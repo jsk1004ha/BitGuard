@@ -28,11 +28,23 @@ def _build_parser() -> argparse.ArgumentParser:
     export.add_argument("--output", type=Path, required=True)
     replay = subparsers.add_parser("replay", help="rerun temporal/action simulation from predictions")
     replay.add_argument("--run", type=Path, required=True)
+    bootstrap = subparsers.add_parser(
+        "bootstrap", help="validate dataset bootstrap options and official-source requirements"
+    )
+    from .bootstrap.cli import add_bootstrap_arguments
+
+    add_bootstrap_arguments(bootstrap)
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int | None:
     args = _build_parser().parse_args(argv)
+    if args.command == "bootstrap":
+        from .bootstrap.cli import options_from_namespace, validation_report
+
+        options = options_from_namespace(args)
+        print(json.dumps(validation_report(args, options), ensure_ascii=False))
+        return 0
     if args.command == "make-demo":
         from .demo import generate_demo
 

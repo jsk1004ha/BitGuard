@@ -1,0 +1,20 @@
+{
+  "nbaiot": {
+    "name": "nbaiot",
+    "project_url": "https://archive.ics.uci.edu/dataset/442/detection+of+iot+botnet+attacks+n+baiot",
+    "download_url": "https://archive.ics.uci.edu/static/public/442/detection%2Bof%2Biot%2Bbotnet%2Battacks%2Bn%2Bbaiot.zip",
+    "doi": "10.24432/C5RC8J",
+    "license_name": "CC BY 4.0",
+    "expected_patterns": ["**/*.csv"],
+    "required_columns": []
+  },
+  "botiot": {
+    "name": "botiot",
+    "project_url": "https://research.unsw.edu.au/projects/bot-iot-dataset",
+    "download_url": null,
+    "doi": null,
+    "license_name": "Academic research use",
+    "expected_patterns": ["**/*.csv"],
+    "required_columns": ["category", "subcategory", "saddr", "stime"]
+  }
+}
