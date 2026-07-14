@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -26,6 +27,64 @@ def build_package_command(environment: Path, forwarded: list[str]) -> list[str]:
     return [str(venv_python(environment)), "-m", "bitguard_bnn", "bootstrap", *forwarded]
 
 
+def validate_virtual_environment(environment: Path) -> None:
+    environment_python = venv_python(environment)
+    probe = (
+        "import json, sys\n"
+        "print(json.dumps({"
+        "'version': list(sys.version_info[:3]), "
+        "'is_venv': sys.prefix != sys.base_prefix"
+        "}))\n"
+    )
+    try:
+        result = subprocess.run(
+            [str(environment_python), "-c", probe],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"unable to run virtual environment Python at {environment_python}: {exc}"
+        ) from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "interpreter probe failed"
+        raise RuntimeError(
+            f"virtual environment Python at {environment_python} is unusable: {detail}"
+        )
+
+    try:
+        metadata = json.loads(result.stdout)
+        raw_version = metadata["version"]
+        is_venv = metadata["is_venv"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"virtual environment Python at {environment_python} returned invalid metadata"
+        ) from exc
+
+    if (
+        not isinstance(raw_version, list)
+        or len(raw_version) < 3
+        or any(type(component) is not int for component in raw_version[:3])
+    ):
+        raise RuntimeError(
+            f"virtual environment Python at {environment_python} returned an invalid version"
+        )
+
+    version = tuple(raw_version[:3])
+    if version[:2] not in SUPPORTED_PYTHON:
+        raise RuntimeError(
+            f"virtual environment at {environment} uses Python {version[0]}.{version[1]}; "
+            "bootstrap requires Python 3.10 through 3.12"
+        )
+    if is_venv is not True:
+        raise RuntimeError(
+            f"interpreter at {environment_python} is not a virtual environment; "
+            "remove .venv and rerun bootstrap"
+        )
+
+
 def _detect_torch_profile() -> str:
     try:
         result = subprocess.run(
@@ -36,6 +95,8 @@ def _detect_torch_profile() -> str:
         )
     except FileNotFoundError:
         return "cpu"
+    except OSError as exc:
+        raise RuntimeError(f"CUDA detection failed while running nvidia-smi: {exc}") from exc
 
     if result.returncode != 0:
         detail = result.stderr.strip() or "nvidia-smi returned a non-zero exit code"
@@ -67,6 +128,12 @@ def _verify_torch_profile(environment: Path, profile: str) -> None:
         "    raise SystemExit(f'expected Torch CUDA {expected!r}, found {actual!r}')\n"
         "if expected is not None and not torch.cuda.is_available():\n"
         "    raise SystemExit('the selected CUDA profile cannot access a CUDA device')\n"
+        "if expected is not None:\n"
+        "    probe = torch.ones(1, device='cuda')\n"
+        "    result = probe + 1\n"
+        "    torch.cuda.synchronize()\n"
+        "    if result.cpu().item() != 2.0:\n"
+        "        raise SystemExit('the selected CUDA profile produced an invalid result')\n"
     )
     result = subprocess.run(
         [str(venv_python(environment)), "-c", verification],
@@ -98,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     environment_python = venv_python(environment)
     if not environment_python.exists():
         subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+    validate_virtual_environment(environment)
 
     pip_install = [str(environment_python), "-m", "pip", "install"]
     locks = repository / "requirements" / "locks"

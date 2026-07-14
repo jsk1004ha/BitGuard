@@ -1,12 +1,14 @@
+import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from scripts.bootstrap import build_package_command, validate_python_version
+from scripts import bootstrap
 
 
 class BootstrapEntryTest(unittest.TestCase):
     def test_build_command_forwards_full_source_and_license(self):
-        command = build_package_command(
+        command = bootstrap.build_package_command(
             Path(".venv"),
             ["--full", "--botiot-source", "input.zip", "--accept-botiot-academic-license"],
         )
@@ -23,7 +25,134 @@ class BootstrapEntryTest(unittest.TestCase):
 
     def test_python_outside_supported_range_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "Python 3.10 through 3.12"):
-            validate_python_version((3, 13, 0))
+            bootstrap.validate_python_version((3, 13, 0))
+
+    def test_supported_real_virtual_environment_passes(self):
+        result = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout='{"version": [3, 12, 1], "is_venv": true}\n',
+            stderr="",
+        )
+        with patch("scripts.bootstrap.subprocess.run", return_value=result) as run:
+            bootstrap.validate_virtual_environment(Path(".venv"))
+
+        probe = run.call_args.args[0]
+        self.assertEqual(probe[:2], [str(bootstrap.venv_python(Path(".venv"))), "-c"])
+        self.assertIn("sys.prefix != sys.base_prefix", probe[2])
+
+    def test_unsupported_virtual_environment_python_is_rejected(self):
+        result = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout='{"version": [3, 13, 0], "is_venv": true}\n',
+            stderr="",
+        )
+        with patch("scripts.bootstrap.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "Python 3.10 through 3.12"):
+                bootstrap.validate_virtual_environment(Path(".venv"))
+
+    def test_non_virtual_environment_interpreter_is_rejected(self):
+        result = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout='{"version": [3, 12, 1], "is_venv": false}\n',
+            stderr="",
+        )
+        with patch("scripts.bootstrap.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "not a virtual environment"):
+                bootstrap.validate_virtual_environment(Path(".venv"))
+
+    def test_auto_compute_uses_cpu_when_nvidia_smi_is_absent(self):
+        with patch("scripts.bootstrap.subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(bootstrap._detect_torch_profile(), "cpu")
+
+    def test_auto_compute_rejects_broken_nvidia_smi_executable(self):
+        with patch("scripts.bootstrap.subprocess.run", side_effect=OSError("probe failure")):
+            with self.assertRaisesRegex(RuntimeError, "CUDA detection failed"):
+                bootstrap._detect_torch_profile()
+
+    def test_auto_compute_rejects_failed_nvidia_smi_probe(self):
+        result = subprocess.CompletedProcess([], 9, stdout="", stderr="driver unavailable")
+        with patch("scripts.bootstrap.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "refusing to downgrade to CPU"):
+                bootstrap._detect_torch_profile()
+
+    def test_auto_compute_rejects_malformed_nvidia_smi_output(self):
+        result = subprocess.CompletedProcess([], 0, stdout="NVIDIA-SMI without CUDA", stderr="")
+        with patch("scripts.bootstrap.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "did not report a CUDA version"):
+                bootstrap._detect_torch_profile()
+
+    def test_cuda_verification_runs_allocation_kernel_and_synchronization(self):
+        result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with patch("scripts.bootstrap.subprocess.run", return_value=result) as run:
+            bootstrap._verify_torch_profile(Path(".venv"), "cu124")
+
+        verification = run.call_args.args[0][2]
+        self.assertIn("torch.ones", verification)
+        self.assertIn("device='cuda'", verification)
+        self.assertIn("probe + 1", verification)
+        self.assertIn("torch.cuda.synchronize()", verification)
+
+    def test_cuda_verification_propagates_probe_failure(self):
+        result = subprocess.CompletedProcess([], 1, stdout="", stderr="kernel launch failed")
+        with patch("scripts.bootstrap.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "kernel launch failed"):
+                bootstrap._verify_torch_profile(Path(".venv"), "cu118")
+
+    def _exercise_main(
+        self, *, environment_exists: bool = True, package_exit_status: int = 0
+    ) -> tuple[int, list[tuple[str, object]]]:
+        events: list[tuple[str, object]] = []
+
+        def record_run(command, **_kwargs):
+            events.append(("run", command))
+            return subprocess.CompletedProcess(command, 0)
+
+        def record_validate(environment):
+            events.append(("validate", environment))
+
+        def record_verify(_environment, profile):
+            events.append(("verify", profile))
+
+        def record_handoff(command, **_kwargs):
+            events.append(("handoff", command))
+            return package_exit_status
+
+        with (
+            patch("scripts.bootstrap.validate_python_version"),
+            patch.object(Path, "exists", return_value=environment_exists),
+            patch("scripts.bootstrap.validate_virtual_environment", side_effect=record_validate),
+            patch("scripts.bootstrap._verify_torch_profile", side_effect=record_verify),
+            patch("scripts.bootstrap.subprocess.run", side_effect=record_run),
+            patch("scripts.bootstrap.subprocess.call", side_effect=record_handoff),
+        ):
+            status = bootstrap.main(["--compute", "cpu", "--full"])
+        return status, events
+
+    def test_main_validates_reused_environment_and_installs_in_contract_order(self):
+        _status, events = self._exercise_main()
+        self.assertEqual(
+            [kind for kind, _value in events],
+            ["validate", "run", "verify", "run", "run", "handoff"],
+        )
+
+        install_commands = [value for kind, value in events if kind == "run"]
+        self.assertTrue(str(install_commands[0][-1]).endswith("torch-cpu.txt"))
+        self.assertEqual(install_commands[1][-1], "--no-deps")
+        self.assertEqual(install_commands[1][-3], "--editable")
+        self.assertTrue(str(install_commands[2][-1]).endswith("full-base.txt"))
+        self.assertEqual(events[-1][1][-2:], ["bootstrap", "--full"])
+
+    def test_main_validates_new_environment_before_installing(self):
+        _status, events = self._exercise_main(environment_exists=False)
+        self.assertEqual([kind for kind, _value in events[:2]], ["run", "validate"])
+        self.assertEqual(events[0][1][1:3], ["-m", "venv"])
+
+    def test_main_propagates_package_exit_status(self):
+        status, _events = self._exercise_main(package_exit_status=23)
+        self.assertEqual(status, 23)
 
 
 if __name__ == "__main__":
