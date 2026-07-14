@@ -29,10 +29,10 @@ def add_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("all", *DATASETS),
         help="dataset to prepare; may be repeated",
     )
-    parser.add_argument("--botiot-source", type=Path)
+    parser.add_argument("--botiot-source")
     parser.add_argument("--accept-botiot-academic-license", action="store_true")
-    parser.add_argument("--data-root", type=Path, default=Path("data"))
-    parser.add_argument("--runs-root", type=Path, default=Path("runs"))
+    parser.add_argument("--data-root", default="data")
+    parser.add_argument("--runs-root", default="runs")
     parser.add_argument("--compute", choices=COMPUTE_PROFILES, default="auto")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--install-system-tools", action="store_true")
@@ -60,11 +60,11 @@ def options_from_namespace(args: argparse.Namespace) -> BootstrapOptions:
 
     return BootstrapOptions(
         datasets=datasets,
-        botiot_source=args.botiot_source.expanduser().resolve()
+        botiot_source=Path(args.botiot_source).expanduser().resolve()
         if args.botiot_source is not None
         else None,
-        data_root=args.data_root.expanduser().resolve(),
-        runs_root=args.runs_root.expanduser().resolve(),
+        data_root=Path(args.data_root).expanduser().resolve(),
+        runs_root=Path(args.runs_root).expanduser().resolve(),
         compute=args.compute,
         prepare_only=args.prepare_only,
         install_system_tools=args.install_system_tools,

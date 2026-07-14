@@ -9,7 +9,7 @@ from dataclasses import FrozenInstanceError
 from io import StringIO
 from pathlib import Path
 
-from bitguard_bnn.bootstrap.cli import parse_bootstrap_options
+from bitguard_bnn.bootstrap.cli import options_from_namespace, parse_bootstrap_options
 from bitguard_bnn.bootstrap.registry import load_registry
 from bitguard_bnn.cli import _build_parser, main
 
@@ -124,6 +124,20 @@ class BootstrapOptionsTest(unittest.TestCase):
 
 
 class BootstrapDispatchTest(unittest.TestCase):
+    @staticmethod
+    def _noncanonical_paths() -> tuple[str, str, str]:
+        if os.name == "nt":
+            return (
+                r".\incoming\..\_review_absent_source.zip",
+                r".\new-data\.\payload",
+                r".\new-runs\..\run-output",
+            )
+        return (
+            "./incoming/../_review_absent_source.zip",
+            "./new-data/./payload",
+            "./new-runs/../run-output",
+        )
+
     def test_existing_train_parser_remains_available(self):
         args = _build_parser().parse_args(["train", "--config", "config.yaml"])
 
@@ -136,6 +150,60 @@ class BootstrapDispatchTest(unittest.TestCase):
                 _build_parser().parse_args(["bootstrap", "--help"])
 
         self.assertEqual(raised.exception.code, 0)
+
+    def test_parser_retains_raw_path_spellings_while_options_resolve(self):
+        source, data_root, runs_root = self._noncanonical_paths()
+        args = _build_parser().parse_args(
+            [
+                "bootstrap",
+                "--dataset",
+                "botiot",
+                "--botiot-source",
+                source,
+                "--accept-botiot-academic-license",
+                "--data-root",
+                data_root,
+                "--runs-root",
+                runs_root,
+            ]
+        )
+
+        self.assertEqual(args.botiot_source, source)
+        self.assertEqual(args.data_root, data_root)
+        self.assertEqual(args.runs_root, runs_root)
+        options = options_from_namespace(args)
+        self.assertEqual(options.botiot_source, Path(source).expanduser().resolve())
+        self.assertEqual(options.data_root, Path(data_root).expanduser().resolve())
+        self.assertEqual(options.runs_root, Path(runs_root).expanduser().resolve())
+
+    def test_bootstrap_report_preserves_raw_path_spellings_byte_for_byte(self):
+        source, data_root, runs_root = self._noncanonical_paths()
+        output = StringIO()
+        with redirect_stdout(output):
+            main(
+                [
+                    "bootstrap",
+                    "--dataset",
+                    "botiot",
+                    "--botiot-source",
+                    source,
+                    "--accept-botiot-academic-license",
+                    "--data-root",
+                    data_root,
+                    "--runs-root",
+                    runs_root,
+                ]
+            )
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(
+            report["inputs"],
+            {
+                "botiot_source": source,
+                "data_root": data_root,
+                "runs_root": runs_root,
+            },
+        )
 
     def test_valid_bootstrap_dispatch_reports_validation_without_mutation(self):
         output = StringIO()
