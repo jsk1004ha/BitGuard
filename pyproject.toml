@@ -18,6 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+full = ["pyarrow==19.0.1"]
 plots = ["matplotlib>=3.7", "seaborn>=0.13"]
 xgboost = ["xgboost>=2.0"]
 dev = ["pytest>=8.0", "ruff>=0.5"]
