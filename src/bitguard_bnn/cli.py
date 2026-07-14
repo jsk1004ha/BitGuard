@@ -34,15 +34,20 @@ def _build_parser() -> argparse.ArgumentParser:
     from .bootstrap.cli import add_bootstrap_arguments
 
     add_bootstrap_arguments(bootstrap)
+    bootstrap.set_defaults(_command_parser=bootstrap)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int | None:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     if args.command == "bootstrap":
         from .bootstrap.cli import options_from_namespace, validation_report
 
-        options = options_from_namespace(args)
+        try:
+            options = options_from_namespace(args)
+        except ValueError as exc:
+            args._command_parser.error(str(exc))
         print(json.dumps(validation_report(args, options), ensure_ascii=False))
         return 0
     if args.command == "make-demo":

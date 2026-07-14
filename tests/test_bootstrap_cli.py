@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from dataclasses import FrozenInstanceError
 from io import StringIO
@@ -13,8 +18,24 @@ from bitguard_bnn.bootstrap.cli import options_from_namespace, parse_bootstrap_o
 from bitguard_bnn.bootstrap.registry import load_registry
 from bitguard_bnn.cli import _build_parser, main
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 class BootstrapRegistryTest(unittest.TestCase):
+    def assert_registry_rejected(
+        self, dataset: str, field: str, value: str, message: str
+    ) -> None:
+        payload = {
+            name: spec.to_dict() for name, spec in load_registry().items()
+        }
+        payload = copy.deepcopy(payload)
+        payload[dataset][field] = value
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "datasets.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, message):
+                load_registry(path)
+
     def test_registry_contains_only_official_sources(self):
         registry = load_registry()
 
@@ -49,6 +70,53 @@ class BootstrapRegistryTest(unittest.TestCase):
         self.assertNotIn("password", serialized)
         self.assertNotIn("credential", serialized)
         self.assertNotIn("sha256", serialized)
+
+    def test_registry_rejects_non_https_and_credential_bearing_urls(self):
+        cases = (
+            ("project_url", "javascript:alert(1)", "HTTPS"),
+            ("download_url", "file:///tmp/archive.zip", "HTTPS"),
+            ("project_url", "http://archive.ics.uci.edu/dataset/442", "HTTPS"),
+            (
+                "download_url",
+                "https://user:secret@archive.ics.uci.edu/static/public/442/archive.zip",
+                "credentials",
+            ),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                self.assert_registry_rejected("nbaiot", field, value, message)
+
+    def test_registry_rejects_wrong_official_identities_and_botiot_download(self):
+        cases = (
+            (
+                "nbaiot",
+                "project_url",
+                "https://archive.ics.uci.edu/dataset/441/not-nbaiot",
+                "official UCI",
+            ),
+            (
+                "nbaiot",
+                "download_url",
+                "https://archive.ics.uci.edu/static/public/441/not-nbaiot.zip",
+                "official UCI",
+            ),
+            ("nbaiot", "doi", "10.0000/WRONG", r"10\.24432/C5RC8J"),
+            (
+                "botiot",
+                "project_url",
+                "https://research.unsw.edu.au/projects/not-bot-iot",
+                "official UNSW",
+            ),
+            (
+                "botiot",
+                "download_url",
+                "https://research.unsw.edu.au/downloads/bot-iot.zip",
+                "must not define download_url",
+            ),
+        )
+        for dataset, field, value, message in cases:
+            with self.subTest(dataset=dataset, field=field):
+                self.assert_registry_rejected(dataset, field, value, message)
 
 
 class BootstrapOptionsTest(unittest.TestCase):
@@ -228,6 +296,101 @@ class BootstrapDispatchTest(unittest.TestCase):
         self.assertEqual(report["scope"], "bootstrap-options")
         self.assertEqual(report["options"]["datasets"], ["nbaiot"])
         self.assertEqual(report["options"]["restart_stage"], "inspect")
+
+    def test_module_entrypoint_reports_bootstrap_semantic_error_without_traceback(self):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(ROOT / "src")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "bitguard_bnn",
+                "bootstrap",
+                "--dataset",
+                "botiot",
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage:", result.stderr)
+        self.assertIn("botiot-source", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+
+class BootstrapPackagingTest(unittest.TestCase):
+    def test_built_wheel_contains_and_loads_dataset_registry_offline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            shutil.copy2(ROOT / "pyproject.toml", project / "pyproject.toml")
+            shutil.copy2(ROOT / "README.md", project / "README.md")
+            shutil.copytree(
+                ROOT / "src",
+                project / "src",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info"),
+            )
+            wheelhouse = root / "wheelhouse"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                    "PIP_NO_INDEX": "1",
+                    "PYTHONPATH": "",
+                }
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    str(project),
+                    "--no-deps",
+                    "--no-build-isolation",
+                    "--wheel-dir",
+                    str(wheelhouse),
+                ],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            wheels = list(wheelhouse.glob("*.whl"))
+            self.assertEqual(len(wheels), 1)
+
+            with zipfile.ZipFile(wheels[0]) as archive:
+                names = archive.namelist()
+                self.assertIn("bitguard_bnn/bootstrap/datasets.json", names)
+                extracted = root / "extracted"
+                archive.extractall(extracted)
+
+            environment["PYTHONPATH"] = str(extracted)
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from bitguard_bnn.bootstrap.registry import load_registry; "
+                        "print(load_registry()['nbaiot'].doi)"
+                    ),
+                ],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+            self.assertEqual(probe.stdout.strip(), "10.24432/C5RC8J")
 
 
 if __name__ == "__main__":

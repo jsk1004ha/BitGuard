@@ -32,6 +32,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"bitguard_bnn.bootstrap" = ["datasets.json"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
