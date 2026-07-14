@@ -84,6 +84,35 @@ class BootstrapEntryTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not report a CUDA version"):
                 bootstrap._detect_torch_profile()
 
+    def test_auto_compute_maps_supported_cuda_versions_to_torch_profiles(self):
+        cases = (
+            ("11.8", "cu118"),
+            ("12.3", "cu118"),
+            ("12.4", "cu124"),
+            ("12.9", "cu124"),
+        )
+        for cuda_version, expected_profile in cases:
+            with self.subTest(cuda_version=cuda_version):
+                result = subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=f"NVIDIA-SMI 570.00    CUDA Version: {cuda_version}\n",
+                    stderr="",
+                )
+                with patch("scripts.bootstrap.subprocess.run", return_value=result):
+                    self.assertEqual(bootstrap._detect_torch_profile(), expected_profile)
+
+    def test_auto_compute_rejects_cuda_below_cu118_threshold(self):
+        result = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout="NVIDIA-SMI 470.00    CUDA Version: 11.7\n",
+            stderr="",
+        )
+        with patch("scripts.bootstrap.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "below the supported cu118 profile"):
+                bootstrap._detect_torch_profile()
+
     def test_cuda_verification_runs_allocation_kernel_and_synchronization(self):
         result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with patch("scripts.bootstrap.subprocess.run", return_value=result) as run:
