@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -708,6 +709,130 @@ class OutOfCoreShardTests(unittest.TestCase):
             self.assertEqual(list(prepared.rglob("*.partial")), [])
             retried = write()
             shard_module.verify_shard_manifest(retried.manifest_path, split_plan=split)
+
+    def test_verifier_membership_replacement_after_validation_aborts_and_retries(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        rows = _rows()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split, plan = self._write(rows, root)
+            membership = split.membership_path
+            original_membership = membership.read_bytes()
+            replacement = root / "reencoded-membership.parquet"
+            table = pq.read_table(membership)
+            pq.write_table(table, replacement, compression="gzip", row_group_size=2)
+            self.assertNotEqual(replacement.read_bytes(), original_membership)
+            manifest_bytes = plan.manifest_path.read_bytes()
+            shard_bytes = {
+                str(entry["path"]): (plan.manifest_path.parent / entry["path"]).read_bytes()
+                for entry in json.loads(manifest_bytes)["entries"]
+            }
+            sentinel = root / "outside-sentinel.txt"
+            sentinel.write_bytes(b"outside")
+            real_validate = shard_module._validate_split_plan
+
+            def replace_after_validation(candidate: object):
+                manifest = real_validate(candidate)
+                os.replace(replacement, membership)
+                return manifest
+
+            try:
+                with patch.object(
+                    shard_module,
+                    "_validate_split_plan",
+                    side_effect=replace_after_validation,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "membership|checksum"):
+                        shard_module.verify_shard_manifest(
+                            plan.manifest_path, split_plan=split
+                        )
+            finally:
+                membership.write_bytes(original_membership)
+            self.assertEqual(plan.manifest_path.read_bytes(), manifest_bytes)
+            for relative, expected in shard_bytes.items():
+                self.assertEqual(
+                    (plan.manifest_path.parent / relative).read_bytes(), expected
+                )
+            self.assertEqual(sentinel.read_bytes(), b"outside")
+            self.assertEqual(
+                list(plan.manifest_path.parent.glob(".verify-shards-*.partial")), []
+            )
+            shard_module.verify_shard_manifest(plan.manifest_path, split_plan=split)
+
+    def test_verifier_shard_swap_after_hash_uses_no_unverified_bytes(self) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        rows = _rows()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split, plan = self._write(rows, root)
+            original_manifest = plan.manifest_path.read_bytes()
+            payload = json.loads(original_manifest)
+            entry = payload["entries"][0]
+            shard = plan.manifest_path.parent / entry["path"]
+            original_shard = shard.read_bytes()
+            marker = original_shard.rfind(b"parquet-cpp-arrow")
+            self.assertGreaterEqual(marker, 0)
+            first = bytearray(original_shard)
+            second = bytearray(original_shard)
+            first[marker] = ord("q")
+            second[marker] = ord("r")
+            first_bytes = bytes(first)
+            second_bytes = bytes(second)
+            shard.write_bytes(first_bytes)
+            replacement = root / "replacement-shard.parquet"
+            replacement.write_bytes(second_bytes)
+            self.assertEqual(pq.read_table(shard).num_rows, int(entry["rows"]))
+            self.assertEqual(
+                pq.read_table(replacement).num_rows, int(entry["rows"])
+            )
+            entry["sha256"] = hashlib.sha256(first_bytes).hexdigest()
+            payload["fingerprint"] = shard_module.stable_fingerprint(
+                shard_module._manifest_semantics(payload)
+            )
+            forged_manifest = (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            plan.manifest_path.write_bytes(forged_manifest)
+            sentinel = root / "outside-sentinel.txt"
+            sentinel.write_bytes(b"outside")
+            real_sha256 = shard_module._sha256_file
+            replaced = False
+            observed_after_failure: bytes | None = None
+
+            def replace_after_hash(candidate: Path) -> str:
+                nonlocal replaced
+                digest = real_sha256(candidate)
+                if not replaced and candidate.resolve() == shard.resolve():
+                    os.replace(replacement, shard)
+                    replaced = True
+                return digest
+
+            try:
+                with patch.object(
+                    shard_module, "_sha256_file", side_effect=replace_after_hash
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "snapshot|checksum|identity"
+                    ):
+                        shard_module.verify_shard_manifest(
+                            plan.manifest_path, split_plan=split
+                        )
+                observed_after_failure = shard.read_bytes()
+                self.assertEqual(plan.manifest_path.read_bytes(), forged_manifest)
+                self.assertEqual(sentinel.read_bytes(), b"outside")
+                self.assertEqual(
+                    list(plan.manifest_path.parent.glob(".verify-shards-*.partial")),
+                    [],
+                )
+            finally:
+                shard.write_bytes(original_shard)
+                plan.manifest_path.write_bytes(original_manifest)
+            self.assertEqual(observed_after_failure, second_bytes)
+            shard_module.verify_shard_manifest(plan.manifest_path, split_plan=split)
 
     def test_manifest_publication_failure_rolls_back_only_owned_shards(self) -> None:
         from bitguard_bnn.out_of_core import shard as shard_module

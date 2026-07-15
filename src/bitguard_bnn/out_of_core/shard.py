@@ -547,17 +547,68 @@ def _validate_membership_file(path: Path) -> None:
             raise RuntimeError("split membership schema drift")
 
 
-def _snapshot_verified_membership(
-    source: Path, destination: Path, expected_sha256: str
-) -> None:
+def _identity_from_status(status: os.stat_result) -> FileIdentity:
+    return FileIdentity(
+        device=int(status.st_dev),
+        inode=int(status.st_ino),
+        mode=int(status.st_mode),
+        size=int(status.st_size),
+        mtime_ns=int(status.st_mtime_ns),
+    )
+
+
+def _copy_verified_snapshot(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+    expected_size: int | None,
+    artifact: str,
+) -> FileIdentity:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    before = file_identity(source)
+    digest = hashlib.sha256()
+    copied = 0
     with source.open("rb") as source_handle, destination.open("xb") as destination_handle:
-        shutil.copyfileobj(source_handle, destination_handle, length=1024 * 1024)
+        opened = _identity_from_status(os.fstat(source_handle.fileno()))
+        while block := source_handle.read(1024 * 1024):
+            destination_handle.write(block)
+            digest.update(block)
+            copied += len(block)
         destination_handle.flush()
         os.fsync(destination_handle.fileno())
+        after_handle = _identity_from_status(os.fstat(source_handle.fileno()))
+    after_path = file_identity(source)
+    if before != opened or before != after_handle or before != after_path:
+        raise RuntimeError(f"{artifact} source identity changed during snapshot")
+    if (
+        digest.hexdigest() != expected_sha256
+        or copied != before.size
+        or (expected_size is not None and copied != expected_size)
+    ):
+        raise RuntimeError(f"{artifact} snapshot checksum or size mismatch")
+    return before
+
+
+def _assert_snapshot_source_identity(
+    source: Path, expected: FileIdentity, artifact: str
+) -> None:
+    if _is_link_like(source) or file_identity(source) != expected:
+        raise RuntimeError(f"{artifact} source identity changed after snapshot")
+
+
+def _snapshot_verified_membership(
+    source: Path, destination: Path, expected_sha256: str
+) -> FileIdentity:
+    identity = _copy_verified_snapshot(
+        source,
+        destination,
+        expected_sha256=expected_sha256,
+        expected_size=None,
+        artifact="split membership",
+    )
     _validate_membership_file(destination)
-    if _sha256_file(destination) != expected_sha256:
-        raise RuntimeError("split membership snapshot checksum mismatch")
+    return identity
 
 
 def _validate_split_plan(plan: SplitPlan) -> dict[str, Any]:
@@ -1196,21 +1247,31 @@ def _verify_entry_and_index(
     path: Path,
     entry: Mapping[str, Any],
     *,
+    snapshot_path: Path,
     schema: pa.Schema,
     work: Path,
     run_paths: list[Path],
     max_rows_per_run: int,
     merge_read_rows: int,
     tracker: _ResourceTracker,
-) -> tuple[Counter[str], dict[str, Counter[str]], Counter[str]]:
+) -> tuple[Counter[str], dict[str, Counter[str]], Counter[str], FileIdentity]:
     schema_fingerprint = stable_fingerprint(_schema_descriptor(schema))
     if entry.get("schema_fingerprint") != schema_fingerprint:
         raise RuntimeError(f"shard entry schema fingerprint mismatch: {entry.get('path')}")
-    if _sha256_file(path) != str(entry.get("sha256")):
+    expected_sha256 = str(entry.get("sha256"))
+    if _sha256_file(path) != expected_sha256:
         raise RuntimeError(f"shard checksum mismatch: {entry.get('path')}")
-    if path.stat().st_size != int(entry.get("byte_size", -1)):
+    expected_size = int(entry.get("byte_size", -1))
+    if path.stat().st_size != expected_size:
         raise RuntimeError(f"shard byte size mismatch: {entry.get('path')}")
-    with path.open("rb") as handle:
+    source_identity = _copy_verified_snapshot(
+        path,
+        snapshot_path,
+        expected_sha256=expected_sha256,
+        expected_size=expected_size,
+        artifact=f"shard {entry.get('path')}",
+    )
+    with snapshot_path.open("rb") as handle:
         parquet = pq.ParquetFile(handle)
         if parquet.schema_arrow != schema:
             raise RuntimeError(f"shard schema drift: {entry.get('path')}")
@@ -1242,7 +1303,7 @@ def _verify_entry_and_index(
         run_paths.append(run)
         coverage_buffer.clear()
 
-    records = _iter_records(path, merge_read_rows, tracker=tracker)
+    records = _iter_records(snapshot_path, merge_read_rows, tracker=tracker)
     try:
         for row in records:
             split = expected_split
@@ -1291,21 +1352,21 @@ def _verify_entry_and_index(
         or ordering_max != entry.get("ordering_max")
     ):
         raise RuntimeError(f"shard ordering boundaries mismatch: {entry.get('path')}")
-    return counts, classes, sources
+    return counts, classes, sources, source_identity
 
 
 def _verify_uid_coverage(
     actual_path: Path,
     *,
     manifest: Mapping[str, Any],
-    split_plan: SplitPlan | None,
+    membership_path: Path | None,
     batch_rows: int,
     tracker: _ResourceTracker,
 ) -> None:
     actual_iter = _iter_records(actual_path, batch_rows, tracker=tracker)
     expected_iter = (
-        _iter_records(split_plan.membership_path, batch_rows, tracker=tracker)
-        if split_plan is not None
+        _iter_records(membership_path, batch_rows, tracker=tracker)
+        if membership_path is not None
         else None
     )
     previous: str | None = None
@@ -1423,10 +1484,11 @@ def verify_shard_manifest(
         "preprocessing_fingerprint"
     ) != str(preprocessing_fingerprint):
         raise RuntimeError("preprocessing fingerprint mismatch")
+    split_manifest: dict[str, Any] | None = None
     if split_plan is not None:
         if manifest.get("split_fingerprint") != split_plan.fingerprint:
             raise RuntimeError("split fingerprint mismatch")
-        _validate_split_plan(split_plan)
+        split_manifest = _validate_split_plan(split_plan)
     try:
         selected_features = _validate_features(manifest["selected_features"])
         schema = _shard_schema(selected_features)
@@ -1442,6 +1504,15 @@ def verify_shard_manifest(
     work.mkdir(parents=True)
     tracker = _ResourceTracker(work, max_rows_per_run, merge_read_rows)
     try:
+        membership_snapshot: Path | None = None
+        membership_identity: FileIdentity | None = None
+        if split_plan is not None and split_manifest is not None:
+            membership_snapshot = work / "split-membership.snapshot.parquet"
+            membership_identity = _snapshot_verified_membership(
+                split_plan.membership_path,
+                membership_snapshot,
+                str(split_manifest["membership"]["sha256"]),
+            )
         entries_value = manifest.get("entries")
         if not isinstance(entries_value, list) or not entries_value:
             raise RuntimeError("shard manifest has no entries")
@@ -1453,8 +1524,9 @@ def verify_shard_manifest(
         counts: Counter[str] = Counter()
         classes: dict[str, Counter[str]] = defaultdict(Counter)
         sources: Counter[str] = Counter()
+        source_identities: list[tuple[Path, FileIdentity]] = []
         bucket_entries: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
-        for entry in entries:
+        for entry_index, entry in enumerate(entries):
             if not isinstance(entry, Mapping):
                 raise RuntimeError("invalid shard manifest entry")
             shard = _safe_entry_path(path.parent, entry.get("path"))
@@ -1475,16 +1547,24 @@ def verify_shard_manifest(
             if resolved in listed:
                 raise RuntimeError(f"duplicate shard manifest path: {entry.get('path')}")
             listed.add(resolved)
-            entry_counts, entry_classes, entry_sources = _verify_entry_and_index(
-                shard,
-                entry,
-                schema=schema,
-                work=work,
-                run_paths=run_paths,
-                max_rows_per_run=max_rows_per_run,
-                merge_read_rows=merge_read_rows,
-                tracker=tracker,
+            entry_counts, entry_classes, entry_sources, source_identity = (
+                _verify_entry_and_index(
+                    shard,
+                    entry,
+                    snapshot_path=(
+                        work
+                        / "verified-shards"
+                        / f"shard-{entry_index:08d}.parquet"
+                    ),
+                    schema=schema,
+                    work=work,
+                    run_paths=run_paths,
+                    max_rows_per_run=max_rows_per_run,
+                    merge_read_rows=merge_read_rows,
+                    tracker=tracker,
+                )
             )
+            source_identities.append((shard, source_identity))
             counts.update(entry_counts)
             for split, values in entry_classes.items():
                 classes[split].update(values)
@@ -1535,7 +1615,7 @@ def verify_shard_manifest(
         _verify_uid_coverage(
             sorted_coverage,
             manifest=manifest,
-            split_plan=split_plan,
+            membership_path=membership_snapshot,
             batch_rows=merge_read_rows,
             tracker=tracker,
         )
@@ -1560,6 +1640,14 @@ def verify_shard_manifest(
         }
         if discovered != listed:
             raise RuntimeError("unlisted or missing Parquet shard artifacts")
+        if split_plan is not None and membership_identity is not None:
+            _assert_snapshot_source_identity(
+                split_plan.membership_path,
+                membership_identity,
+                "split membership",
+            )
+        for source, identity in source_identities:
+            _assert_snapshot_source_identity(source, identity, f"shard {source}")
         _cleanup_work(work)
         return manifest
     except BaseException as primary:
