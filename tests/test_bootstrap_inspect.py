@@ -380,6 +380,85 @@ class SchemaInspectionTest(unittest.TestCase):
         self.assertEqual(report.accepted_rows, int(expected.sum()))
         self.assertEqual(report.rejected_rows, int((~expected).sum()))
 
+    def test_boolean_integer_and_missing_timestamp_matches_dataframe_concat(
+        self,
+    ) -> None:
+        csv_text = (
+            "category,subcategory,saddr,stime,x\n"
+            "Normal,Normal,device,True,1\n"
+            "Normal,Normal,device,True,2\n"
+            "Normal,Normal,device,1,3\n"
+            "Normal,Normal,device,,4\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "flows.csv"
+            path.write_text(csv_text, encoding="utf-8")
+            inferred = pd.concat(
+                pd.read_csv(path, chunksize=1, low_memory=False),
+                ignore_index=True,
+            )["stime"]
+            expected = _coerce_timestamp(inferred).notna()
+            datetime_sizes: list[int] = []
+            real_datetime = pd.to_datetime
+
+            def record_datetime(values, *args, **kwargs):
+                datetime_sizes.append(len(values))
+                return real_datetime(values, *args, **kwargs)
+
+            with patch.object(inspect_module.pd, "to_datetime", record_datetime):
+                report = inspect_csv_dataset(
+                    "botiot",
+                    root,
+                    chunk_size=1,
+                    fail_on_rejected=False,
+                )
+
+        self.assertEqual(expected.tolist(), [False, False, True, False])
+        self.assertEqual(report.accepted_rows, int(expected.sum()))
+        self.assertEqual(report.rejected_rows, int((~expected).sum()))
+        self.assertTrue(datetime_sizes)
+        self.assertLessEqual(max(datetime_sizes), 1)
+
+    def test_timestamp_promotion_matches_dataframe_concat_dtype_combinations(
+        self,
+    ) -> None:
+        cases = (
+            ("True", "1", ""),
+            ("True", "1.5", ""),
+            ("True", "2020-01-02", ""),
+            ("1", "2020-01-02", ""),
+        )
+        for tokens in cases:
+            with self.subTest(tokens=tokens):
+                chunks = list(
+                    pd.read_csv(
+                        io.StringIO("stime\n" + "\n".join(tokens) + "\n"),
+                        chunksize=1,
+                        low_memory=False,
+                        skip_blank_lines=False,
+                    )
+                )
+                expected = pd.concat(chunks, ignore_index=True)["stime"]
+                witnesses: dict[str, pd.DataFrame] = {}
+                for chunk in chunks:
+                    series = chunk["stime"]
+                    witnesses.setdefault(
+                        str(series.dtype),
+                        series.iloc[:1].to_frame(),
+                    )
+                promoted = pd.concat(
+                    [
+                        inspect_module._promote_timestamp_series(
+                            chunk["stime"], tuple(witnesses.values())
+                        )
+                        for chunk in chunks
+                    ],
+                    ignore_index=True,
+                )
+
+                pd.testing.assert_series_equal(promoted, expected)
+
     def test_mixed_datetime_formats_match_concatenated_adapter_context(self) -> None:
         timestamps = (
             "2020-01-02",
