@@ -18,12 +18,18 @@ import pyarrow.parquet as pq
 from bitguard_bnn.constants import normalize_token
 from bitguard_bnn.out_of_core.common import normalize_logical_path
 from bitguard_bnn.out_of_core.manifest import (
+    FileIdentity,
     SPLIT_MANIFEST_SCHEMA,
     SplitPlan,
     SourceRowRecord,
+    attach_cleanup_context,
     canonical_json_bytes,
+    file_identity,
     manifest_path_for_membership,
+    split_manifest_semantic_fingerprint,
+    split_manifest_semantics,
     stable_fingerprint,
+    unlink_file_if_identity,
     write_json_atomic,
 )
 from bitguard_bnn.out_of_core.source import NormalizedChunk
@@ -882,10 +888,21 @@ def _ensure_nonempty(counts: Mapping[str, int]) -> None:
         raise ValueError("split must produce non-empty train, validation, and test partitions")
 
 
+def _schema_descriptor(schema: pa.Schema) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": field.name,
+            "type": str(field.type),
+            "nullable": bool(field.nullable),
+        }
+        for field in schema
+    ]
+
+
 def _validate_existing(
     membership_path: Path,
     manifest_path: Path,
-    fingerprint: str,
+    expected_manifest: Mapping[str, Any],
 ) -> bool:
     if not membership_path.exists() and not manifest_path.exists():
         return False
@@ -893,10 +910,29 @@ def _validate_existing(
         raise RuntimeError("incomplete immutable split output already exists")
     import json
 
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if payload.get("fingerprint") != fingerprint:
-        raise RuntimeError("immutable split output fingerprint conflict")
-    expected_rows = sum(int(value) for value in payload["counts"].values())
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("split manifest root must be an object")
+        payload_semantics = split_manifest_semantics(payload)
+        payload_semantic_fingerprint = split_manifest_semantic_fingerprint(payload)
+        expected_semantics = split_manifest_semantics(expected_manifest)
+        expected_semantic_fingerprint = split_manifest_semantic_fingerprint(
+            expected_manifest
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("immutable split output semantic conflict") from exc
+    if (
+        payload.get("semantic_fingerprint") != payload_semantic_fingerprint
+        or expected_manifest.get("semantic_fingerprint")
+        != expected_semantic_fingerprint
+        or canonical_json_bytes(payload_semantics)
+        != canonical_json_bytes(expected_semantics)
+    ):
+        raise RuntimeError("immutable split output semantic conflict")
+    expected_rows = sum(
+        int(value) for value in expected_manifest["counts"].values()
+    )
     with membership_path.open("rb") as handle:
         parquet = pq.ParquetFile(handle)
         if (
@@ -904,7 +940,11 @@ def _validate_existing(
             or parquet.schema_arrow != _MEMBERSHIP_SCHEMA
         ):
             raise RuntimeError("existing split membership validation failed")
-    if _sha256_file(membership_path) != payload["membership"]["sha256"]:
+    try:
+        expected_sha = str(payload["membership"]["sha256"])
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("immutable split output semantic conflict") from exc
+    if _sha256_file(membership_path) != expected_sha:
         raise RuntimeError("existing split membership checksum mismatch")
     return True
 
@@ -932,7 +972,11 @@ def build_split_plan(
     work = output / f".split-{uuid.uuid4().hex}.partial"
     work.mkdir()
     tracker = _ResourceTracker(work, max_rows_per_run)
-    published_membership: Path | None = None
+    publication_partial: Path | None = None
+    membership_path: Path | None = None
+    manifest_path: Path | None = None
+    published_membership: FileIdentity | None = None
+    published_manifest: FileIdentity | None = None
     try:
         inspection_paths, coordinate_paths, total_rows = _write_inspection_runs(
             chunks,
@@ -1048,12 +1092,8 @@ def build_split_plan(
         )
         membership_path = output / f"split-membership-{fingerprint}.parquet"
         manifest_path = manifest_path_for_membership(membership_path)
-        membership_schema = {
-            field.name: str(field.type) for field in _MEMBERSHIP_SCHEMA
-        }
-        inspection_schema = {
-            field.name: str(field.type) for field in _INSPECTION_SCHEMA
-        }
+        membership_schema = _schema_descriptor(_MEMBERSHIP_SCHEMA)
+        inspection_schema = _schema_descriptor(_INSPECTION_SCHEMA)
         manifest: dict[str, Any] = {
             "schema_version": SPLIT_MANIFEST_SCHEMA,
             "fingerprint": fingerprint,
@@ -1111,7 +1151,18 @@ def build_split_plan(
                 "task1_verified_snapshot_disk_not_included": True,
             },
         }
-        if _validate_existing(membership_path, manifest_path, fingerprint):
+        manifest["semantic_fingerprint"] = split_manifest_semantic_fingerprint(
+            manifest
+        )
+        publication_partial = output / (
+            f".{membership_path.name}.{uuid.uuid4().hex}.partial"
+        )
+        os.replace(membership_partial, publication_partial)
+        shutil.rmtree(work)
+        if _validate_existing(membership_path, manifest_path, manifest):
+            publication_partial.unlink()
+            publication_partial = None
+            _fsync_directory(output)
             return SplitPlan(
                 strategy=str(cfg["strategy"]),
                 train_count=int(counts["train"]),
@@ -1120,11 +1171,16 @@ def build_split_plan(
                 membership_path=membership_path,
                 fingerprint=fingerprint,
             )
-        os.replace(membership_partial, membership_path)
-        published_membership = membership_path
+        if membership_path.exists() or manifest_path.exists():
+            raise RuntimeError("immutable split output appeared during publication")
+        expected_membership_identity = file_identity(publication_partial)
+        os.replace(publication_partial, membership_path)
+        published_membership = expected_membership_identity
+        publication_partial = None
+        if file_identity(membership_path) != expected_membership_identity:
+            raise RuntimeError("published membership identity changed after rename")
         _fsync_directory(output)
-        write_json_atomic(manifest_path, manifest)
-        published_membership = None
+        published_manifest = write_json_atomic(manifest_path, manifest)
         return SplitPlan(
             strategy=str(cfg["strategy"]),
             train_count=int(counts["train"]),
@@ -1133,12 +1189,51 @@ def build_split_plan(
             membership_path=membership_path,
             fingerprint=fingerprint,
         )
-    except BaseException:
-        if published_membership is not None:
-            published_membership.unlink(missing_ok=True)
+    except BaseException as primary:
+        cleanup: list[BaseException] = []
+        removed_final = False
+        if published_manifest is not None and manifest_path is not None:
+            try:
+                removed_final = (
+                    unlink_file_if_identity(manifest_path, published_manifest)
+                    or removed_final
+                )
+            except BaseException as error:
+                cleanup.append(error)
+        if published_membership is not None and membership_path is not None:
+            try:
+                removed_final = (
+                    unlink_file_if_identity(membership_path, published_membership)
+                    or removed_final
+                )
+            except BaseException as error:
+                cleanup.append(error)
+        if publication_partial is not None:
+            try:
+                partial_existed = publication_partial.exists()
+                publication_partial.unlink(missing_ok=True)
+                removed_final = removed_final or partial_existed
+            except BaseException as error:
+                cleanup.append(error)
+        if work.exists():
+            try:
+                shutil.rmtree(work)
+            except BaseException as error:
+                cleanup.append(error)
+        if removed_final:
+            try:
+                _fsync_directory(output)
+            except BaseException as error:
+                cleanup.append(error)
+        if cleanup:
+            for cleanup_error in cleanup:
+                attach_cleanup_context(
+                    primary,
+                    "cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                )
+            raise primary from cleanup[0]
         raise
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
 
 
 plan_split = build_split_plan

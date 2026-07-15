@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import tempfile
@@ -383,6 +384,180 @@ class OutOfCoreSplitTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(OSError, "fsync failed"):
                 split_module._fsync_directory(Path("unused"))
+
+    def test_existing_manifest_semantic_tampering_is_rejected(self) -> None:
+        rows = _rows(40)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = self._build(rows, _config("random"), root)
+            manifest_path = plan.membership_path.with_suffix(".manifest.json")
+            valid = json.loads(manifest_path.read_text("utf-8"))
+
+            def increment_class(payload: dict[str, Any]) -> None:
+                payload["class_counts"]["train"]["benign"] += 1
+
+            def increment_source(payload: dict[str, Any]) -> None:
+                source = sorted(payload["source_coverage"])[0]
+                payload["source_coverage"][source]["train"] += 1
+
+            mutations = {
+                "schema_version": lambda payload: payload.__setitem__(
+                    "schema_version", "tampered"
+                ),
+                "class_counts": increment_class,
+                "source_coverage": increment_source,
+                "schema_descriptor": lambda payload: payload.__setitem__(
+                    "schema", [{"name": "row_uid", "type": "string", "nullable": True}]
+                ),
+                "schema_fingerprint": lambda payload: payload.__setitem__(
+                    "schema_fingerprint", "0" * 64
+                ),
+                "algorithm": lambda payload: payload["algorithm_versions"].__setitem__(
+                    "split", "tampered"
+                ),
+                "config": lambda payload: payload.__setitem__(
+                    "config_signature", "0" * 64
+                ),
+                "checks": lambda payload: payload["checks"].__setitem__(
+                    "unknown_in_train", 99
+                ),
+                "semantic_fingerprint": lambda payload: payload.__setitem__(
+                    "semantic_fingerprint", "0" * 64
+                ),
+                "membership_logical": lambda payload: payload["membership"].__setitem__(
+                    "logical_digest", "0" * 64
+                ),
+            }
+            for name, mutate in mutations.items():
+                with self.subTest(field=name):
+                    payload = copy.deepcopy(valid)
+                    mutate(payload)
+                    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "immutable split output"):
+                        self._build(rows, _config("random"), root)
+            manifest_path.write_text("{", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "immutable split output"):
+                self._build(rows, _config("random"), root)
+            manifest_path.write_text(json.dumps(valid), encoding="utf-8")
+
+    def test_manifest_schema_descriptor_is_ordered_and_preserves_nullability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            plan = self._build(_rows(20), _config("random"), Path(temp))
+            manifest = json.loads(
+                plan.membership_path.with_suffix(".manifest.json").read_text("utf-8")
+            )
+        self.assertEqual(
+            manifest["schema"],
+            [
+                {"name": "row_uid", "type": "string", "nullable": False},
+                {"name": "split", "type": "string", "nullable": False},
+                {"name": "behavior_label", "type": "string", "nullable": False},
+            ],
+        )
+        self.assertEqual(len(manifest["semantic_fingerprint"]), 64)
+
+    def test_post_rename_manifest_fsync_failure_rolls_back_both_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch(
+                "bitguard_bnn.out_of_core.manifest._fsync_directory",
+                side_effect=OSError("injected post-rename fsync failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "post-rename fsync failure"):
+                    self._build(_rows(20), _config("random"), root)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_success_never_ignores_work_tree_cleanup_failure(self) -> None:
+        import shutil
+
+        real_rmtree: Any = shutil.rmtree
+
+        def fail_only_when_strict(path: object, *args: object, **kwargs: object) -> None:
+            if Path(str(path)).name.startswith(".split-"):
+                if kwargs.get("ignore_errors"):
+                    return
+                raise OSError("injected work cleanup failure")
+            real_rmtree(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch(
+                "bitguard_bnn.out_of_core.split.shutil.rmtree",
+                side_effect=fail_only_when_strict,
+            ):
+                with self.assertRaisesRegex(OSError, "work cleanup failure"):
+                    self._build(_rows(20), _config("random"), root)
+            self.assertFalse(any(root.glob("split-membership-*")))
+
+    def test_primary_error_remains_primary_when_cleanup_also_fails(self) -> None:
+        import shutil
+
+        real_rmtree: Any = shutil.rmtree
+
+        def fail_only_when_strict(path: object, *args: object, **kwargs: object) -> None:
+            if Path(str(path)).name.startswith(".split-"):
+                if kwargs.get("ignore_errors"):
+                    return
+                raise OSError("secondary cleanup failure")
+            real_rmtree(path, *args, **kwargs)
+
+        def failing_chunks() -> Any:
+            yield _chunks(_rows(4), sizes=(4,))[0]
+            raise ValueError("primary inspection failure")
+
+        from bitguard_bnn.out_of_core.split import build_split_plan
+
+        with tempfile.TemporaryDirectory() as temp:
+            with patch(
+                "bitguard_bnn.out_of_core.split.shutil.rmtree",
+                side_effect=fail_only_when_strict,
+            ):
+                with self.assertRaisesRegex(ValueError, "primary inspection failure") as caught:
+                    build_split_plan(
+                        failing_chunks(),
+                        _config("random"),
+                        Path(temp),
+                        max_rows_per_run=4,
+                    )
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+
+    def test_idempotent_cleanup_fsync_fault_never_removes_existing_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = self._build(_rows(20), _config("random"), root)
+            manifest_path = plan.membership_path.with_suffix(".manifest.json")
+            membership_before = plan.membership_path.read_bytes()
+            manifest_before = manifest_path.read_bytes()
+            with patch(
+                "bitguard_bnn.out_of_core.split._fsync_directory",
+                side_effect=OSError("injected idempotent cleanup fsync failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "idempotent cleanup fsync failure"):
+                    self._build(_rows(20), _config("random"), root)
+            self.assertEqual(plan.membership_path.read_bytes(), membership_before)
+            self.assertEqual(manifest_path.read_bytes(), manifest_before)
+            self.assertFalse(any(".partial" in path.name for path in root.iterdir()))
+
+    def test_post_rename_membership_identity_fault_rolls_back_owned_file(self) -> None:
+        from bitguard_bnn.out_of_core import split as split_module
+
+        real_file_identity = split_module.file_identity
+
+        def fail_only_for_final_membership(path: Path) -> Any:
+            if path.name.startswith("split-membership-"):
+                raise PermissionError("injected post-rename identity failure")
+            return real_file_identity(path)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(
+                split_module,
+                "file_identity",
+                side_effect=fail_only_for_final_membership,
+            ):
+                with self.assertRaisesRegex(PermissionError, "identity failure"):
+                    self._build(_rows(20), _config("random"), root)
+            self.assertEqual(list(root.iterdir()), [])
 
 
 if __name__ == "__main__":
