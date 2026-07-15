@@ -360,6 +360,7 @@ class BootstrapWriterLock:
         self._nonce_factory = nonce_factory or (lambda: uuid.uuid4().hex)
         self._pid_is_alive = pid_is_alive or _pid_is_alive
         self._owned_metadata: dict[str, Any] | None = None
+        self._owned_identity: tuple[int, int] | None = None
         if not isinstance(self.pid, int) or isinstance(self.pid, bool) or self.pid <= 0:
             raise BootstrapLockError("A bootstrap writer lock PID must be positive.")
         if not isinstance(self.hostname, str) or not self.hostname:
@@ -374,73 +375,113 @@ class BootstrapWriterLock:
     def acquire(self) -> BootstrapWriterLock:
         """Acquire the lock or fail with explicit recovery guidance."""
 
-        if self._owned_metadata is not None:
+        if self._owned_metadata is not None or self._owned_identity is not None:
             raise BootstrapLockError(f"Bootstrap writer lock {self.path} is already held.")
 
-        while True:
-            metadata = self._new_metadata()
-            serialized = (
-                json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n"
-            ).encode("utf-8")
+        metadata = self._new_metadata()
+        serialized = (
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        recovered_stale = False
+        try:
+            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            recovered_stale = self._handle_existing_lock()
             try:
                 descriptor = os.open(
                     self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
                 )
             except FileExistsError:
-                self._handle_existing_lock()
-                continue
+                detail = (
+                    " after stale recovery"
+                    if recovered_stale
+                    else " while the existing lock changed"
+                )
+                raise BootstrapLockError(
+                    f"Another contender acquired bootstrap writer lock {self.path}"
+                    f"{detail}; its lock was preserved. Retry in a new acquisition "
+                    "attempt after verifying that writer's status."
+                ) from None
             except OSError as error:
                 raise BootstrapLockError(
                     f"Cannot create bootstrap writer lock {self.path}: {error}."
                 ) from error
-
-            identity = _stat_identity(os.fstat(descriptor))
-            try:
-                offset = 0
-                while offset < len(serialized):
-                    offset += os.write(descriptor, serialized[offset:])
-                os.fsync(descriptor)
-            except OSError as error:
-                try:
-                    os.close(descriptor)
-                finally:
-                    self._unlink_if_identity(identity)
-                raise BootstrapLockError(
-                    f"Cannot write bootstrap writer lock {self.path}: {error}."
-                ) from error
-            else:
-                os.close(descriptor)
-            self._owned_metadata = metadata
-            return self
-
-    def release(self) -> bool:
-        """Release only a lock whose metadata and file identity still match."""
-
-        owned = self._owned_metadata
-        if owned is None:
-            return False
-        try:
-            current = self._read_existing_lock()
-        except BootstrapLockError:
-            self._owned_metadata = None
-            return False
-        if current is None:
-            self._owned_metadata = None
-            return False
-        metadata, identity = current
-        if metadata != owned or not self._identity_is_current(identity):
-            self._owned_metadata = None
-            return False
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            self._owned_metadata = None
-            return False
         except OSError as error:
             raise BootstrapLockError(
-                f"Cannot release bootstrap writer lock {self.path}: {error}."
+                f"Cannot create bootstrap writer lock {self.path}: {error}."
             ) from error
-        self._owned_metadata = None
+
+        identity = _stat_identity(os.fstat(descriptor))
+        try:
+            offset = 0
+            while offset < len(serialized):
+                written = os.write(descriptor, serialized[offset:])
+                if written <= 0:
+                    raise OSError("lock write made no progress")
+                offset += written
+            os.fsync(descriptor)
+        except OSError as error:
+            try:
+                os.close(descriptor)
+            finally:
+                try:
+                    self._discard_created_lock(identity)
+                except BootstrapLockError as cleanup_error:
+                    raise BootstrapLockError(
+                        f"Cannot write bootstrap writer lock {self.path}: {error}; "
+                        f"safe cleanup also failed: {cleanup_error}"
+                    ) from error
+            raise BootstrapLockError(
+                f"Cannot write bootstrap writer lock {self.path}: {error}."
+            ) from error
+        else:
+            os.close(descriptor)
+        self._owned_metadata = metadata
+        self._owned_identity = identity
+        return self
+
+    def release(self) -> bool:
+        """Release only the exact lock inode and metadata acquired by this object."""
+
+        owned_metadata = self._owned_metadata
+        owned_identity = self._owned_identity
+        if owned_metadata is None or owned_identity is None:
+            self._clear_ownership()
+            return False
+
+        quarantine = self._quarantine_current("release")
+        if quarantine is None:
+            self._clear_ownership()
+            return False
+        try:
+            current = self._read_lock_at(quarantine)
+        except BootstrapLockError:
+            self._clear_ownership()
+            self._restore_quarantine(quarantine, "unverifiable release candidate")
+            return False
+
+        metadata, identity = current
+        if metadata != owned_metadata or identity != owned_identity:
+            self._clear_ownership()
+            self._restore_quarantine(quarantine, "changed release candidate")
+            return False
+
+        try:
+            quarantine.unlink()
+        except OSError as error:
+            self._clear_ownership()
+            try:
+                self._restore_quarantine(quarantine, "failed release cleanup")
+            except BootstrapLockError as restore_error:
+                raise BootstrapLockError(
+                    f"Cannot release bootstrap writer lock {self.path}: {error}; "
+                    f"safe restoration also failed: {restore_error}"
+                ) from error
+            raise BootstrapLockError(
+                f"Cannot release bootstrap writer lock {self.path}: {error}; "
+                "the lock was restored without deletion."
+            ) from error
+        self._clear_ownership()
         return True
 
     def _new_metadata(self) -> dict[str, Any]:
@@ -462,11 +503,11 @@ class BootstrapWriterLock:
             "nonce": nonce,
         }
 
-    def _handle_existing_lock(self) -> None:
+    def _handle_existing_lock(self) -> bool:
         current = self._read_existing_lock()
         if current is None:
-            return
-        metadata, _identity = current
+            return False
+        metadata, expected_identity = current
         self._refuse_foreign_or_active(metadata)
         if not self.recover_stale:
             raise BootstrapLockError(
@@ -475,21 +516,58 @@ class BootstrapWriterLock:
                 "required; retry with recover_stale=True after verifying the owner exited."
             )
 
-        rechecked = self._read_existing_lock()
-        if rechecked is None:
-            return
-        rechecked_metadata, identity = rechecked
-        self._refuse_foreign_or_active(rechecked_metadata)
-        if not self._identity_is_current(identity):
-            return
+        quarantine = self._quarantine_current("stale recovery")
+        if quarantine is None:
+            return False
         try:
-            self.path.unlink()
-        except FileNotFoundError:
-            return
-        except OSError as error:
+            quarantined_metadata, quarantined_identity = self._read_lock_at(quarantine)
+        except BootstrapLockError as error:
+            self._restore_quarantine(quarantine, "unverifiable stale candidate")
             raise BootstrapLockError(
-                f"Cannot recover stale bootstrap writer lock {self.path}: {error}."
+                f"Bootstrap writer lock {self.path} changed or became invalid during "
+                "stale recovery; it was restored without deletion. Inspect it before "
+                "retrying."
             ) from error
+
+        if (
+            quarantined_identity != expected_identity
+            or quarantined_metadata != metadata
+        ):
+            changed_owner_error: BootstrapLockError | None = None
+            try:
+                self._refuse_foreign_or_active(quarantined_metadata)
+            except BootstrapLockError as error:
+                changed_owner_error = error
+            self._restore_quarantine(quarantine, "changed stale candidate")
+            if changed_owner_error is not None:
+                raise changed_owner_error
+            raise BootstrapLockError(
+                f"Bootstrap writer lock {self.path} changed during stale recovery; "
+                "the replacement was restored without deletion. Retry as a new "
+                "acquisition attempt after verifying its owner."
+            )
+
+        try:
+            self._refuse_foreign_or_active(quarantined_metadata)
+        except BootstrapLockError:
+            self._restore_quarantine(quarantine, "active or foreign stale candidate")
+            raise
+
+        try:
+            quarantine.unlink()
+        except OSError as error:
+            try:
+                self._restore_quarantine(quarantine, "failed stale cleanup")
+            except BootstrapLockError as restore_error:
+                raise BootstrapLockError(
+                    f"Cannot recover stale bootstrap writer lock {self.path}: {error}; "
+                    f"safe restoration also failed: {restore_error}"
+                ) from error
+            raise BootstrapLockError(
+                f"Cannot recover stale bootstrap writer lock {self.path}: {error}; "
+                "the stale lock was restored without deletion."
+            ) from error
+        return True
 
     def _refuse_foreign_or_active(self, metadata: dict[str, Any]) -> None:
         if metadata["hostname"] != self.hostname:
@@ -506,43 +584,140 @@ class BootstrapWriterLock:
     def _read_existing_lock(
         self,
     ) -> tuple[dict[str, Any], tuple[int, int]] | None:
+        return self._read_lock_at(self.path, missing_ok=True)
+
+    def _read_lock_at(
+        self,
+        path: Path,
+        *,
+        missing_ok: bool = False,
+    ) -> tuple[dict[str, Any], tuple[int, int]] | None:
         try:
-            with self.path.open("rb") as stream:
+            with path.open("rb") as stream:
                 raw = stream.read()
                 identity = _stat_identity(os.fstat(stream.fileno()))
         except FileNotFoundError:
-            return None
+            if missing_ok:
+                return None
+            raise BootstrapLockError(
+                f"Bootstrap writer lock candidate {path} disappeared while it was "
+                "being verified; inspect sibling quarantine files before retrying."
+            ) from None
         except OSError as error:
             raise BootstrapLockError(
-                f"Cannot read bootstrap writer lock {self.path}: {error}."
+                f"Cannot read bootstrap writer lock {path}: {error}."
             ) from error
         try:
             payload = json.loads(raw.decode("utf-8"))
             metadata = _validate_lock_metadata(payload)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise BootstrapLockError(
-                f"Bootstrap writer lock {self.path} is invalid or truncated; it "
+                f"Bootstrap writer lock {path} is invalid or truncated; it "
                 "will not be removed automatically. Inspect ownership and remove it "
                 "manually only when safe."
             ) from error
         return metadata, identity
 
-    def _identity_is_current(self, identity: tuple[int, int]) -> bool:
+    def _quarantine_current(self, purpose: str) -> Path | None:
+        quarantine = self._reserve_quarantine()
         try:
-            return _stat_identity(self.path.stat()) == identity
+            os.replace(self.path, quarantine)
         except FileNotFoundError:
-            return False
+            try:
+                quarantine.unlink()
+            except OSError as cleanup_error:
+                raise BootstrapLockError(
+                    f"Bootstrap writer lock {self.path} disappeared during {purpose}, "
+                    f"and reserved quarantine {quarantine} could not be cleaned: "
+                    f"{cleanup_error}."
+                ) from cleanup_error
+            return None
+        except OSError as error:
+            try:
+                quarantine.unlink()
+            except OSError as cleanup_error:
+                raise BootstrapLockError(
+                    f"Cannot quarantine bootstrap writer lock {self.path} for "
+                    f"{purpose}: {error}; reserved quarantine {quarantine} could "
+                    f"not be cleaned: {cleanup_error}."
+                ) from error
+            raise BootstrapLockError(
+                f"Cannot quarantine bootstrap writer lock {self.path} for "
+                f"{purpose}: {error}."
+            ) from error
+        return quarantine
+
+    def _reserve_quarantine(self) -> Path:
+        for _attempt in range(16):
+            quarantine = self.path.with_name(
+                f".{self.path.name}.{uuid.uuid4().hex}.quarantine"
+            )
+            try:
+                descriptor = os.open(
+                    quarantine,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise BootstrapLockError(
+                    f"Cannot reserve a sibling quarantine for bootstrap writer lock "
+                    f"{self.path}: {error}."
+                ) from error
+            os.close(descriptor)
+            return quarantine
+        raise BootstrapLockError(
+            f"Cannot reserve a unique sibling quarantine for bootstrap writer lock "
+            f"{self.path}; inspect existing quarantine files before retrying."
+        )
+
+    def _restore_quarantine(self, quarantine: Path, reason: str) -> None:
+        try:
+            os.link(quarantine, self.path)
         except OSError as error:
             raise BootstrapLockError(
-                f"Cannot inspect bootstrap writer lock {self.path}: {error}."
+                f"Cannot safely restore bootstrap writer lock {self.path} after "
+                f"{reason}: {error}; quarantine {quarantine} is preserved. Inspect "
+                "both paths and restore the quarantined lock only when safe."
+            ) from error
+        try:
+            quarantine.unlink()
+        except OSError as error:
+            raise BootstrapLockError(
+                f"Bootstrap writer lock {self.path} was restored after {reason}, but "
+                f"quarantine {quarantine} could not be removed: {error}; it is "
+                "preserved as an additional link and requires manual cleanup."
             ) from error
 
-    def _unlink_if_identity(self, identity: tuple[int, int]) -> None:
+    def _discard_created_lock(self, expected_identity: tuple[int, int]) -> None:
+        quarantine = self._quarantine_current("failed lock creation cleanup")
+        if quarantine is None:
+            return
         try:
-            if self._identity_is_current(identity):
-                self.path.unlink()
-        except (BootstrapLockError, OSError):
-            pass
+            with quarantine.open("rb") as stream:
+                quarantined_identity = _stat_identity(os.fstat(stream.fileno()))
+        except OSError as error:
+            self._restore_quarantine(quarantine, "unverifiable failed lock creation")
+            raise BootstrapLockError(
+                f"Cannot verify failed bootstrap writer lock creation: {error}; "
+                "the candidate was restored without deletion."
+            ) from error
+        if quarantined_identity != expected_identity:
+            self._restore_quarantine(quarantine, "changed failed lock creation")
+            return
+        try:
+            quarantine.unlink()
+        except OSError as error:
+            self._restore_quarantine(quarantine, "failed lock creation cleanup")
+            raise BootstrapLockError(
+                f"Cannot clean failed bootstrap writer lock creation: {error}; "
+                "the candidate was restored without deletion."
+            ) from error
+
+    def _clear_ownership(self) -> None:
+        self._owned_metadata = None
+        self._owned_identity = None
 
 
 def _validate_lock_metadata(payload: Any) -> dict[str, Any]:

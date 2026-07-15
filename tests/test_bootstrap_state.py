@@ -23,6 +23,32 @@ from bitguard_bnn.bootstrap.state import (
 FIXED_TIME = datetime(2026, 7, 14, 4, 30, tzinfo=timezone.utc)
 
 
+class _FailingTextStream:
+    def __init__(self, stream, operation: str) -> None:
+        self._stream = stream
+        self._operation = operation
+
+    def __enter__(self):
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return self._stream.__exit__(exc_type, exc, traceback)
+
+    def write(self, value: str) -> int:
+        if self._operation == "write":
+            raise OSError("simulated state write failure")
+        return self._stream.write(value)
+
+    def flush(self) -> None:
+        if self._operation == "flush":
+            raise OSError("simulated state flush failure")
+        self._stream.flush()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+
 class BootstrapStateStoreTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -208,6 +234,66 @@ class BootstrapStateStoreTest(unittest.TestCase):
         )
         self.assertFalse((self.root / "state.json.tmp").exists())
 
+    def _assert_temp_stream_failure_preserves_previous_state(
+        self, operation: str
+    ) -> None:
+        archive = self.output("archive.zip")
+        inspection = self.output("inspection.json")
+        store = BootstrapStateStore(self.state_path)
+        store.complete("acquire", "input-a", [archive])
+        previous_bytes = self.state_path.read_bytes()
+        temporary = self.root / "state.json.tmp"
+        real_open = Path.open
+
+        def open_with_failure(path, *args, **kwargs):
+            stream = real_open(path, *args, **kwargs)
+            if path == temporary:
+                return _FailingTextStream(stream, operation)
+            return stream
+
+        with patch.object(
+            Path,
+            "open",
+            autospec=True,
+            side_effect=open_with_failure,
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "persist"):
+                store.complete("inspect", "input-b", [inspection])
+
+        self.assertEqual(self.state_path.read_bytes(), previous_bytes)
+        self.assertEqual(store.completed_stages, ("acquire",))
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
+        )
+        self.assertFalse(temporary.exists())
+
+    def test_failed_state_write_preserves_previous_state_and_cleans_temp(self):
+        self._assert_temp_stream_failure_preserves_previous_state("write")
+
+    def test_failed_state_flush_preserves_previous_state_and_cleans_temp(self):
+        self._assert_temp_stream_failure_preserves_previous_state("flush")
+
+    def test_failed_state_fsync_preserves_previous_state_and_cleans_temp(self):
+        archive = self.output("archive.zip")
+        inspection = self.output("inspection.json")
+        store = BootstrapStateStore(self.state_path)
+        store.complete("acquire", "input-a", [archive])
+        previous_bytes = self.state_path.read_bytes()
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.fsync",
+            side_effect=OSError("simulated state fsync failure"),
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "persist"):
+                store.complete("inspect", "input-b", [inspection])
+
+        self.assertEqual(self.state_path.read_bytes(), previous_bytes)
+        self.assertEqual(store.completed_stages, ("acquire",))
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
+        )
+        self.assertFalse((self.root / "state.json.tmp").exists())
+
     def test_restart_invalidates_stage_and_dependants(self):
         store = BootstrapStateStore(self.state_path)
         for stage in ("acquire", "extract", "inspect"):
@@ -254,9 +340,15 @@ class BootstrapWriterLockTest(unittest.TestCase):
         }
 
     def write_lock(self, **overrides: object) -> None:
+        self.write_lock_at(self.lock_path, **overrides)
+
+    def write_lock_at(self, path: Path, **overrides: object) -> None:
         metadata = self.metadata(**overrides)
-        self.lock_path.write_text(
-            json.dumps(metadata, sort_keys=True), encoding="utf-8"
+        path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+
+    def quarantine_paths(self) -> list[Path]:
+        return list(
+            self.lock_path.parent.glob(f".{self.lock_path.name}.*.quarantine")
         )
 
     def lock(self, **overrides: object) -> BootstrapWriterLock:
@@ -343,6 +435,122 @@ class BootstrapWriterLockTest(unittest.TestCase):
         metadata = json.loads(self.lock_path.read_text(encoding="utf-8"))
         self.assertEqual(metadata["nonce"], "replacement-owner")
 
+    def test_stale_recovery_restores_late_replacement_instead_of_deleting_it(self):
+        self.write_lock(pid=404, nonce="stale-owner")
+        winner_path = self.lock_path.with_name("late-winner.lock")
+        self.write_lock_at(winner_path, pid=505, nonce="late-winner")
+        real_replace = os.replace
+        real_unlink = Path.unlink
+        injected = False
+
+        def install_winner() -> None:
+            nonlocal injected
+            if not injected:
+                injected = True
+                real_replace(winner_path, self.lock_path)
+
+        def replace_after_last_check(source, target) -> None:
+            if Path(source) == self.lock_path:
+                install_winner()
+            real_replace(source, target)
+
+        def unlink_after_last_check(path, *args, **kwargs) -> None:
+            if path == self.lock_path:
+                install_winner()
+            real_unlink(path, *args, **kwargs)
+
+        with (
+            patch(
+                "bitguard_bnn.bootstrap.state.os.replace",
+                side_effect=replace_after_last_check,
+            ),
+            patch.object(
+                Path,
+                "unlink",
+                autospec=True,
+                side_effect=unlink_after_last_check,
+            ),
+        ):
+            with self.assertRaisesRegex(BootstrapLockError, "changed.*recovery"):
+                self.lock(
+                    pid_is_alive=lambda _pid: False,
+                    recover_stale=True,
+                ).acquire()
+
+        metadata = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["nonce"], "late-winner")
+        self.assertEqual(self.quarantine_paths(), [])
+
+    def test_contender_winning_after_stale_quarantine_is_preserved(self):
+        self.write_lock(pid=404, nonce="stale-owner")
+        real_open = os.open
+        exclusive_attempts = 0
+        probed_pids: list[int] = []
+
+        def contender_wins(path, flags, mode=0o777):
+            nonlocal exclusive_attempts
+            if Path(path) == self.lock_path and flags & os.O_EXCL:
+                exclusive_attempts += 1
+                if exclusive_attempts == 2:
+                    self.write_lock(pid=505, nonce="winning-contender")
+            return real_open(path, flags, mode)
+
+        def absent(pid: int) -> bool:
+            probed_pids.append(pid)
+            return False
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.open",
+            side_effect=contender_wins,
+        ):
+            with self.assertRaisesRegex(
+                BootstrapLockError, "contender.*stale recovery"
+            ):
+                self.lock(pid_is_alive=absent, recover_stale=True).acquire()
+
+        metadata = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["nonce"], "winning-contender")
+        self.assertNotIn(505, probed_pids)
+        self.assertEqual(exclusive_attempts, 2)
+        self.assertEqual(self.quarantine_paths(), [])
+
+    def test_failed_mismatch_restore_preserves_quarantine_and_new_owner(self):
+        self.write_lock(pid=404, nonce="stale-owner")
+        winner_path = self.lock_path.with_name("late-winner.lock")
+        self.write_lock_at(winner_path, pid=505, nonce="quarantined-winner")
+        real_replace = os.replace
+        injected = False
+
+        def replace_then_fill_original(source, target) -> None:
+            nonlocal injected
+            if Path(source) == self.lock_path and not injected:
+                injected = True
+                real_replace(winner_path, self.lock_path)
+                real_replace(self.lock_path, target)
+                self.write_lock(pid=606, nonce="new-canonical-owner")
+                return
+            real_replace(source, target)
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.replace",
+            side_effect=replace_then_fill_original,
+        ):
+            with self.assertRaisesRegex(
+                BootstrapLockError, "quarantine.*preserved"
+            ) as caught:
+                self.lock(
+                    pid_is_alive=lambda _pid: False,
+                    recover_stale=True,
+                ).acquire()
+
+        canonical = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        self.assertEqual(canonical["nonce"], "new-canonical-owner")
+        quarantines = self.quarantine_paths()
+        self.assertEqual(len(quarantines), 1)
+        self.assertIn(str(quarantines[0]), str(caught.exception))
+        quarantined = json.loads(quarantines[0].read_text(encoding="utf-8"))
+        self.assertEqual(quarantined["nonce"], "quarantined-winner")
+
     def test_old_but_active_lock_is_never_removed_based_on_age(self):
         self.write_lock(pid=606, started_at="2001-01-01T00:00:00Z")
 
@@ -379,6 +587,27 @@ class BootstrapWriterLockTest(unittest.TestCase):
         self.assertTrue(self.lock_path.exists())
         metadata = json.loads(self.lock_path.read_text(encoding="utf-8"))
         self.assertEqual(metadata["nonce"], "replacement-owner")
+
+    def test_release_preserves_byte_identical_replacement_with_new_identity(self):
+        lock = self.lock()
+        lock.acquire()
+        owned_bytes = self.lock_path.read_bytes()
+        owned_identity = (self.lock_path.stat().st_dev, self.lock_path.stat().st_ino)
+        replacement = self.lock_path.with_name("identical-replacement.lock")
+        replacement.write_bytes(owned_bytes)
+        replacement_identity = (replacement.stat().st_dev, replacement.stat().st_ino)
+        self.assertNotEqual(replacement_identity, owned_identity)
+        os.replace(replacement, self.lock_path)
+
+        self.assertFalse(lock.release())
+
+        self.assertTrue(self.lock_path.exists())
+        self.assertEqual(self.lock_path.read_bytes(), owned_bytes)
+        self.assertEqual(
+            (self.lock_path.stat().st_dev, self.lock_path.stat().st_ino),
+            replacement_identity,
+        )
+        self.assertEqual(self.quarantine_paths(), [])
 
 
 if __name__ == "__main__":
