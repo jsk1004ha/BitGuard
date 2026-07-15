@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
 import itertools
 import os
 import sqlite3
@@ -252,6 +254,26 @@ def _verify_pinned_text(
         current_fd
     ) or _content_fingerprint(path_before) != _content_fingerprint(current_path):
         raise SchemaInspectionError(f"CSV source changed during inspection: {path}")
+
+
+def _sha256_pinned_text(path: Path, handle: TextIO) -> str:
+    """Hash the source through its already identity-pinned descriptor."""
+
+    descriptor = handle.fileno()
+    try:
+        handle.seek(0)
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while block := os.read(descriptor, 1 << 20):
+            digest.update(block)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise SchemaInspectionError(
+            f"cannot hash pinned CSV source {path}: {error}"
+        ) from error
+    if _content_fingerprint(before) != _content_fingerprint(after):
+        raise SchemaInspectionError(f"CSV source changed during inspection: {path}")
+    return digest.hexdigest()
 
 
 def _discover_csvs(source: Path) -> tuple[Path, tuple[Path, ...]]:
@@ -566,6 +588,7 @@ class _FileInspectionPlan:
     unusable_columns: tuple[str, ...]
     timestamp_numeric_mode: bool
     source_fingerprint: tuple[int, int, int, int]
+    source_sha256: str
 
 
 def _converted_numeric(values: Sequence[str]):
@@ -576,6 +599,28 @@ def _converted_numeric(values: Sequence[str]):
     except Exception as error:
         raise SchemaInspectionError(
             "pandas numeric conversion failed; rerun bootstrap to restore the locked "
+            "dependency environment"
+        ) from error
+
+
+def _pandas_inferred_chunk(
+    header: Sequence[str],
+    rows: Sequence[dict[str, str]],
+):
+    """Apply the training adapter's pandas CSV inference to one bounded chunk."""
+
+    _require_pandas()
+    assert pd is not None
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows([row[column] for column in header] for row in rows)
+    buffer.seek(0)
+    try:
+        return pd.read_csv(buffer, low_memory=False)
+    except Exception as error:
+        raise SchemaInspectionError(
+            "pandas CSV inference failed; rerun bootstrap to restore the locked "
             "dependency environment"
         ) from error
 
@@ -636,6 +681,7 @@ def _plan_file_inspection(
     numeric_keys: set[str] = set()
     timestamp_numeric = 0
     timestamp_total = 0
+    source_sha256 = ""
     try:
         bounded_lines = _BoundedLines(handle, max_record_chars)
         reader = csv.reader(bounded_lines, strict=True)
@@ -655,17 +701,18 @@ def _plan_file_inspection(
                     values_chunk.append(values)
             if not values_chunk:
                 continue
+            inferred_chunk = _pandas_inferred_chunk(schema.header, values_chunk)
             for candidate in schema.candidates:
                 key = _column_key(candidate)
                 if key in numeric_keys:
                     continue
                 converted = _converted_numeric(
-                    [values[candidate] for values in values_chunk]
+                    inferred_chunk[candidate]
                 )
                 if bool(converted.notna().any()):
                     numeric_keys.add(key)
             if schema.timestamp is not None:
-                timestamp_values = [values[schema.timestamp] for values in values_chunk]
+                timestamp_values = inferred_chunk[schema.timestamp]
                 converted_timestamp = _converted_numeric(timestamp_values)
                 timestamp_numeric += int(converted_timestamp.notna().sum())
                 timestamp_total += len(timestamp_values)
@@ -673,6 +720,7 @@ def _plan_file_inspection(
         raise SchemaInspectionError(f"cannot parse CSV {path}: {error}") from error
     finally:
         try:
+            source_sha256 = _sha256_pinned_text(path, handle)
             _verify_pinned_text(path, handle, opened, path_before, root)
         finally:
             handle.close()
@@ -696,6 +744,7 @@ def _plan_file_inspection(
             timestamp_total > 0 and timestamp_numeric / timestamp_total >= 0.95
         ),
         source_fingerprint=_content_fingerprint(path_before),
+        source_sha256=source_sha256,
     )
 
 
@@ -783,6 +832,7 @@ def _inspect_csv_dataset_unlocked(
                 file_accepted = 0
                 file_rejections: Counter[str] = Counter()
                 file_classes: Counter[str] = Counter()
+                pass_sha256 = ""
                 try:
                     if _content_fingerprint(path_before) != plan.source_fingerprint:
                         raise SchemaInspectionError(
@@ -811,17 +861,17 @@ def _inspect_csv_dataset_unlocked(
                             for reason, values in checked_rows
                             if reason is None and values is not None
                         ]
-                        timestamp_validity = iter(
-                            _timestamp_validity(
-                                [
-                                    values[schema.timestamp]
-                                    for values in normalized_rows
-                                ],
+                        if schema.timestamp is not None and normalized_rows:
+                            inferred_chunk = _pandas_inferred_chunk(
+                                schema.header, normalized_rows
+                            )
+                            timestamp_flags = _timestamp_validity(
+                                inferred_chunk[schema.timestamp],
                                 numeric_mode=plan.timestamp_numeric_mode,
                             ).tolist()
-                            if schema.timestamp is not None
-                            else [True] * len(normalized_rows)
-                        )
+                        else:
+                            timestamp_flags = [True] * len(normalized_rows)
+                        timestamp_validity = iter(timestamp_flags)
                         for reason, values in checked_rows:
                             logical_row += 1
                             file_rows += 1
@@ -859,9 +909,14 @@ def _inspect_csv_dataset_unlocked(
                     ) from error
                 finally:
                     try:
+                        pass_sha256 = _sha256_pinned_text(path, handle)
                         _verify_pinned_text(path, handle, opened, path_before, root)
                     finally:
                         handle.close()
+                if pass_sha256 != plan.source_sha256:
+                    raise SchemaInspectionError(
+                        f"CSV source changed between inspection passes: {path}"
+                    )
                 file_reports.append(
                     FileSchemaReport(
                         relative_path=relative,

@@ -306,6 +306,49 @@ class SchemaInspectionTest(unittest.TestCase):
         self.assertTrue(observed["0.01e310"])
         self.assertFalse(observed["1_000"])
 
+    def test_boolean_feature_inference_matches_training_adapter(self) -> None:
+        frame = pd.read_csv(
+            io.StringIO("enabled,x\nTrue,1\nFalse,2\n"),
+            low_memory=False,
+        )
+        expected = tuple(sorted(_numeric_features(frame), key=str.casefold))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rows.csv").write_text(
+                "enabled,x\nTrue,1\nFalse,2\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset("nbaiot", root, chunk_size=2)
+
+        self.assertEqual(report.feature_columns, expected)
+        self.assertIn("enabled", report.feature_columns)
+
+    def test_boolean_timestamp_inference_matches_training_adapter(self) -> None:
+        timestamps = pd.read_csv(
+            io.StringIO("stime\nTrue\nFalse\n"),
+            low_memory=False,
+        )["stime"]
+        expected = _coerce_timestamp(timestamps).notna()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory,saddr,stime,x\n"
+                "Normal,Normal,device,True,1\n"
+                "Normal,Normal,device,False,2\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                chunk_size=2,
+                fail_on_rejected=False,
+            )
+
+        self.assertEqual(report.accepted_rows, int(expected.sum()))
+        self.assertEqual(report.rejected_rows, int((~expected).sum()))
+
     def test_underscore_timestamp_is_rejected_during_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -327,7 +370,7 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertEqual(report.rejected_reasons, (("invalid_timestamp", 1),))
 
     def test_timestamp_mode_matches_training_threshold_at_95_percent(self) -> None:
-        for numeric_rows, expected_accepted in ((96, 96), (94, 6)):
+        for numeric_rows in (96, 94):
             with (
                 self.subTest(numeric_rows=numeric_rows),
                 tempfile.TemporaryDirectory() as directory,
@@ -337,7 +380,16 @@ class SchemaInspectionTest(unittest.TestCase):
                 timestamps.extend(
                     "2019-01-01T00:00:00Z" for _ in range(100 - numeric_rows)
                 )
-                expected = _coerce_timestamp(pd.Series(timestamps)).notna()
+                csv_text = "stime\n" + "\n".join(timestamps) + "\n"
+                inferred = pd.concat(
+                    pd.read_csv(
+                        io.StringIO(csv_text),
+                        chunksize=7,
+                        low_memory=False,
+                    ),
+                    ignore_index=True,
+                )["stime"]
+                expected = _coerce_timestamp(inferred).notna()
                 with (root / "flows.csv").open(
                     "w", encoding="utf-8", newline=""
                 ) as handle:
@@ -351,10 +403,9 @@ class SchemaInspectionTest(unittest.TestCase):
                 )
 
                 self.assertEqual(report.accepted_rows, int(expected.sum()))
-                self.assertEqual(report.accepted_rows, expected_accepted)
                 self.assertEqual(
                     report.rejected_reasons,
-                    (("invalid_timestamp", 100 - expected_accepted),),
+                    (("invalid_timestamp", 100 - int(expected.sum())),),
                 )
 
     def test_timestamp_numeric_mode_rejects_infinity_for_elapsed_time_safety(
@@ -497,6 +548,26 @@ class SchemaInspectionTest(unittest.TestCase):
                 ),
             )
 
+    def test_timestamp_inference_handles_a_chunk_with_only_malformed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory,saddr,stime,x\n"
+                "Normal,Normal,device,1,1\n"
+                "Normal,Normal,device,2\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                chunk_size=1,
+                fail_on_rejected=False,
+            )
+
+        self.assertEqual(report.accepted_rows, 1)
+        self.assertEqual(report.rejected_reasons, (("column_count_mismatch", 1),))
+
     def test_row_and_field_ceilings_bound_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -573,6 +644,47 @@ class SchemaInspectionTest(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(
                     SchemaInspectionError, "changed between inspection passes"
+                ),
+            ):
+                inspect_csv_dataset("nbaiot", root)
+
+    def test_same_inode_size_and_mtime_rewrite_between_passes_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            path.write_text("x\n1\n", encoding="utf-8")
+            original = path.stat()
+            real_open = inspect_module._open_pinned_text
+            calls = 0
+
+            def rewrite_before_second_pass(candidate: Path):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    with candidate.open("r+b") as handle:
+                        handle.seek(0)
+                        handle.write(b"x\n2\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.utime(
+                        candidate,
+                        ns=(original.st_atime_ns, original.st_mtime_ns),
+                    )
+                    rewritten = candidate.stat()
+                    self.assertEqual(rewritten.st_ino, original.st_ino)
+                    self.assertEqual(rewritten.st_size, original.st_size)
+                    self.assertEqual(rewritten.st_mtime_ns, original.st_mtime_ns)
+                return real_open(candidate)
+
+            with (
+                patch.object(
+                    inspect_module,
+                    "_open_pinned_text",
+                    rewrite_before_second_pass,
+                ),
+                self.assertRaisesRegex(
+                    SchemaInspectionError,
+                    "changed between inspection passes",
                 ),
             ):
                 inspect_csv_dataset("nbaiot", root)

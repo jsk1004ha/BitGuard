@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+from bitguard_bnn.bootstrap import extract as extract_module
 from bitguard_bnn.bootstrap.extract import (
     ArchiveExtractionError,
     MissingArchiveToolError,
@@ -165,49 +166,104 @@ class SafeZipExtractionTest(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertEqual(sorted(item.name for item in root.iterdir()), ["source.zip"])
 
-    def test_private_temp_mutation_during_link_is_not_published(self) -> None:
+    def test_destination_is_published_once_as_a_complete_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "source.zip"
+            destination = root / "output"
+            _write_zip(
+                archive,
+                [("nested/data.csv", b"trusted"), ("other.csv", b"complete")],
+            )
+            real_publish = extract_module.rename_directory_noreplace
+            observations: list[tuple[bool, tuple[str, ...]]] = []
+
+            def observe_atomic_publish(source: Path, target: Path) -> None:
+                self.assertEqual(target, destination)
+                self.assertFalse(target.exists())
+                staged = tuple(
+                    sorted(
+                        item.relative_to(source).as_posix()
+                        for item in source.rglob("*")
+                        if item.is_file()
+                    )
+                )
+                observations.append((target.exists(), staged))
+                real_publish(source, target)
+                published = tuple(
+                    sorted(
+                        item.relative_to(target).as_posix()
+                        for item in target.rglob("*")
+                        if item.is_file()
+                    )
+                )
+                observations.append((target.exists(), published))
+
+            with patch.object(
+                extract_module,
+                "rename_directory_noreplace",
+                side_effect=observe_atomic_publish,
+            ):
+                extract_zip(archive, destination)
+            expected = ("nested/data.csv", "other.csv")
+            self.assertEqual(observations, [(False, expected), (True, expected)])
+
+    def test_publication_collision_preserves_foreign_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive = root / "source.zip"
             destination = root / "output"
             _write_zip(archive, [("data.csv", b"trusted")])
-            real_link = os.link
+            real_publish = extract_module.rename_directory_noreplace
+            foreign = b"foreign destination must survive"
 
-            def mutating_link(source, target, *args, **kwargs):
-                result = real_link(source, target, *args, **kwargs)
-                source_path = Path(source)
-                if source_path.name.endswith(".partial"):
-                    source_path.write_bytes(b"changed")
-                return result
+            def collide(source: Path, target: Path) -> None:
+                target.mkdir()
+                (target / "foreign.bin").write_bytes(foreign)
+                real_publish(source, target)
 
             with (
-                patch("bitguard_bnn.bootstrap.extract.os.link", mutating_link),
-                self.assertRaisesRegex(ArchiveExtractionError, "content changed"),
+                patch.object(
+                    extract_module,
+                    "rename_directory_noreplace",
+                    side_effect=collide,
+                ),
+                self.assertRaisesRegex(ArchiveExtractionError, "destination appeared"),
             ):
                 extract_zip(archive, destination)
-            self.assertFalse(destination.exists())
+            self.assertEqual((destination / "foreign.bin").read_bytes(), foreign)
 
-    def test_staged_file_mutation_during_final_publication_is_rejected(self) -> None:
+    def test_replacement_at_former_cleanup_window_is_never_recursively_deleted(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive = root / "source.zip"
             destination = root / "output"
+            displaced = root / "published-owned-tree"
             _write_zip(archive, [("data.csv", b"trusted")])
-            real_link = os.link
+            real_publish = extract_module.rename_directory_noreplace
+            foreign = b"replacement tree must survive"
 
-            def mutating_link(source, target, *args, **kwargs):
-                result = real_link(source, target, *args, **kwargs)
-                source_path = Path(source)
-                if source_path.name == "data.csv":
-                    source_path.write_bytes(b"changed")
-                return result
+            def replace_after_publish(source: Path, target: Path) -> None:
+                real_publish(source, target)
+                target.rename(displaced)
+                target.mkdir()
+                (target / "foreign.bin").write_bytes(foreign)
+                raise OSError("injected post-publication replacement")
 
             with (
-                patch("bitguard_bnn.bootstrap.extract.os.link", mutating_link),
-                self.assertRaisesRegex(ArchiveExtractionError, "content changed"),
+                patch.object(
+                    extract_module,
+                    "rename_directory_noreplace",
+                    side_effect=replace_after_publish,
+                ),
+                self.assertRaisesRegex(ArchiveExtractionError, "publication failed"),
             ):
                 extract_zip(archive, destination)
-            self.assertFalse(destination.exists())
+
+            self.assertEqual((destination / "foreign.bin").read_bytes(), foreign)
+            self.assertEqual((displaced / "data.csv").read_bytes(), b"trusted")
 
     def test_extracts_regular_files_with_stable_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -382,6 +438,8 @@ Mode = drwxr-xr-x
             source.write_bytes(b"rar")
             destination = root / "out"
             calls: list[list[str]] = []
+            publications: list[tuple[bool, tuple[str, ...]]] = []
+            real_publish = extract_module.rename_directory_noreplace
 
             def run(args, **kwargs):
                 calls.append(list(args))
@@ -394,18 +452,48 @@ Mode = drwxr-xr-x
                 (output / "empty").mkdir()
                 return subprocess.CompletedProcess(args, 0, "", "")
 
-            result = extract_rar(
-                source,
-                destination,
-                which_fn=lambda name: "/tools/7z" if name == "7z" else None,
-                run_fn=run,
-                disk_free_fn=lambda _: 100,
-            )
+            def observe_atomic_publish(staged: Path, target: Path) -> None:
+                self.assertEqual(staged.name, "content")
+                self.assertFalse(target.exists())
+                before = tuple(
+                    sorted(
+                        item.relative_to(staged).as_posix()
+                        for item in staged.rglob("*")
+                        if item.is_file()
+                    )
+                )
+                publications.append((target.exists(), before))
+                real_publish(staged, target)
+                after = tuple(
+                    sorted(
+                        item.relative_to(target).as_posix()
+                        for item in target.rglob("*")
+                        if item.is_file()
+                    )
+                )
+                publications.append((target.exists(), after))
+
+            with patch.object(
+                extract_module,
+                "rename_directory_noreplace",
+                side_effect=observe_atomic_publish,
+            ):
+                result = extract_rar(
+                    source,
+                    destination,
+                    which_fn=lambda name: "/tools/7z" if name == "7z" else None,
+                    run_fn=run,
+                    disk_free_fn=lambda _: 100,
+                )
             self.assertEqual([call[1] for call in calls], ["l", "x"])
             self.assertIn("--", calls[0])
             self.assertIn("--", calls[1])
             self.assertEqual(result.files, ("nested/data.csv",))
             self.assertEqual((destination / "nested" / "data.csv").read_bytes(), b"1234567")
+            self.assertEqual(
+                publications,
+                [(False, ("nested/data.csv",)), (True, ("nested/data.csv",))],
+            )
 
     def test_rejects_unexpected_result_tree_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

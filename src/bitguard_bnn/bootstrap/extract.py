@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
+from bitguard_bnn.bootstrap.fsops import rename_directory_noreplace
+
 
 class ArchiveExtractionError(RuntimeError):
     """An archive cannot be extracted without violating the safety contract."""
@@ -383,7 +385,6 @@ def _write_zip_member(
     parent_before = _lstat(destination.parent, "private extraction directory")
     if not _same_object(parent_expected, parent_before):
         raise ArchiveExtractionError("private extraction directory changed before file creation")
-    temporary = destination.parent / f".bitguard-{uuid.uuid4().hex}.partial"
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -392,16 +393,17 @@ def _write_zip_member(
         | getattr(os, "O_NOFOLLOW", 0)
     )
     descriptor = -1
-    temporary_identity: os.stat_result | None = None
+    destination_identity: os.stat_result | None = None
+    digest = hashlib.sha256()
     written = 0
     try:
-        descriptor = os.open(temporary, flags, stat.S_IRUSR | stat.S_IWUSR)
+        descriptor = os.open(destination, flags, stat.S_IRUSR | stat.S_IWUSR)
         parent_after_open = _lstat(destination.parent, "private extraction directory")
         if not _same_object(parent_expected, parent_after_open):
             raise ArchiveExtractionError(
                 "private extraction directory changed during file creation"
             )
-        temporary_identity = os.fstat(descriptor)
+        destination_identity = os.fstat(descriptor)
         with archive.open(info, "r") as source:
             while True:
                 block = source.read(chunk_size)
@@ -420,44 +422,37 @@ def _write_zip_member(
                             f"short write while extracting {info.filename!r}"
                         )
                     view = view[count:]
+                digest.update(block)
         if written != info.file_size:
             raise ArchiveExtractionError(
                 f"archive member size mismatch for {info.filename!r}: "
                 f"declared={info.file_size}, actual={written}"
             )
         os.fsync(descriptor)
+        descriptor_result = os.fstat(descriptor)
+        if (
+            destination_identity is None
+            or not _same_object(destination_identity, descriptor_result)
+            or descriptor_result.st_size != written
+        ):
+            raise ArchiveExtractionError("staged extraction file changed while writing")
         os.close(descriptor)
         descriptor = -1
-        current = temporary.lstat()
-        if temporary_identity is None or not _same_object(temporary_identity, current):
-            raise ArchiveExtractionError("private temporary file was replaced during extraction")
-        temporary_digest, current = _regular_sha256(temporary, current)
-        try:
-            os.link(temporary, destination, follow_symlinks=False)
-        except FileExistsError as error:
-            raise ArchiveExtractionError(
-                f"no-clobber publication refused existing path: {destination}"
-            ) from error
         destination_result = destination.lstat()
-        if not _same_object(temporary_identity, destination_result):
-            raise ArchiveExtractionError("published extraction file identity mismatch")
-        temporary.unlink()
-        published_digest, published_result = _regular_sha256(destination, temporary_identity)
-        if published_result.st_size != written or published_digest != temporary_digest:
-            raise ArchiveExtractionError("published extraction file content changed")
+        if destination_identity is None or not _same_object(
+            destination_identity, destination_result
+        ):
+            raise ArchiveExtractionError("staged extraction file identity mismatch")
+        staged_digest, staged_result = _regular_sha256(
+            destination, destination_identity
+        )
+        if staged_result.st_size != written or staged_digest != digest.hexdigest():
+            raise ArchiveExtractionError("staged extraction file content changed")
         _fsync_directory(destination.parent)
         return written
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary_identity is not None:
-            try:
-                current = temporary.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                if _same_object(temporary_identity, current):
-                    temporary.unlink(missing_ok=True)
 
 
 def _zip_entries(infos: Sequence[zipfile.ZipInfo]) -> tuple[ArchiveEntry, ...]:
@@ -500,85 +495,37 @@ def _cleanup_staging(staging: Path, expected: os.stat_result) -> None:
     shutil.rmtree(staging)
 
 
-def _publish_tree(
-    staging: Path,
-    staging_identity: os.stat_result,
+def _publish_directory(
+    source: Path,
+    source_identity: os.stat_result,
     destination: Path,
     destination_parent_identity: os.stat_result,
-    entries: Sequence[ArchiveEntry],
 ) -> None:
-    _assert_root_identity(staging, staging_identity)
+    _assert_root_identity(source, source_identity)
     parent_now = _lstat(destination.parent, "destination parent")
     if not _same_object(destination_parent_identity, parent_now):
         raise ArchiveExtractionError("destination parent changed before publication")
     try:
-        os.mkdir(destination, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        rename_directory_noreplace(source, destination)
     except FileExistsError as error:
         raise ArchiveExtractionError(
             f"destination appeared before no-clobber publication: {destination}"
         ) from error
-    destination_identity = destination.lstat()
-    try:
-        directories = sorted(
-            {
-                parent.as_posix()
-                for entry in entries
-                for parent in PurePosixPath(entry.path).parents
-            }
-            | {entry.path for entry in entries if entry.is_dir},
-            key=lambda item: (len(PurePosixPath(item).parts), item.casefold()),
+    except OSError as error:
+        raise ArchiveExtractionError(
+            f"atomic extraction publication failed for {destination}: {error}; "
+            "all observed paths were preserved"
+        ) from error
+    published = _lstat(destination, "published extraction directory")
+    if not _same_object(source_identity, published) or not stat.S_ISDIR(
+        published.st_mode
+    ):
+        raise ArchiveExtractionError(
+            f"published extraction directory identity changed: {destination}; "
+            "the observed path was preserved"
         )
-        for relative in directories:
-            if relative in {"", "."}:
-                continue
-            _assert_root_identity(destination, destination_identity)
-            target = _contained(destination, relative)
-            target.mkdir(exist_ok=True)
-            result = target.lstat()
-            if (
-                not stat.S_ISDIR(result.st_mode)
-                or stat.S_ISLNK(result.st_mode)
-                or _is_reparse(result)
-            ):
-                raise ArchiveExtractionError(f"unsafe publication directory: {relative!r}")
-        files = sorted(
-            (item for item in entries if not item.is_dir), key=lambda item: item.path
-        )
-        for entry in files:
-            _assert_root_identity(destination, destination_identity)
-            source = _contained(staging, entry.path)
-            target = _contained(destination, entry.path)
-            source_result = source.lstat()
-            if not stat.S_ISREG(source_result.st_mode) or stat.S_ISLNK(source_result.st_mode):
-                raise ArchiveExtractionError(
-                    f"unsafe staged file before publication: {entry.path!r}"
-                )
-            source_digest, source_result = _regular_sha256(source, source_result)
-            try:
-                os.link(source, target, follow_symlinks=False)
-            except FileExistsError as error:
-                raise ArchiveExtractionError(
-                    f"no-clobber publication refused existing path: {target}"
-                ) from error
-            if not _same_object(source_result, target.lstat()):
-                raise ArchiveExtractionError(f"publication identity mismatch: {entry.path!r}")
-            source.unlink()
-            target_digest, target_result = _regular_sha256(target, source_result)
-            if source_digest != target_digest or target_result.st_size != entry.size:
-                raise ArchiveExtractionError(
-                    f"published extraction content changed: {entry.path!r}"
-                )
-        _fsync_directory(destination)
-        _fsync_directory(destination.parent)
-    except BaseException:
-        try:
-            current = destination.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            if _same_object(destination_identity, current):
-                shutil.rmtree(destination)
-        raise
+    _fsync_directory(destination)
+    _fsync_directory(destination.parent)
 
 
 def extract_zip(
@@ -643,7 +590,7 @@ def extract_zip(
                 )
         _verify_source_unchanged(source_path, source_identity, handle)
         assert staging is not None and staging_identity is not None
-        _publish_tree(staging, staging_identity, destination_path, parent_identity, entries)
+        _publish_directory(staging, staging_identity, destination_path, parent_identity)
         return ExtractionResult(
             source=str(source_path),
             destination=str(destination_path),
@@ -949,12 +896,11 @@ def extract_rar(
             or source_now.st_mtime_ns != source_identity.st_mtime_ns
         ):
             raise ArchiveExtractionError("RAR source changed during extraction")
-        _publish_tree(
+        _publish_directory(
             extraction_root,
             extraction_identity,
             destination_path,
             parent_identity,
-            entries,
         )
         return ExtractionResult(
             source=str(source_path),

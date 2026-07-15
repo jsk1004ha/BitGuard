@@ -346,6 +346,19 @@ def _rename_noreplace(
     raise OSError(error_number, os.strerror(error_number), source)
 
 
+def rename_directory_noreplace(
+    source: Path | str,
+    destination: Path | str,
+) -> None:
+    """Atomically publish a directory without replacing an existing path.
+
+    Both paths must be on the same filesystem.  Unsupported kernels fail
+    closed instead of falling back to a clobbering rename.
+    """
+
+    _rename_noreplace(Path(source), Path(destination), None)
+
+
 def _reclaim_retired_storage(
     artifact: Path,
     expected: tuple[int, ...],
