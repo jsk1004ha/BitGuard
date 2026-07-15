@@ -166,6 +166,28 @@ class OutOfCoreShardTests(unittest.TestCase):
             first = plan.manifest_path.parent / manifest["entries"][0]["path"]
             self.assertEqual(pq.ParquetFile(first).schema_arrow.names[-2:], ["f1", "f2"])
 
+    def test_recomputed_manifest_rejects_unknown_algorithm_versions(self) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split, plan = self._write(_rows(), root)
+            payload = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            payload["algorithm_versions"]["shards"] = "attacker-controlled-v99"
+            payload["fingerprint"] = shard_module.stable_fingerprint(
+                shard_module._manifest_semantics(payload)
+            )
+            plan.manifest_path.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "algorithm"):
+                shard_module.verify_shard_manifest(
+                    plan.manifest_path,
+                    split_plan=split,
+                )
+
     def test_writes_exact_partitioned_coverage_and_semantic_manifest(self) -> None:
         from bitguard_bnn.out_of_core.shard import verify_shard_manifest
 

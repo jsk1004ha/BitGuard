@@ -1200,6 +1200,12 @@ def load_shard_manifest(path: Path | str) -> dict[str, Any]:
         raise RuntimeError(f"unable to read shard manifest: {manifest_path}") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != SHARD_MANIFEST_SCHEMA:
         raise RuntimeError(f"unsupported shard manifest schema: {manifest_path}")
+    expected_algorithms = {
+        "shards": SHARD_ALGORITHM,
+        "coverage": COVERAGE_ALGORITHM,
+    }
+    if payload.get("algorithm_versions") != expected_algorithms:
+        raise RuntimeError("unsupported shard manifest algorithm versions")
     try:
         fingerprint = stable_fingerprint(_manifest_semantics(payload))
     except (TypeError, ValueError) as exc:
