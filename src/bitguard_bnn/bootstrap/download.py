@@ -73,7 +73,7 @@ def sanitize_url(value: str) -> str:
     host = f"[{hostname}]" if ":" in hostname else hostname
     if port is not None:
         host = f"{host}:{port}"
-    sanitized = SplitResult(parsed.scheme, host, parsed.path, parsed.query, parsed.fragment)
+    sanitized = SplitResult(parsed.scheme, host, parsed.path, "", "")
     return urlunsplit(sanitized)
 
 
@@ -273,7 +273,8 @@ def _stream_response(
     stream, opened_identity = _open_partial(
         partial, append=append, known_stat=known_stat
     )
-    failure: BaseException | None = None
+    failure: Exception | None = None
+    base_exception_active = False
     try:
         while True:
             try:
@@ -300,13 +301,25 @@ def _stream_response(
             os.fsync(stream.fileno())
         except OSError as sync_error:
             failure = OSError(f"{error}; preserving the partial also failed: {sync_error}")
-    try:
-        stream.close()
-    except OSError as close_error:
-        if failure is None:
-            failure = close_error
-        else:
-            failure = OSError(f"{failure}; partial close also failed: {close_error}")
+    except BaseException:
+        base_exception_active = True
+        try:
+            stream.flush()
+            os.fsync(stream.fileno())
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            stream.close()
+        except OSError as close_error:
+            if not base_exception_active:
+                if failure is None:
+                    failure = close_error
+                else:
+                    failure = OSError(
+                        f"{failure}; partial close also failed: {close_error}"
+                    )
     if failure is not None:
         if isinstance(failure, DownloadError):
             raise failure
@@ -475,11 +488,23 @@ def download_file(
         try:
             response = urlopen(request, timeout=float(timeout))
         except HTTPError as error:
-            if error.code == 416 and request_offset > 0 and not retry_without_range:
-                response_url = sanitize_url(error.geturl() or safe_source)
-                match = _UNSATISFIED_RANGE.fullmatch(
+            try:
+                status_code = error.code
+                error_response_url = sanitize_url(error.geturl() or safe_source)
+                content_range = (
                     error.headers.get("Content-Range", "") if error.headers else ""
                 )
+            finally:
+                try:
+                    error.close()
+                except OSError as close_error:
+                    raise DownloadError(
+                        f"Could not close HTTP error response for {safe_source}: "
+                        f"{close_error}."
+                    ) from close_error
+            if status_code == 416 and request_offset > 0 and not retry_without_range:
+                response_url = error_response_url
+                match = _UNSATISFIED_RANGE.fullmatch(content_range)
                 if match is not None and int(match.group(1)) == request_offset:
                     expected_total = request_offset
                     break
@@ -487,7 +512,7 @@ def download_file(
                 restarted = True
                 continue
             raise DownloadError(
-                f"HTTP download failed for {safe_source} with status {error.code}; "
+                f"HTTP download failed for {error_response_url} with status {status_code}; "
                 f"resumable content remains at {partial}."
             ) from None
         except (URLError, TimeoutError, OSError, ValueError) as error:

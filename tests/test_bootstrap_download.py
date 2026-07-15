@@ -9,9 +9,12 @@ import threading
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from bitguard_bnn.bootstrap import download as download_module
 from bitguard_bnn.bootstrap import manifest as manifest_module
@@ -42,6 +45,23 @@ class _RangeServer:
             def do_GET(self) -> None:
                 fixture.requests.append({key: value for key, value in self.headers.items()})
                 requested = self.headers.get("Range")
+                if fixture.mode in {"redirect-secret", "redirect-error"} and self.path.startswith(
+                    "/archive.zip"
+                ):
+                    self.send_response(302)
+                    self.send_header(
+                        "Location",
+                        "/redirected.zip?access_token=redirect-query-secret"
+                        "#redirect-fragment-secret",
+                    )
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if fixture.mode == "redirect-error" and self.path.startswith(
+                    "/redirected.zip"
+                ):
+                    self.send_error(503, "redirected fixture failure")
+                    return
                 if fixture.mode == "error":
                     self.send_error(503, "temporary fixture failure")
                     return
@@ -125,6 +145,68 @@ class _GuardedResponse:
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._response, name)
+
+
+class _CloseTrackingHTTPError(HTTPError):
+    def __init__(self, url: str, status: int, headers: Message | None = None) -> None:
+        super().__init__(url, status, "fixture error", headers or Message(), BytesIO())
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+        super().close()
+
+
+class _InterruptingResponse:
+    def __init__(self, url: str, signal: BaseException, prefix: bytes) -> None:
+        self.status = 200
+        self.headers = Message()
+        self.headers["Content-Length"] = str(len(PAYLOAD))
+        self._url = url
+        self._signal = signal
+        self._prefix = prefix
+        self._reads = 0
+        self.close_count = 0
+
+    def geturl(self) -> str:
+        return self._url
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self, _amount: int) -> bytes:
+        self._reads += 1
+        if self._reads == 1:
+            return self._prefix
+        raise self._signal
+
+    def close(self) -> None:
+        self.close_count += 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+class _CloseTrackingStream:
+    def __init__(self, stream: object) -> None:
+        self._stream = stream
+        self.close_count = 0
+
+    def write(self, payload: bytes) -> int:
+        return self._stream.write(payload)  # type: ignore[attr-defined]
+
+    def flush(self) -> None:
+        self._stream.flush()  # type: ignore[attr-defined]
+
+    def fileno(self) -> int:
+        return self._stream.fileno()  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self.close_count += 1
+        self._stream.close()  # type: ignore[attr-defined]
 
 
 class DownloadFileTest(unittest.TestCase):
@@ -434,6 +516,113 @@ class DownloadFileTest(unittest.TestCase):
         self.assertTrue(restarted.restarted)
         self.assertEqual(self.destination.read_bytes(), PAYLOAD)
 
+    def test_accepted_416_http_error_is_closed_exactly_once(self) -> None:
+        self.partial.write_bytes(PAYLOAD)
+        headers = Message()
+        headers["Content-Range"] = f"bytes */{len(PAYLOAD)}"
+        error = _CloseTrackingHTTPError(
+            "https://example.test/archive?access_token=error-secret#fragment-secret",
+            416,
+            headers,
+        )
+
+        with patch.object(download_module, "urlopen", side_effect=error):
+            result = download_file("https://example.test/archive", self.destination)
+
+        self.assertEqual(error.close_count, 1)
+        self.assertEqual(result.sha256, PAYLOAD_SHA256)
+
+    def test_retryable_416_http_error_is_closed_exactly_once(self) -> None:
+        self.partial.write_bytes(PAYLOAD[:83])
+        headers = Message()
+        headers["Content-Range"] = f"bytes */{len(PAYLOAD)}"
+        error = _CloseTrackingHTTPError(
+            "https://example.test/archive?sig=retry-secret#retry-fragment",
+            416,
+            headers,
+        )
+        real_urlopen = download_module.urlopen
+        calls = 0
+
+        def fail_once_then_open(*args: object, **kwargs: object):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise error
+            return real_urlopen(*args, **kwargs)
+
+        with _RangeServer(mode="range-416") as server:
+            with patch.object(download_module, "urlopen", side_effect=fail_once_then_open):
+                result = download_file(server.url, self.destination)
+
+        self.assertEqual(error.close_count, 1)
+        self.assertTrue(result.restarted)
+        self.assertEqual(self.destination.read_bytes(), PAYLOAD)
+
+    def test_terminal_http_error_is_closed_once_and_diagnostics_hide_secrets(self) -> None:
+        error = _CloseTrackingHTTPError(
+            "https://example.test/archive?X-Amz-Signature=terminal-secret"
+            "#terminal-fragment",
+            503,
+        )
+
+        with patch.object(download_module, "urlopen", side_effect=error):
+            with self.assertRaises(DownloadError) as caught:
+                download_file(
+                    "https://user:password@example.test/archive"
+                    "?access_token=source-secret#source-fragment",
+                    self.destination,
+                )
+
+        self.assertEqual(error.close_count, 1)
+        rendered = str(caught.exception)
+        for secret in (
+            "user",
+            "password",
+            "terminal-secret",
+            "terminal-fragment",
+            "source-secret",
+            "source-fragment",
+        ):
+            self.assertNotIn(secret, rendered)
+
+    def test_base_exceptions_close_partial_descriptor_and_are_not_converted(self) -> None:
+        prefix = PAYLOAD[:61]
+        real_fdopen = download_module.os.fdopen
+        signal_cases = (KeyboardInterrupt("interrupt"), SystemExit("exit"))
+
+        for signal in signal_cases:
+            with self.subTest(signal=type(signal).__name__):
+                self.partial.unlink(missing_ok=True)
+                self.destination.unlink(missing_ok=True)
+                streams: list[_CloseTrackingStream] = []
+                response = _InterruptingResponse(
+                    "https://example.test/archive?sig=response-secret#response-fragment",
+                    signal,
+                    prefix,
+                )
+
+                def tracking_fdopen(*args: object, **kwargs: object):
+                    tracked = _CloseTrackingStream(real_fdopen(*args, **kwargs))
+                    streams.append(tracked)
+                    return tracked
+
+                with (
+                    patch.object(download_module, "urlopen", return_value=response),
+                    patch.object(download_module.os, "fdopen", side_effect=tracking_fdopen),
+                ):
+                    with self.assertRaises(type(signal)) as caught:
+                        download_file("https://example.test/archive", self.destination)
+
+                observed_close_count = streams[0].close_count
+                if observed_close_count == 0:
+                    streams[0].close()
+                self.assertIs(caught.exception, signal)
+                self.assertEqual(observed_close_count, 1)
+                self.assertEqual(response.close_count, 1)
+                self.assertEqual(self.partial.read_bytes(), prefix)
+                self.assertFalse(self.destination.exists())
+
     def test_destination_and_partial_symlinks_are_rejected(self) -> None:
         outside = self.root / "outside"
         outside.write_bytes(b"outside")
@@ -448,8 +637,11 @@ class DownloadFileTest(unittest.TestCase):
                 path.unlink()
 
     def test_url_sanitization_removes_credentials_from_values_and_errors(self) -> None:
-        sanitized = sanitize_url("https://user:password@example.test/archive?q=1")
-        self.assertEqual(sanitized, "https://example.test/archive?q=1")
+        sanitized = sanitize_url(
+            "https://user:password@example.test/archive"
+            "?access_token=query-secret#oauth-fragment-secret"
+        )
+        self.assertEqual(sanitized, "https://example.test/archive")
         with self.assertRaises(DownloadError) as caught:
             download_file(
                 "http://user:password@127.0.0.1:1/archive",
@@ -459,6 +651,46 @@ class DownloadFileTest(unittest.TestCase):
         rendered = str(caught.exception)
         self.assertNotIn("user", rendered)
         self.assertNotIn("password", rendered)
+
+    def test_result_urls_drop_signed_queries_and_redirect_fragments(self) -> None:
+        source_secrets = (
+            "source-signature-secret",
+            "source-oauth-secret",
+            "source-fragment-secret",
+        )
+        with _RangeServer(mode="redirect-secret") as server:
+            source_url = (
+                f"{server.url}?X-Amz-Signature={source_secrets[0]}"
+                f"&access_token={source_secrets[1]}#{source_secrets[2]}"
+            )
+            result = download_file(source_url, self.destination)
+
+        self.assertEqual(result.source_url, server.url)
+        self.assertEqual(
+            result.final_response_url,
+            server.url.replace("/archive.zip", "/redirected.zip"),
+        )
+        serialized = json.dumps(result.to_dict())
+        for secret in (*source_secrets, "redirect-query-secret", "redirect-fragment-secret"):
+            self.assertNotIn(secret, serialized)
+
+    def test_redirected_http_error_diagnostics_drop_query_and_fragment_secrets(self) -> None:
+        with _RangeServer(mode="redirect-error") as server:
+            with self.assertRaises(DownloadError) as caught:
+                download_file(
+                    f"{server.url}?access_token=source-error-secret"
+                    "#source-error-fragment",
+                    self.destination,
+                )
+
+        rendered = str(caught.exception)
+        for secret in (
+            "source-error-secret",
+            "source-error-fragment",
+            "redirect-query-secret",
+            "redirect-fragment-secret",
+        ):
+            self.assertNotIn(secret, rendered)
 
 
 @contextmanager
