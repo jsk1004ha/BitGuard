@@ -66,6 +66,7 @@ class _IterationPlan:
     source: _SourceSpec
     files: tuple[_FilePlan, ...]
     retained_uids: frozenset[str] | None
+    materialization_order: tuple[str, ...] | None
     feature_columns: tuple[str, ...]
 
 
@@ -93,10 +94,12 @@ def _relative_path(path: Path, root: Path) -> str:
 
 
 def _resolve_source(
-    config: dict[str, Any], path_override: Path | None = None
+    config: dict[str, Any],
+    path_override: Path | None = None,
+    dataset_type: str | None = None,
 ) -> _SourceSpec:
     cfg = config["dataset"]
-    kind = str(cfg["type"]).lower()
+    kind = str(dataset_type or cfg["type"]).lower()
     if kind not in {"nbaiot", "botiot", "csv"}:
         raise ValueError(f"unsupported dataset.type: {kind}")
     label_overrides = (
@@ -122,9 +125,11 @@ def _resolve_source(
         if kind == "botiot":
             raise FileNotFoundError(f"no BoT-IoT CSV files match {pattern}")
         raise FileNotFoundError(f"no CSV files match {pattern}")
-    project_root = Path(config.get("_project_root", "."))
-    relative_paths = tuple(_relative_path(path, project_root) for path in files)
-    return _SourceSpec(kind, files, relative_paths, None, label_overrides)
+    selected = resolve_path(config, pattern)
+    selected_root = Path(selected) if selected is not None and Path(selected).is_dir() else None
+    relative_root = selected_root or Path(config.get("_project_root", "."))
+    relative_paths = tuple(_relative_path(path, relative_root) for path in files)
+    return _SourceSpec(kind, files, relative_paths, selected_root, label_overrides)
 
 
 def _close_reader(reader: object) -> None:
@@ -164,7 +169,7 @@ def _scan_selected_rows(
     finally:
         _close_reader(reader)
     if offset == 0:
-        raise ValueError(f"empty CSV: {path}")
+        return frozenset()
     if max_rows is None or offset <= max_rows:
         return None
     return frozenset(-source_index for _, source_index in retained)
@@ -421,9 +426,9 @@ def _select_class_uids(
     chunk_size: int,
     limit: int | None,
     seed: int,
-) -> frozenset[str] | None:
+) -> tuple[frozenset[str] | None, tuple[str, ...] | None]:
     if limit is None:
-        return None
+        return None, None
     if limit <= 0:
         raise ValueError("max_rows_per_class must be positive or null")
     rng = np.random.default_rng(seed)
@@ -455,7 +460,12 @@ def _select_class_uids(
                     elif entry > heap[0]:
                         heapq.heapreplace(heap, entry)
                 ordinals[label] = ordinal
-    return frozenset(entry[2] for heap in heaps.values() for entry in heap)
+    materialization_order = tuple(
+        entry[2]
+        for heap in heaps.values()
+        for entry in sorted(heap, key=lambda item: (-item[0], -item[1]))
+    )
+    return frozenset(materialization_order), materialization_order
 
 
 def _filter_retained(
@@ -504,8 +514,9 @@ def _build_iteration_plan(
     config: dict[str, Any],
     path_override: Path | None,
     apply_sampling_caps: bool,
+    dataset_type: str | None = None,
 ) -> _IterationPlan:
-    source = _resolve_source(config, path_override)
+    source = _resolve_source(config, path_override, dataset_type)
     cfg = config["dataset"]
     chunk_size = int(cfg["chunk_size"])
     max_rows = cfg.get("max_rows_per_file") if apply_sampling_caps else None
@@ -522,6 +533,8 @@ def _build_iteration_plan(
             seed=data_module._source_seed(int(config["experiment"]["seed"]), path),
             budget=budget,
         )
+        if selected_rows == frozenset():
+            continue
         schema, timestamp = _plan_schema_and_timestamp(
             source.kind, path, selected_rows, cfg, chunk_size
         )
@@ -529,9 +542,11 @@ def _build_iteration_plan(
             _FilePlan(path, relative_path, selected_rows, schema, timestamp)
         )
     files = tuple(file_plans)
+    if not files:
+        raise ValueError("no numeric feature columns were found")
     class_limit = cfg.get("max_rows_per_class") if apply_sampling_caps else None
     class_limit = int(class_limit) if class_limit is not None else None
-    retained_uids = _select_class_uids(
+    retained_uids, materialization_order = _select_class_uids(
         files,
         source,
         chunk_size=chunk_size,
@@ -545,17 +560,18 @@ def _build_iteration_plan(
         chunk_size=chunk_size,
         drop_columns=set(cfg.get("drop_columns", [])),
     )
-    return _IterationPlan(source, files, retained_uids, features)
+    return _IterationPlan(
+        source,
+        files,
+        retained_uids,
+        materialization_order,
+        features,
+    )
 
 
-def iter_normalized_chunks(
-    config: dict[str, Any],
-    path_override: Path | None = None,
-    apply_sampling_caps: bool = True,
+def _iter_planned_chunks(
+    config: dict[str, Any], plan: _IterationPlan
 ) -> Iterator[NormalizedChunk]:
-    """Yield normalized dataset chunks without concatenating source frames."""
-
-    plan = _build_iteration_plan(config, path_override, apply_sampling_caps)
     chunk_size = int(config["dataset"]["chunk_size"])
     for file_plan in plan.files:
         for chunk in _iter_file_normalized(file_plan, plan.source, chunk_size):
@@ -574,22 +590,46 @@ def iter_normalized_chunks(
             )
 
 
+def iter_normalized_chunks(
+    config: dict[str, Any],
+    *,
+    path_override: Path | None = None,
+    apply_sampling_caps: bool = True,
+) -> Iterator[NormalizedChunk]:
+    """Yield normalized dataset chunks without concatenating source frames."""
+
+    plan = _build_iteration_plan(config, path_override, apply_sampling_caps)
+    yield from _iter_planned_chunks(config, plan)
+
+
 def load_normalized_dataset(
-    config: dict[str, Any], path_override: Path | None = None
+    config: dict[str, Any],
+    path_override: Path | None = None,
+    *,
+    dataset_type: str | None = None,
 ) -> data_module.LoadedDataset:
     """Materialize normalized chunks at the legacy in-memory compatibility boundary."""
 
-    chunks = list(iter_normalized_chunks(config, path_override))
+    plan = _build_iteration_plan(config, path_override, True, dataset_type)
+    chunks = list(_iter_planned_chunks(config, plan))
     if not chunks:
         raise ValueError("dataset contains no rows")
-    combined = (
-        pd.concat([chunk.frame for chunk in chunks], ignore_index=True)
-        .sample(frac=1, random_state=int(config["experiment"]["seed"]))
-        .reset_index(drop=True)
-    )
+    combined = pd.concat([chunk.frame for chunk in chunks], ignore_index=True)
+    if plan.materialization_order is not None:
+        order = {
+            uid: position
+            for position, uid in enumerate(plan.materialization_order)
+        }
+        combined["__materialization_order"] = combined["row_uid"].map(order)
+        combined = combined.sort_values(
+            "__materialization_order", kind="stable"
+        ).drop(columns="__materialization_order")
+    combined = combined.sample(
+        frac=1, random_state=int(config["experiment"]["seed"])
+    ).reset_index(drop=True)
     cfg = config["dataset"]
     features = data_module._numeric_features(combined, cfg.get("drop_columns", []))
-    source = _resolve_source(config, path_override)
+    source = plan.source
     digests: dict[str, str] = {}
     for path, relative_path in zip(source.files, source.relative_paths):
         digest_key = (

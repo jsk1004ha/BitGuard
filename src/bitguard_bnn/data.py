@@ -14,9 +14,6 @@ from .config import resolve_path
 from .constants import (
     CANONICAL_LABELS,
     META_COLUMNS,
-    botiot_behavior,
-    canonicalize_behavior,
-    nbaiot_behavior,
     normalize_token,
 )
 
@@ -163,60 +160,12 @@ def _numeric_features(frame: pd.DataFrame, drop_columns: Iterable[str] = ()) -> 
 
 
 def load_nbaiot(config: dict[str, Any], path_override: Path | None = None) -> LoadedDataset:
-    cfg = config["dataset"]
-    root = path_override or resolve_path(config, cfg["path"])
-    assert root is not None
-    files = sorted(root.rglob("*.csv"))
-    if not files:
-        raise FileNotFoundError(f"no N-BaIoT CSV files under {root}")
-    seed = int(config["experiment"]["seed"])
-    label_overrides = {
-        normalize_token(key): canonicalize_behavior(value)
-        for key, value in cfg.get("label_map", {}).items()
-    }
-    accumulator = _FrameAccumulator(cfg.get("max_rows_per_class"), seed)
-    digests: dict[str, str] = {}
-    for path in files:
-        relative = path.relative_to(root)
-        device = relative.parts[0] if len(relative.parts) > 1 else path.parent.name
-        stem = normalize_token(path.stem)
-        if "benign" in stem:
-            raw_attack = "benign"
-        else:
-            family = normalize_token(path.parent.name.replace("_attacks", ""))
-            raw_attack = f"{family}_{stem}"
-        frame = _read_csv_chunks(
-            path,
-            int(cfg["chunk_size"]),
-            cfg.get("max_rows_per_file"),
-            _source_seed(int(config["experiment"]["seed"]), path),
-        )
-        behavior = label_overrides.get(raw_attack, nbaiot_behavior(raw_attack))
-        frame = _append_metadata(
-            frame,
-            dataset="nbaiot",
-            source_file=path,
-            device_id=device,
-            raw_attack=raw_attack,
-            behavior_label=behavior,
-            row_prefix="nbaiot",
-        )
-        accumulator.add(frame)
-        digests[str(relative)] = _file_digest(path)
-    combined = accumulator.finish(seed)
-    features = _numeric_features(combined, cfg.get("drop_columns", []))
-    return LoadedDataset(
-        combined,
-        features,
-        {
-            "type": "nbaiot",
-            "root": str(root),
-            "files": len(files),
-            "sha256": digests,
-            "has_wall_clock_time": False,
-            "notes": "N-BaIoT sequence_index is not a wall-clock timestamp.",
-            "label_overrides": label_overrides,
-        },
+    from .out_of_core.source import load_normalized_dataset
+
+    return load_normalized_dataset(
+        config,
+        path_override,
+        dataset_type="nbaiot",
     )
 
 
@@ -231,67 +180,12 @@ def _resolve_glob(config: dict[str, Any], pattern: str | Path) -> list[Path]:
 
 
 def load_botiot(config: dict[str, Any], path_override: Path | None = None) -> LoadedDataset:
-    cfg = config["dataset"]
-    files = _resolve_glob(config, path_override or cfg["path"])
-    if not files:
-        raise FileNotFoundError(f"no BoT-IoT CSV files match {path_override or cfg['path']}")
-    seed = int(config["experiment"]["seed"])
-    label_overrides = {
-        normalize_token(key): canonicalize_behavior(value)
-        for key, value in cfg.get("label_map", {}).items()
-    }
-    accumulator = _FrameAccumulator(cfg.get("max_rows_per_class"), seed)
-    digests: dict[str, str] = {}
-    for path in files:
-        frame = _read_csv_chunks(
-            path,
-            int(cfg["chunk_size"]),
-            cfg.get("max_rows_per_file"),
-            _source_seed(int(config["experiment"]["seed"]), path),
-        )
-        label_col = _find_column(frame, cfg.get("label_column"), ["category", "label", "attack"])
-        raw_col = _find_column(
-            frame, cfg.get("raw_attack_column"), ["subcategory", "attack", "category"]
-        )
-        device_col = _find_column(frame, cfg.get("device_column"), ["saddr", "srcip", "device_id"])
-        time_col = _find_column(frame, cfg.get("time_column"), ["stime", "timestamp", "time"])
-        category = frame[label_col] if label_col else pd.Series("unknown", index=frame.index)
-        raw_attack = frame[raw_col] if raw_col else category
-        behaviors = [
-            label_overrides.get(
-                normalize_token(raw),
-                label_overrides.get(normalize_token(cat), botiot_behavior(cat, raw)),
-            )
-            for cat, raw in zip(category, raw_attack)
-        ]
-        devices = frame[device_col].astype(str) if device_col else f"source_{path.stem}"
-        timestamps = _coerce_timestamp(frame[time_col]) if time_col else None
-        metadata_sources = {label_col, raw_col, device_col, time_col} - {None}
-        frame = frame.drop(columns=list(metadata_sources), errors="ignore")
-        frame = _append_metadata(
-            frame,
-            dataset="botiot",
-            source_file=path,
-            device_id=devices,
-            raw_attack=raw_attack.map(normalize_token),
-            behavior_label=behaviors,
-            timestamp=timestamps,
-            row_prefix="botiot",
-        )
-        accumulator.add(frame)
-        digests[str(path)] = _file_digest(path)
-    combined = accumulator.finish(seed)
-    features = _numeric_features(combined, cfg.get("drop_columns", []))
-    return LoadedDataset(
-        combined,
-        features,
-        {
-            "type": "botiot",
-            "files": len(files),
-            "sha256": digests,
-            "has_wall_clock_time": bool(combined["timestamp"].notna().any()),
-            "label_overrides": label_overrides,
-        },
+    from .out_of_core.source import load_normalized_dataset
+
+    return load_normalized_dataset(
+        config,
+        path_override,
+        dataset_type="botiot",
     )
 
 
@@ -315,55 +209,12 @@ def _coerce_timestamp(values: pd.Series) -> pd.Series:
 
 
 def load_generic_csv(config: dict[str, Any], path_override: Path | None = None) -> LoadedDataset:
-    cfg = config["dataset"]
-    files = _resolve_glob(config, path_override or cfg["path"])
-    if not files:
-        raise FileNotFoundError(f"no CSV files match {path_override or cfg['path']}")
-    seed = int(config["experiment"]["seed"])
-    accumulator = _FrameAccumulator(cfg.get("max_rows_per_class"), seed)
-    digests: dict[str, str] = {}
-    for path in files:
-        frame = _read_csv_chunks(
-            path,
-            int(cfg["chunk_size"]),
-            cfg.get("max_rows_per_file"),
-            _source_seed(int(config["experiment"]["seed"]), path),
-        )
-        label_col = cfg.get("label_column", "behavior_label")
-        if label_col not in frame:
-            raise ValueError(f"label column {label_col!r} missing from {path}")
-        raw_col = cfg.get("raw_attack_column", "raw_attack")
-        device_col = cfg.get("device_column", "device_id")
-        time_col = cfg.get("time_column", "timestamp")
-        labels = frame[label_col].map(canonicalize_behavior)
-        raw = frame[raw_col].map(normalize_token) if raw_col in frame else frame[label_col].map(normalize_token)
-        devices = frame[device_col].astype(str) if device_col in frame else f"source_{path.stem}"
-        timestamps = _coerce_timestamp(frame[time_col]) if time_col in frame else None
-        metadata_sources = {label_col, raw_col, device_col, time_col} & set(frame.columns)
-        frame = frame.drop(columns=list(metadata_sources))
-        frame = _append_metadata(
-            frame,
-            dataset="csv",
-            source_file=path,
-            device_id=devices,
-            raw_attack=raw,
-            behavior_label=labels,
-            timestamp=timestamps,
-            row_prefix="csv",
-        )
-        accumulator.add(frame)
-        digests[str(path)] = _file_digest(path)
-    combined = accumulator.finish(seed)
-    features = _numeric_features(combined, cfg.get("drop_columns", []))
-    return LoadedDataset(
-        combined,
-        features,
-        {
-            "type": "csv",
-            "files": len(files),
-            "sha256": digests,
-            "has_wall_clock_time": bool(combined["timestamp"].notna().any()),
-        },
+    from .out_of_core.source import load_normalized_dataset
+
+    return load_normalized_dataset(
+        config,
+        path_override,
+        dataset_type="csv",
     )
 
 

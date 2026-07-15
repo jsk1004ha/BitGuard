@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ import pandas as pd
 
 from bitguard_bnn.config import DEFAULTS
 from bitguard_bnn.data import (
+    LoadedDataset,
     load_botiot,
     load_dataset,
     load_generic_csv,
@@ -189,6 +191,141 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "label column"):
                 list(iter_normalized_chunks(config, apply_sampling_caps=False))
+
+    def test_materialized_class_cap_order_matches_legacy_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for folder, base in (("a", 0), ("b", 10)):
+                (root / folder).mkdir()
+                pd.DataFrame(
+                    {
+                        "behavior_label": [
+                            "benign",
+                            "scan_like",
+                            "benign",
+                            "scan_like",
+                        ],
+                        "raw_attack": ["benign", "scan", "benign", "scan"],
+                        "device_id": [folder] * 4,
+                        "timestamp": range(base, base + 4),
+                        "x": range(base, base + 4),
+                    }
+                ).to_csv(root / folder / "rows.csv", index=False)
+            config = _base_config(root, "csv", "**/*.csv")
+            config["dataset"]["max_rows_per_class"] = 2
+
+            legacy = load_generic_csv(config).frame
+            materialized = load_dataset(config).frame
+
+        expected = [
+            ("b", 1, "scan_like"),
+            ("a", 1, "scan_like"),
+            ("a", 2, "benign"),
+            ("b", 2, "benign"),
+        ]
+
+        def identity(frame: pd.DataFrame) -> list[tuple[str, int, str]]:
+            return [
+                (Path(source).parent.name, int(index), str(label))
+                for source, index, label in zip(
+                    frame["source_file"],
+                    frame["sequence_index"],
+                    frame["behavior_label"],
+                )
+            ]
+
+        self.assertEqual(identity(legacy), expected)
+        self.assertEqual(identity(materialized), expected)
+
+    def test_header_only_file_is_skipped_when_later_file_has_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "00-header.csv").write_text(
+                "behavior_label,timestamp,x\n", encoding="utf-8"
+            )
+            pd.DataFrame(
+                {
+                    "behavior_label": ["benign", "scan_like"],
+                    "timestamp": [1, 2],
+                    "x": [3, 4],
+                }
+            ).to_csv(root / "01-data.csv", index=False)
+            config = _base_config(root, "csv", "*.csv")
+
+            chunks = list(iter_normalized_chunks(config))
+            loaded = load_dataset(config)
+
+        self.assertEqual(sum(len(chunk.frame) for chunk in chunks), 2)
+        self.assertEqual({chunk.source_relative_path for chunk in chunks}, {"01-data.csv"})
+        self.assertEqual(len(loaded.frame), 2)
+        self.assertEqual(loaded.provenance["files"], 2)
+
+    def test_only_header_files_report_no_numeric_features(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "header.csv").write_text(
+                "behavior_label,timestamp,x\n", encoding="utf-8"
+            )
+            config = _base_config(root, "csv", "header.csv")
+
+            with self.assertRaisesRegex(ValueError, "no numeric feature"):
+                list(iter_normalized_chunks(config))
+
+    def test_iterator_options_are_keyword_only(self) -> None:
+        parameters = inspect.signature(iter_normalized_chunks).parameters
+        self.assertEqual(
+            parameters["path_override"].kind,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        self.assertEqual(
+            parameters["apply_sampling_caps"].kind,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+
+    def test_directory_override_uses_unique_paths_relative_to_selected_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            selected = root / "selected"
+            for folder, value in (("a", 1), ("b", 2)):
+                (selected / folder).mkdir(parents=True)
+                pd.DataFrame(
+                    {"behavior_label": ["benign"], "x": [value]}
+                ).to_csv(selected / folder / "rows.csv", index=False)
+            config = _base_config(project, "csv", "unused.csv")
+
+            chunks = list(
+                iter_normalized_chunks(config, path_override=selected)
+            )
+
+        self.assertEqual(
+            [chunk.source_relative_path for chunk in chunks],
+            ["a/rows.csv", "b/rows.csv"],
+        )
+
+    def test_typed_loaders_delegate_to_shared_materializer(self) -> None:
+        sentinel = LoadedDataset(pd.DataFrame(), [], {})
+        cases = (
+            (load_nbaiot, "nbaiot"),
+            (load_botiot, "botiot"),
+            (load_generic_csv, "csv"),
+        )
+        for loader, dataset_type in cases:
+            with self.subTest(dataset_type=dataset_type):
+                config = {"dataset": {"type": dataset_type}}
+                with patch(
+                    "bitguard_bnn.out_of_core.source.load_normalized_dataset",
+                    return_value=sentinel,
+                ) as shared:
+                    self.assertIs(loader(config), sentinel)
+                shared.assert_called_once_with(
+                    config,
+                    None,
+                    dataset_type=dataset_type,
+                )
 
 
 if __name__ == "__main__":
