@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shlex
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -423,7 +424,7 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         durable.assert_any_call(destination)
         self.assertEqual(destination.read_bytes(), b"verified")
 
-    def test_durable_directory_helper_orders_syncs_and_skips_existing_roots(
+    def test_durable_directory_helper_orders_syncs_for_new_and_existing_roots(
         self,
     ) -> None:
         from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
@@ -483,7 +484,78 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
             ),
         ):
             ensure(root)
-        self.assertEqual(events, [])
+        self.assertEqual(
+            events,
+            [
+                ("fsync-self", root),
+                ("fsync-parent", root),
+            ],
+        )
+
+    def test_durable_directory_retry_reestablishes_sync_after_first_failure(
+        self,
+    ) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        root = self.root / "retry-protocol-root"
+        with patch.object(
+            orchestrator_module,
+            "_fsync_parent_directory",
+            side_effect=OSError("injected parent fsync failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "injected parent fsync failure"):
+                orchestrator_module._ensure_durable_directory(root)
+
+        self.assertTrue(root.is_dir())
+        events: list[tuple[str, Path]] = []
+        with (
+            patch.object(
+                orchestrator_module,
+                "_fsync_directory",
+                side_effect=lambda path: events.append(("fsync-self", Path(path))),
+            ),
+            patch.object(
+                orchestrator_module,
+                "_fsync_parent_directory",
+                side_effect=lambda path: events.append(("fsync-parent", Path(path))),
+            ),
+        ):
+            created = orchestrator_module._ensure_durable_directory(root)
+
+        self.assertFalse(created)
+        self.assertEqual(
+            events,
+            [
+                ("fsync-self", root),
+                ("fsync-parent", root),
+            ],
+        )
+
+    def test_durable_directory_rejects_symlink_and_reparse_roots(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        root = self.root / "unsafe-protocol-root"
+        cases = {
+            "symlink": SimpleNamespace(
+                st_mode=stat.S_IFLNK | 0o777,
+                st_reparse_tag=0,
+            ),
+            "reparse": SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755,
+                st_reparse_tag=0xA0000003,
+            ),
+        }
+        for name, result in cases.items():
+            with (
+                self.subTest(name=name),
+                patch.object(
+                    Path,
+                    "lstat",
+                    return_value=result,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "non-symlink directory"):
+                    orchestrator_module._ensure_durable_directory(root)
 
     def test_protocol_roots_use_durable_creation_in_stage_order(self) -> None:
         from bitguard_bnn.bootstrap import orchestrator as orchestrator_module

@@ -227,6 +227,13 @@ def _fsync_directory(path: Path) -> None:
 def _ensure_durable_directory(path: Path) -> bool:
     """Create one protocol root and durably publish it before it is used."""
 
+    def unsafe(result: os.stat_result) -> bool:
+        return (
+            stat.S_ISLNK(result.st_mode)
+            or not stat.S_ISDIR(result.st_mode)
+            or bool(getattr(result, "st_reparse_tag", 0))
+        )
+
     try:
         existing = path.lstat()
     except FileNotFoundError:
@@ -236,23 +243,27 @@ def _ensure_durable_directory(path: Path) -> bool:
             f"Cannot inspect protocol directory {path}: {error}"
         ) from error
     else:
-        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
+        if unsafe(existing):
             raise RuntimeError(
                 f"Protocol directory must be a non-symlink directory: {path}"
             )
+        _fsync_directory(path)
+        _fsync_parent_directory(path)
         return False
 
     try:
         path.mkdir(parents=True, exist_ok=False)
     except FileExistsError:
         current = path.lstat()
-        if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+        if unsafe(current):
             raise RuntimeError(
                 f"Protocol directory must be a non-symlink directory: {path}"
             )
+        _fsync_directory(path)
+        _fsync_parent_directory(path)
         return False
     created = path.lstat()
-    if stat.S_ISLNK(created.st_mode) or not stat.S_ISDIR(created.st_mode):
+    if unsafe(created):
         raise RuntimeError(f"Created protocol directory changed type: {path}")
     _fsync_directory(path)
     _fsync_parent_directory(path)
