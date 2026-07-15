@@ -28,15 +28,27 @@ from bitguard_bnn.preprocess import FeaturePreprocessor
 
 
 class _FailingAuditConnection:
-    def __init__(self, connection: sqlite3.Connection, fail_on: str) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        fail_on: str,
+        *,
+        rollback_failure: bool = False,
+    ) -> None:
         self.connection = connection
         self.fail_on = fail_on
+        self.rollback_failure = rollback_failure
         self.failed = False
+        self.statements: list[str] = []
 
     def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        if args and isinstance(args[0], str):
+            self.statements.append(args[0])
         return self.connection.execute(*args, **kwargs)
 
     def executemany(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        if args and isinstance(args[0], str):
+            self.statements.append(args[0])
         if self.fail_on == "insert" and not self.failed:
             self.failed = True
             raise sqlite3.OperationalError("injected audit insert failure")
@@ -49,6 +61,8 @@ class _FailingAuditConnection:
         self.connection.commit()
 
     def rollback(self) -> None:
+        if self.rollback_failure:
+            raise sqlite3.OperationalError("injected audit rollback failure")
         self.connection.rollback()
 
     def close(self) -> None:
@@ -614,6 +628,104 @@ class OutOfCorePreprocessTests(unittest.TestCase):
                         features,
                         np.arange(len(frame)),
                     )
+
+    def test_audit_rollback_failure_poison_state_preserves_original_error(self) -> None:
+        frame, features = _frame(12)
+        for fail_on in ("insert", "commit"):
+            with self.subTest(fail_on=fail_on):
+                builder = _builder_for_method("inspect_batch", frame, features)
+                assert builder._audit_connection is not None
+                builder._audit_connection = cast(
+                    Any,
+                    _FailingAuditConnection(
+                        builder._audit_connection,
+                        fail_on,
+                        rollback_failure=True,
+                    ),
+                )
+                before = _scientific_state(builder)
+
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError, f"audit {fail_on} failure"
+                ) as caught:
+                    _feed(
+                        builder,
+                        "inspect_batch",
+                        frame,
+                        features,
+                        np.arange(len(frame)),
+                    )
+
+                self.assertEqual(builder._state, "failed")
+                self.assertEqual(_scientific_state(builder)[1:], before[1:])
+                notes = getattr(caught.exception, "__notes__", [])
+                self.assertTrue(
+                    any("audit rollback failed" in note for note in notes), notes
+                )
+                for action in (
+                    lambda: _feed(
+                        builder,
+                        "inspect_batch",
+                        frame,
+                        features,
+                        np.arange(len(frame)),
+                    ),
+                    builder.finalize_imputation,
+                    builder.finalize,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "failed"):
+                        action()
+
+    def test_cross_batch_duplicate_uses_pk_without_per_uid_selects(self) -> None:
+        frame, features = _frame(120)
+        builder = StreamingFeaturePreprocessor(
+            _config(),
+            candidate_features=features,
+            split_fingerprint="split-v1",
+            expected_train_rows=len(frame),
+            quantile_capacity=7,
+            quantile_seed=17,
+        )
+        assert builder._audit_connection is not None
+        connection = _FailingAuditConnection(builder._audit_connection, "never")
+        builder._audit_connection = cast(Any, connection)
+
+        _feed(
+            builder,
+            "inspect_batch",
+            frame,
+            features,
+            np.arange(60),
+        )
+        selects = [
+            statement
+            for statement in connection.statements
+            if statement.lstrip().upper().startswith("SELECT")
+        ]
+        self.assertEqual(selects, [])
+
+        before = _scientific_state(builder)
+        duplicate_then_new = np.concatenate(
+            [np.asarray([0]), np.arange(60, len(frame))]
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate row_uid"):
+            _feed(
+                builder,
+                "inspect_batch",
+                frame,
+                features,
+                duplicate_then_new,
+            )
+        self.assertEqual(_scientific_state(builder), before)
+
+        _feed(
+            builder,
+            "inspect_batch",
+            frame,
+            features,
+            np.arange(60, len(frame)),
+        )
+        self.assertEqual(builder.imputation_sketch.total_rows, len(frame))
 
     def test_post_audit_scientific_failure_poison_state_blocks_retry(self) -> None:
         frame, features = _frame(3)

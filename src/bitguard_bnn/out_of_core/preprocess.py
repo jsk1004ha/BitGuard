@@ -397,16 +397,6 @@ class StreamingFeaturePreprocessor:
         )
         return uids, matrix, label_values
 
-    def _ensure_phase_uids_are_new(self, phase: int, uids: Sequence[str]) -> None:
-        assert self._audit_connection is not None
-        for uid in uids:
-            duplicate = self._audit_connection.execute(
-                "SELECT 1 FROM pass_rows WHERE phase = ? AND row_uid = ? LIMIT 1",
-                (phase, uid),
-            ).fetchone()
-            if duplicate is not None:
-                raise ValueError(f"duplicate row_uid in preprocessing pass {phase}: {uid}")
-
     @staticmethod
     def _prepare_audit_records(
         phase: int,
@@ -435,10 +425,11 @@ class StreamingFeaturePreprocessor:
             )
             self._audit_connection.commit()
         except sqlite3.IntegrityError as exc:
-            self._rollback_audit()
-            raise ValueError(f"duplicate row_uid in preprocessing pass {phase}") from exc
-        except BaseException:
-            self._rollback_audit()
+            error = ValueError(f"duplicate row_uid in preprocessing pass {phase}")
+            self._rollback_audit(error)
+            raise error from exc
+        except BaseException as exc:
+            self._rollback_audit(exc)
             raise
         try:
             scientific_commit()
@@ -449,12 +440,16 @@ class StreamingFeaturePreprocessor:
             ) from exc
         self._phase_rows[phase] += len(records)
 
-    def _rollback_audit(self) -> None:
+    def _rollback_audit(self, original_error: BaseException) -> None:
         assert self._audit_connection is not None
         try:
             self._audit_connection.rollback()
-        except sqlite3.Error:
-            pass
+        except BaseException as rollback_error:
+            self._state = "failed"
+            original_error.add_note(
+                "audit rollback failed: "
+                f"{type(rollback_error).__name__}: {rollback_error}"
+            )
 
     def _verify_phase(self, phase: int, *, compare_to_inspect: bool) -> str:
         if self._phase_rows[phase] != self.expected_train_rows:
@@ -510,7 +505,6 @@ class StreamingFeaturePreprocessor:
             feature_names=feature_names,
             membership=membership,
         )
-        self._ensure_phase_uids_are_new(_PHASE_INSPECT, uids)
         normalized = matrix.astype(np.float32).astype(np.float64)
         delta = PriorityRowSketch(
             capacity=self.quantile_capacity,
@@ -597,7 +591,6 @@ class StreamingFeaturePreprocessor:
             feature_names=feature_names,
             membership=membership,
         )
-        self._ensure_phase_uids_are_new(_PHASE_ANOVA, uids)
         assert self.anova is not None
         imputed = self._impute_usable(matrix)
         if not np.isfinite(imputed).all():
@@ -688,7 +681,6 @@ class StreamingFeaturePreprocessor:
             feature_names=feature_names,
             membership=membership,
         )
-        self._ensure_phase_uids_are_new(_PHASE_CALIBRATE, uids)
         assert (
             self.selected_indices is not None
             and self.selected_calibration is not None
