@@ -187,24 +187,124 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         offset += written
 
 
+class AtomicJsonWriteError(RuntimeError):
+    """Describe whether an atomic JSON failure happened before or after replace."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        published: bool,
+        published_identity: tuple[int, int] | None,
+        cause: BaseException,
+    ) -> None:
+        phase = "after publication" if published else "before publication"
+        super().__init__(f"Atomic JSON write for {path} failed {phase}: {cause}")
+        self.path = path
+        self.published = published
+        self.published_identity = published_identity
+        self.cause = cause
+
+
 def _write_json(path: Path, value: Mapping[str, object]) -> None:
-    _ensure_durable_directory(path.parent)
-    payload = (
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    descriptor = os.open(
-        temporary,
-        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
+    published = False
+    published_identity: tuple[int, int] | None = None
     try:
-        _write_all(descriptor, payload)
+        _ensure_durable_directory(path.parent)
+        payload = (
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        descriptor = os.open(
+            temporary,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        operation_error: BaseException | None = None
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise RuntimeError(
+                    f"Atomic JSON temporary is not a regular file: {temporary}"
+                )
+            published_identity = (int(opened.st_dev), int(opened.st_ino))
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        except BaseException as error:
+            operation_error = error
+        try:
+            os.close(descriptor)
+        except OSError as close_error:
+            if operation_error is None:
+                operation_error = close_error
+            else:
+                operation_error = OSError(
+                    f"{operation_error}; temporary close also failed: {close_error}"
+                )
+        if operation_error is not None:
+            raise operation_error
+        temporary.replace(path)
+        published = True
+        committed = path.lstat()
+        if (
+            not stat.S_ISREG(committed.st_mode)
+            or stat.S_ISLNK(committed.st_mode)
+            or (int(committed.st_dev), int(committed.st_ino)) != published_identity
+        ):
+            raise RuntimeError(
+                f"Atomic JSON publication identity could not be verified: {path}"
+            )
+        _fsync_parent_directory(path)
+    except AtomicJsonWriteError:
+        raise
+    except BaseException as error:
+        raise AtomicJsonWriteError(
+            path,
+            published=published,
+            published_identity=published_identity if published else None,
+            cause=error,
+        ) from error
+
+
+def _invalidate_published_json(
+    path: Path,
+    expected_identity: tuple[int, int] | None,
+) -> None:
+    """Remove a writer-owned success envelope when atomic reconciliation cannot publish."""
+
+    if expected_identity is None:
+        raise RuntimeError(
+            f"Cannot invalidate published JSON {path} without a verified identity"
+        )
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+    )
+    operation_error: BaseException | None = None
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (int(current.st_dev), int(current.st_ino)) != expected_identity
+        ):
+            raise RuntimeError(
+                f"Published JSON identity changed before invalidation: {path}"
+            )
+        os.ftruncate(descriptor, 0)
         os.fsync(descriptor)
-    finally:
+    except BaseException as error:
+        operation_error = error
+    try:
         os.close(descriptor)
-    temporary.replace(path)
-    _fsync_parent_directory(path)
+    except OSError as close_error:
+        if operation_error is None:
+            operation_error = close_error
+        else:
+            operation_error = OSError(
+                f"{operation_error}; invalidated JSON close also failed: {close_error}"
+            )
+    if operation_error is not None:
+        raise operation_error
 
 
 def _fsync_directory(path: Path) -> None:
@@ -303,36 +403,76 @@ def _fsync_regular_file(path: Path) -> None:
         or bool(getattr(before, "st_reparse_tag", 0))
     ):
         raise RuntimeError(f"Durability target must be a regular file: {path}")
-    descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
-    sync_error: OSError | None = None
-    opened: os.stat_result | None = None
-    try:
-        opened = os.fstat(descriptor)
-        os.fsync(descriptor)
-    except OSError as error:
-        sync_error = error
-    try:
-        os.close(descriptor)
-    except OSError as close_error:
-        if sync_error is not None:
-            raise OSError(
-                f"file fsync failed: {sync_error}; file close failed: {close_error}"
-            ) from sync_error
-        raise
-    if sync_error is not None:
-        raise sync_error
-    after = path.lstat()
-    identity = lambda result: (
+    object_identity = lambda result: (
         result.st_dev,
         result.st_ino,
         stat.S_IFMT(result.st_mode),
         result.st_size,
         result.st_mtime_ns,
     )
+    original_mode = stat.S_IMODE(before.st_mode)
+    mode_changed = False
+    descriptor = -1
+    operation_error: BaseException | None = None
+    opened: os.stat_result | None = None
+    try:
+        if os.name == "nt" and not original_mode & stat.S_IWRITE:
+            os.chmod(path, original_mode | stat.S_IWRITE)
+            mode_changed = True
+            writable = path.lstat()
+            if object_identity(writable) != object_identity(before):
+                raise RuntimeError(
+                    f"Read-only durability target changed while enabling sync: {path}"
+                )
+        flags = (os.O_RDWR if os.name == "nt" else os.O_RDONLY) | getattr(
+            os, "O_NOFOLLOW", 0
+        )
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if object_identity(opened) != object_identity(before):
+            raise RuntimeError(
+                f"Durability target changed before it was flushed: {path}"
+            )
+        os.fsync(descriptor)
+    except BaseException as error:
+        operation_error = error
+    if descriptor >= 0:
+        try:
+            os.close(descriptor)
+        except OSError as close_error:
+            if operation_error is None:
+                operation_error = close_error
+            else:
+                operation_error = OSError(
+                    f"file durability failed: {operation_error}; file close failed: "
+                    f"{close_error}"
+                )
+    restore_error: BaseException | None = None
+    if mode_changed:
+        try:
+            current = path.lstat()
+            if object_identity(current) != object_identity(before):
+                raise RuntimeError(
+                    f"Read-only durability target changed before mode restore: {path}"
+                )
+            os.chmod(path, original_mode)
+        except BaseException as error:
+            restore_error = error
+    if operation_error is not None:
+        if restore_error is not None:
+            raise RuntimeError(
+                f"File durability failed: {operation_error}; restoring read-only mode "
+                f"also failed: {restore_error}"
+            ) from operation_error
+        raise operation_error
+    if restore_error is not None:
+        raise restore_error
+    after = path.lstat()
     if (
         opened is None
-        or identity(before) != identity(opened)
-        or identity(before) != identity(after)
+        or object_identity(before) != object_identity(opened)
+        or object_identity(before) != object_identity(after)
+        or stat.S_IMODE(after.st_mode) != original_mode
     ):
         raise RuntimeError(f"Durability target changed while it was flushed: {path}")
 
@@ -976,12 +1116,17 @@ def run_bootstrap(
             except BaseException as write_error:
                 last_write_error = write_error
                 if report_persistence_error is None:
-                    report_persistence_error = write_error
-                else:
-                    report_persistence_error = RuntimeError(
-                        f"{_safe_error(report_persistence_error)}; another report "
-                        f"target also failed: {_safe_error(write_error)}"
-                    )
+                    if (
+                        isinstance(write_error, AtomicJsonWriteError)
+                        and write_error.published
+                    ):
+                        report_persistence_error = RuntimeError(
+                            "Bootstrap report directory durability is uncertain after "
+                            "publication; a canonical failure-envelope reconciliation "
+                            f"was required: {_safe_error(write_error)}"
+                        )
+                    else:
+                        report_persistence_error = write_error
                 report_status = "failed"
                 if primary_error is None:
                     failed_stage = "report"
@@ -989,6 +1134,55 @@ def run_bootstrap(
                         "Bootstrap report persistence failed: "
                         f"{_safe_error(write_error)}"
                     )
+
+                if not (
+                    isinstance(write_error, AtomicJsonWriteError)
+                    and write_error.published
+                ):
+                    continue
+
+                failed_payload = build_report(report_status, primary_error, target)
+                try:
+                    _write_json(target, failed_payload)
+                    return failed_payload
+                except BaseException as reconciliation_error:
+                    last_write_error = reconciliation_error
+                    if (
+                        isinstance(reconciliation_error, AtomicJsonWriteError)
+                        and reconciliation_error.published
+                    ):
+                        # Replace succeeded, so the visible canonical artifact already
+                        # carries the same failed status used by any fallback report.
+                        continue
+
+                    # Reconciliation did not replace the original success envelope.
+                    # Invalidate only the exact writer-owned inode before publishing a
+                    # fallback; a malformed canonical artifact cannot contradict it.
+                    invalidation_error: BaseException | None = None
+                    for _attempt in range(2):
+                        try:
+                            _invalidate_published_json(
+                                target,
+                                write_error.published_identity,
+                            )
+                            invalidation_error = None
+                            break
+                        except BaseException as invalidate_error:
+                            invalidation_error = invalidate_error
+                    if invalidation_error is not None:
+                        try:
+                            visible = json.loads(target.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeError, json.JSONDecodeError):
+                            continue
+                        if (
+                            isinstance(visible, dict)
+                            and visible.get("status") == "sources_verified"
+                        ):
+                            raise RuntimeError(
+                                "Could not invalidate a contradictory canonical "
+                                f"bootstrap success report at {target}: "
+                                f"{_safe_error(invalidation_error)}"
+                            ) from invalidation_error
         assert last_write_error is not None
         return build_report(report_status, primary_error, unique_targets[-1])
 

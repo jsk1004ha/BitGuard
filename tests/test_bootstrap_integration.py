@@ -17,7 +17,7 @@ from unittest.mock import Mock, call, patch
 
 from bitguard_bnn.bootstrap.cleanup import scan_cleanup_debt
 from bitguard_bnn.bootstrap.download import DownloadResult, download_file
-from bitguard_bnn.bootstrap.extract import extract_zip
+from bitguard_bnn.bootstrap.extract import ExtractionResult, extract_zip
 from bitguard_bnn.bootstrap.inspect import inspect_csv_dataset
 from bitguard_bnn.bootstrap.orchestrator import (
     BootstrapDependencies,
@@ -607,6 +607,105 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
             events.index(("directory", root)),
         )
         self.assertEqual(events[-1], ("parent", root))
+
+    def test_regular_file_durability_preserves_read_only_mode(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        target = self.root / "read-only.bin"
+        target.write_bytes(b"durable")
+        target.chmod(stat.S_IREAD)
+        expected_mode = stat.S_IMODE(target.lstat().st_mode)
+        try:
+            orchestrator_module._fsync_regular_file(target)
+            self.assertEqual(stat.S_IMODE(target.lstat().st_mode), expected_mode)
+        finally:
+            target.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    def test_read_only_manual_directory_is_copied_without_mutating_source(self) -> None:
+        source_file = self.botiot_source / "flows.csv"
+        source_file.chmod(stat.S_IREAD)
+        source_mode = stat.S_IMODE(source_file.lstat().st_mode)
+        options = replace(self.options, datasets=("botiot",))
+        try:
+            report = run_bootstrap(options, dependencies=self.dependencies())
+
+            self.assertEqual(report["status"], "sources_verified")
+            self.assertEqual(stat.S_IMODE(source_file.lstat().st_mode), source_mode)
+            copied = next((self.data_root / "raw").rglob("flows.csv"))
+            self.assertEqual(stat.S_IMODE(copied.lstat().st_mode), source_mode)
+        finally:
+            for candidate in self.root.rglob("*"):
+                if candidate.is_file():
+                    candidate.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    def test_read_only_zip_result_is_durable_and_keeps_its_mode(self) -> None:
+        def readonly_zip(source, destination, **kwargs):
+            result = extract_zip(source, destination, **kwargs)
+            extracted = next(Path(destination).rglob("*.csv"))
+            extracted.chmod(stat.S_IREAD)
+            return result
+
+        options = replace(
+            self.options,
+            datasets=("nbaiot",),
+            botiot_source=None,
+            accepted_botiot_license=False,
+        )
+        try:
+            report = run_bootstrap(
+                options,
+                dependencies=self.dependencies(zip_extractor=readonly_zip),
+            )
+
+            self.assertEqual(report["status"], "sources_verified")
+            extracted = next((self.data_root / "raw").rglob("*.csv"))
+            self.assertFalse(stat.S_IMODE(extracted.lstat().st_mode) & stat.S_IWRITE)
+        finally:
+            for candidate in self.root.rglob("*"):
+                if candidate.is_file():
+                    candidate.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    def test_read_only_rar_result_is_durable_and_keeps_its_mode(self) -> None:
+        rar_source = self.root / "official-botiot.rar"
+        rar_source.write_bytes(b"fixture handled by injected extractor")
+
+        def readonly_rar(source, destination, **_kwargs):
+            destination = Path(destination)
+            destination.mkdir()
+            extracted = destination / "flows.csv"
+            extracted.write_text(
+                "category,subcategory,saddr,stime,bytes,rate\n"
+                "Normal,Normal,10.0.0.1,1.5,100,2.0\n",
+                encoding="utf-8",
+            )
+            extracted.chmod(stat.S_IREAD)
+            return ExtractionResult(
+                source=str(source),
+                destination=str(destination),
+                extractor="injected-rar-fixture",
+                files=("flows.csv",),
+                total_bytes=extracted.stat().st_size,
+            )
+
+        options = replace(
+            self.options,
+            datasets=("botiot",),
+            botiot_source=rar_source,
+        )
+        dependencies = replace(
+            self.dependencies(),
+            rar_extractor=readonly_rar,
+        )
+        try:
+            report = run_bootstrap(options, dependencies=dependencies)
+
+            self.assertEqual(report["status"], "sources_verified")
+            extracted = next((self.data_root / "raw").rglob("flows.csv"))
+            self.assertFalse(stat.S_IMODE(extracted.lstat().st_mode) & stat.S_IWRITE)
+        finally:
+            for candidate in self.root.rglob("*"):
+                if candidate.is_file():
+                    candidate.chmod(stat.S_IREAD | stat.S_IWRITE)
 
     def test_protocol_roots_use_durable_creation_in_stage_order(self) -> None:
         from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
@@ -1288,6 +1387,56 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
             "private-token-secret",
         ):
             self.assertNotIn(secret, environment)
+
+    def test_post_replace_report_fsync_failure_never_leaves_canonical_success(
+        self,
+    ) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        canonical = self.data_root / ".bitguard" / "bootstrap-report.json"
+        original_fsync_parent = orchestrator_module._fsync_parent_directory
+
+        def fail_canonical_report_fsync(path):
+            if Path(path) == canonical:
+                raise OSError("injected post-replace report fsync failure")
+            return original_fsync_parent(path)
+
+        with patch.object(
+            orchestrator_module,
+            "_fsync_parent_directory",
+            side_effect=fail_canonical_report_fsync,
+        ):
+            failed = run_bootstrap(self.options, dependencies=self.dependencies())
+
+        fallback = Path(failed["report_path"])
+        canonical_payload = json.loads(canonical.read_text(encoding="utf-8"))
+        fallback_payload = json.loads(fallback.read_text(encoding="utf-8"))
+        self.assertEqual(failed, fallback_payload)
+        self.assertNotEqual(fallback, canonical)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failed_stage"], "report")
+        self.assertEqual(canonical_payload["status"], "failed")
+        self.assertEqual(canonical_payload["failed_stage"], "report")
+        self.assertEqual(canonical_payload["error"], fallback_payload["error"])
+        self.assertEqual(
+            canonical_payload["report_error"],
+            fallback_payload["report_error"],
+        )
+        self.assertIn("durability", failed["report_error"].casefold())
+        state = json.loads(
+            (self.data_root / ".bitguard" / "bootstrap-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn("inspect", state["stages"])
+
+        restarted = run_bootstrap(self.options, dependencies=self.dependencies())
+
+        self.assertEqual(restarted["status"], "sources_verified")
+        self.assertEqual(
+            restarted["reused_stages"],
+            ["preflight", "environment", "acquire", "extract", "inspect"],
+        )
 
     def test_stage_failure_remains_primary_when_report_persistence_also_fails(
         self,
