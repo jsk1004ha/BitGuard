@@ -745,14 +745,16 @@ def _pin_manifest_temporary(
             temporary_identity = _inode_identity(temporary_stat)
             descriptor_identity = _inode_identity(os.fstat(descriptor))
         except (OSError, SourceManifestError):
-            _unlink_owned_manifest_path(pin, pin_identity)
+            if pin_identity == expected_identity:
+                _unlink_owned_manifest_path(pin, expected_identity)
             raise
         if (
             pin_identity != expected_identity
             or temporary_identity != expected_identity
             or descriptor_identity != expected_identity
         ):
-            _unlink_owned_manifest_path(pin, pin_identity)
+            if pin_identity == expected_identity:
+                _unlink_owned_manifest_path(pin, expected_identity)
             raise SourceManifestError(
                 f"Manifest temporary {temporary} changed identity while creating its pin."
             )
@@ -882,15 +884,12 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
     final_identity = _inode_identity(final_stat)
     if final_identity != temporary_identity:
         try:
-            _unlink_owned_manifest_path(target, final_identity)
-        except SourceManifestError:
-            pass
-        try:
             _unlink_owned_manifest_path(pin, temporary_identity)
         except SourceManifestError:
             pass
         raise SourceManifestError(
-            f"Published source manifest {target} does not have the verified pin identity."
+            f"Published source manifest {target} does not have the verified pin identity; "
+            "the unowned final path was preserved."
         )
 
     try:

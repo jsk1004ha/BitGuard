@@ -400,6 +400,53 @@ class DownloadFileTest(unittest.TestCase):
         self.assertFalse(self.destination.exists())
         self.assertEqual(self.partial.read_bytes(), PAYLOAD)
 
+    def test_boolean_timeout_and_chunk_size_are_rejected(self) -> None:
+        for timeout in (True, False):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(DownloadError, "timeout"):
+                    download_file(
+                        "https://example.test/archive",
+                        self.destination,
+                        timeout=timeout,
+                    )
+
+        for chunk_size in (True, False):
+            with self.subTest(chunk_size=chunk_size):
+                with self.assertRaisesRegex(DownloadError, "chunk_size"):
+                    download_file(
+                        "https://example.test/archive",
+                        self.destination,
+                        chunk_size=chunk_size,
+                    )
+
+    def test_valid_timeout_and_chunk_size_boundaries_are_preserved(self) -> None:
+        with _RangeServer() as server:
+            result = download_file(
+                server.url,
+                self.destination,
+                timeout=download_module.MAX_TIMEOUT_SECONDS,
+                chunk_size=1,
+            )
+
+        self.assertEqual(result.sha256, PAYLOAD_SHA256)
+        self.assertEqual(self.destination.read_bytes(), PAYLOAD)
+
+    def test_non_string_expected_sha256_is_rejected_as_download_error(self) -> None:
+        for expected_sha256 in (True, False, 1, b"0" * 64, object()):
+            with self.subTest(expected_sha256=type(expected_sha256).__name__):
+                with self.assertRaisesRegex(DownloadError, "expected_sha256"):
+                    download_file(
+                        "https://example.test/archive",
+                        self.destination,
+                        expected_sha256=expected_sha256,  # type: ignore[arg-type]
+                    )
+
+    def test_sha256_normalizer_rejects_every_non_string_type(self) -> None:
+        for value in (None, True, False, 1, b"0" * 64, object()):
+            with self.subTest(value=type(value).__name__):
+                with self.assertRaisesRegex(DownloadError, "expected_sha256"):
+                    download_module._normalize_sha256(value)
+
     def test_streams_fixed_chunks_and_fsyncs_before_publication(self) -> None:
         reads: list[int] = []
         fsynced = False
@@ -581,7 +628,9 @@ class DownloadFileTest(unittest.TestCase):
         self.assertFalse(self.destination.exists())
         self.assertEqual(list(self.root.glob(".*.verified*")), [])
 
-    def test_substituted_private_download_pin_is_never_reported_as_published(self) -> None:
+    def test_substituted_private_download_pin_is_preserved_and_never_reported_as_published(
+        self,
+    ) -> None:
         real_link = download_module.os.link
         displaced = self.root / "verified-pin-before-swap"
         attacker = b"attacker-controlled-final"
@@ -611,8 +660,62 @@ class DownloadFileTest(unittest.TestCase):
                     )
 
         self.assertTrue(substituted)
-        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.destination.read_bytes(), attacker)
         self.assertEqual(self.partial.read_bytes(), PAYLOAD)
+
+    def test_foreign_download_replacement_after_link_is_preserved(self) -> None:
+        foreign = self.root / "foreign-download-winner"
+        foreign_bytes = b"foreign winner after verified link"
+        foreign.write_bytes(foreign_bytes)
+        real_link = download_module.os.link
+        replaced = False
+
+        def replace_after_publish(source: object, target: object) -> None:
+            nonlocal replaced
+            real_link(source, target)
+            if Path(target) == self.destination:
+                replaced = True
+                foreign.replace(self.destination)
+
+        with _RangeServer() as server:
+            with patch.object(download_module.os, "link", side_effect=replace_after_publish):
+                with self.assertRaisesRegex(DownloadError, "identity|preserved|publish"):
+                    download_file(
+                        server.url,
+                        self.destination,
+                        expected_sha256=PAYLOAD_SHA256,
+                    )
+
+        self.assertTrue(replaced)
+        self.assertEqual(self.destination.read_bytes(), foreign_bytes)
+        self.assertEqual(self.partial.read_bytes(), PAYLOAD)
+        self.assertEqual(list(self.root.glob(".*.verified*")), [])
+
+    def test_foreign_download_pin_replacement_after_link_is_preserved(self) -> None:
+        foreign = self.root / "foreign-download-pin"
+        foreign_bytes = b"foreign private pin"
+        foreign.write_bytes(foreign_bytes)
+        real_link = download_module.os.link
+        foreign_pin: Path | None = None
+
+        def replace_pin_after_link(source: object, target: object) -> None:
+            nonlocal foreign_pin
+            real_link(source, target)
+            target_path = Path(target)
+            if target_path.name.endswith(".verified.pin") and foreign_pin is None:
+                foreign_pin = target_path
+                foreign.replace(target_path)
+
+        with _RangeServer() as server:
+            with patch.object(download_module.os, "link", side_effect=replace_pin_after_link):
+                with self.assertRaisesRegex(DownloadError, "identity|pin|changed"):
+                    download_file(server.url, self.destination)
+
+        self.assertIsNotNone(foreign_pin)
+        assert foreign_pin is not None
+        self.assertEqual(foreign_pin.read_bytes(), foreign_bytes)
+        self.assertEqual(self.partial.read_bytes(), PAYLOAD)
+        self.assertFalse(self.destination.exists())
 
     def test_valid_416_complete_partial_publishes_and_incomplete_retries_once(self) -> None:
         self.partial.write_bytes(PAYLOAD)
@@ -1158,7 +1261,7 @@ class SourceManifestTest(unittest.TestCase):
             self.assertEqual(displaced.read_bytes(), manifest_json_bytes(manifest))
         self.assertEqual(list(path.parent.glob(f".{path.name}.*.pin")), [])
 
-    def test_manifest_private_pin_substitution_cannot_leave_a_final(self) -> None:
+    def test_manifest_private_pin_substitution_preserves_unverified_final(self) -> None:
         manifest = self.official_manifest()
         path = self.root.parent / "source-manifest.json"
         displaced = self.root.parent / "owned-manifest-pin"
@@ -1184,8 +1287,59 @@ class SourceManifestTest(unittest.TestCase):
                 write_source_manifest(path, manifest)
 
         self.assertTrue(substituted)
-        self.assertFalse(path.exists())
+        self.assertEqual(path.read_bytes(), attacker)
         self.assertEqual(displaced.read_bytes(), manifest_json_bytes(manifest))
+
+    def test_foreign_manifest_replacement_after_link_is_preserved(self) -> None:
+        manifest = self.official_manifest()
+        path = self.root.parent / "source-manifest.json"
+        foreign = self.root.parent / "foreign-manifest-winner"
+        foreign_bytes = b'{"foreign":true}\n'
+        foreign.write_bytes(foreign_bytes)
+        real_link = manifest_module.os.link
+        replaced = False
+
+        def replace_after_publish(source: object, target: object) -> None:
+            nonlocal replaced
+            real_link(source, target)
+            if Path(target) == path:
+                replaced = True
+                foreign.replace(path)
+
+        with patch.object(manifest_module.os, "link", side_effect=replace_after_publish):
+            with self.assertRaisesRegex(SourceManifestError, "identity|preserved|pin"):
+                write_source_manifest(path, manifest)
+
+        self.assertTrue(replaced)
+        self.assertEqual(path.read_bytes(), foreign_bytes)
+        self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+        self.assertEqual(list(path.parent.glob(f".{path.name}.*.pin")), [])
+
+    def test_foreign_manifest_pin_replacement_after_link_is_preserved(self) -> None:
+        manifest = self.official_manifest()
+        path = self.root.parent / "source-manifest.json"
+        foreign = self.root.parent / "foreign-manifest-pin"
+        foreign_bytes = b'{"foreign-pin":true}\n'
+        foreign.write_bytes(foreign_bytes)
+        real_link = manifest_module.os.link
+        foreign_pin: Path | None = None
+
+        def replace_pin_after_link(source: object, target: object) -> None:
+            nonlocal foreign_pin
+            real_link(source, target)
+            target_path = Path(target)
+            if target_path.name.endswith(".pin") and foreign_pin is None:
+                foreign_pin = target_path
+                foreign.replace(target_path)
+
+        with patch.object(manifest_module.os, "link", side_effect=replace_pin_after_link):
+            with self.assertRaisesRegex(SourceManifestError, "identity|pin|changed"):
+                write_source_manifest(path, manifest)
+
+        self.assertIsNotNone(foreign_pin)
+        assert foreign_pin is not None
+        self.assertEqual(foreign_pin.read_bytes(), foreign_bytes)
+        self.assertFalse(path.exists())
 
     def test_existing_manifest_replacement_during_pinned_read_is_rejected(self) -> None:
         manifest = self.official_manifest()

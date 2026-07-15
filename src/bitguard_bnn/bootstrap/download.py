@@ -86,15 +86,16 @@ def sanitize_url(value: str) -> str:
     return urlunsplit(sanitized)
 
 
-def _validate_sha256(value: str | None) -> None:
-    if value is None:
-        return
+def _normalize_sha256(value: object) -> str:
+    if not isinstance(value, str):
+        raise DownloadError("expected_sha256 must be a string.")
     if (
         len(value) != 64
         or value != value.lower()
         or any(character not in "0123456789abcdef" for character in value)
     ):
         raise DownloadError("expected_sha256 must be an exact lowercase SHA-256 digest.")
+    return value
 
 
 def _resolved_destination(destination: Path | str) -> Path:
@@ -423,14 +424,16 @@ def _pin_private_snapshot(
             assert private_stat is not None
             private_identity = _file_identity(private_stat)
         except DownloadError:
-            _unlink_private_candidate(pin, pin_identity)
+            if pin_identity == expected_identity:
+                _unlink_private_candidate(pin, expected_identity)
             raise
         if (
             pin_identity != expected_identity
             or descriptor_identity != expected_identity
             or private_identity != expected_identity
         ):
-            _unlink_private_candidate(pin, pin_identity)
+            if pin_identity == expected_identity:
+                _unlink_private_candidate(pin, expected_identity)
             raise DownloadError(
                 f"Private verified snapshot {private} changed identity while it was pinned."
             )
@@ -582,13 +585,10 @@ def _publish_snapshot(
     assert final_stat is not None
     final_identity = _file_identity(final_stat)
     if final_identity != snapshot.identity:
-        try:
-            _unlink_private_candidate(destination, final_identity)
-        except DownloadError:
-            pass
         raise DownloadError(
             f"Download destination {destination} was not linked from the verified identity; "
-            f"private pin {snapshot.pin} was preserved for inspection."
+            "the unowned final path was preserved and the private verified pin will be "
+            "cleaned if it still has its known identity."
         )
     try:
         _fsync_parent_directory(destination)
@@ -622,12 +622,18 @@ def download_file(
     """Download one URL through a sole resumable ``.partial`` path."""
 
     safe_source = sanitize_url(source_url)
-    _validate_sha256(expected_sha256)
-    if not isinstance(timeout, (int, float)) or not 0 < timeout <= MAX_TIMEOUT_SECONDS:
+    expected_sha256 = (
+        None if expected_sha256 is None else _normalize_sha256(expected_sha256)
+    )
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not 0 < timeout <= MAX_TIMEOUT_SECONDS
+    ):
         raise DownloadError(
             f"timeout must be greater than zero and at most {MAX_TIMEOUT_SECONDS} seconds."
         )
-    if not isinstance(chunk_size, int) or chunk_size <= 0:
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise DownloadError("chunk_size must be a positive integer.")
 
     target = _resolved_destination(destination)
