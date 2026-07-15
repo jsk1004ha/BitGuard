@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import subprocess
@@ -34,7 +35,10 @@ from bitguard_bnn.constants import (
 )
 from bitguard_bnn.out_of_core.common import (
     FileFingerprint,
+    LOGICAL_SOURCE_ALGORITHM,
     LoadedDataset,
+    ROW_UID_ALGORITHM,
+    SOURCE_SAMPLING_ALGORITHM,
     append_metadata,
     find_column,
     logical_source_id,
@@ -76,6 +80,7 @@ class NormalizedSourceProof:
     row_count: int
     files: tuple[NormalizedSourceFileProof, ...]
     snapshot_bytes: int
+    normalization_signature: str
     fingerprint: str
 
 
@@ -289,39 +294,247 @@ def _assert_source_stat(
         raise RuntimeError(f"dataset source changed during {phase}: {path}")
 
 
-def _validated_work_dir(work_dir: Path) -> Path:
-    requested = Path(work_dir)
-    try:
-        work_stat = requested.lstat()
-    except OSError as exc:
-        raise ValueError(
-            f"normalized source work_dir is not accessible: {requested}"
-        ) from exc
+@dataclass(frozen=True, slots=True)
+class _WorkComponent:
+    path: Path
+    device: int
+    inode: int
+    file_type: int
+    attributes: int
+
+
+def _work_path_components(work_dir: Path) -> tuple[Path, ...]:
+    absolute = Path(os.path.abspath(os.fspath(work_dir)))
+    parts = absolute.parts
+    if not parts:
+        raise ValueError("normalized source work_dir is not accessible")
+    current = Path(parts[0])
+    components = [current]
+    for part in parts[1:]:
+        current = current / part
+        components.append(current)
+    return tuple(components)
+
+
+def _inspect_work_components(work_dir: Path) -> tuple[_WorkComponent, ...]:
+    inspected: list[_WorkComponent] = []
     is_junction = getattr(os.path, "isjunction", lambda _path: False)
-    if (
-        stat.S_ISLNK(work_stat.st_mode)
-        or bool(is_junction(requested))
-        or not stat.S_ISDIR(work_stat.st_mode)
-    ):
-        raise ValueError(
-            f"normalized source work_dir must be a real directory: {requested}"
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    for component in _work_path_components(work_dir):
+        try:
+            component_stat = component.lstat()
+        except OSError as exc:
+            raise ValueError(
+                f"normalized source work_dir is not accessible: {component}"
+            ) from exc
+        attributes = int(getattr(component_stat, "st_file_attributes", 0))
+        if (
+            stat.S_ISLNK(component_stat.st_mode)
+            or bool(is_junction(component))
+            or bool(attributes & reparse_flag)
+        ):
+            raise ValueError(
+                "normalized source work_dir contains a symlink, junction, "
+                f"or reparse-point ancestor: {component}"
+            )
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError(
+                f"normalized source work_dir ancestor is not a directory: {component}"
+            )
+        inspected.append(
+            _WorkComponent(
+                path=component,
+                device=int(component_stat.st_dev),
+                inode=int(component_stat.st_ino),
+                file_type=stat.S_IFMT(component_stat.st_mode),
+                attributes=attributes,
+            )
         )
+    final_stat = inspected[-1]
     if os.name != "nt":
-        if hasattr(os, "getuid") and work_stat.st_uid != os.getuid():
+        actual = final_stat.path.lstat()
+        if hasattr(os, "getuid") and actual.st_uid != os.getuid():
             raise ValueError("normalized source work_dir must be owned by this user")
-        if stat.S_IMODE(work_stat.st_mode) & 0o077:
+        if stat.S_IMODE(actual.st_mode) & 0o077:
             raise ValueError("normalized source work_dir must be private (mode 0700)")
-    return requested.resolve(strict=True)
+    return tuple(inspected)
 
 
-def _new_snapshot_root(work_dir: Path | None = None) -> Path:
-    parent = _validated_work_dir(work_dir) if work_dir is not None else None
-    return Path(
-        tempfile.mkdtemp(
-            prefix="bitguard-verified-source-",
-            dir=str(parent) if parent is not None else None,
-        )
-    )
+def _same_work_components(
+    expected: Sequence[_WorkComponent], actual: Sequence[_WorkComponent]
+) -> bool:
+    return [
+        (item.path, item.device, item.inode, item.file_type, item.attributes)
+        for item in expected
+    ] == [
+        (item.path, item.device, item.inode, item.file_type, item.attributes)
+        for item in actual
+    ]
+
+
+def _open_windows_work_handles(
+    components: Sequence[_WorkComponent],
+) -> list[int]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handles: list[int] = []
+    try:
+        for component in components:
+            handle = create_file(
+                str(component.path),
+                0x80,
+                0x1 | 0x2,
+                None,
+                3,
+                0x02000000 | 0x00200000,
+                None,
+            )
+            if handle == wintypes.HANDLE(-1).value:
+                raise RuntimeError(
+                    f"could not pin normalized source work_dir: {component.path}"
+                )
+            handles.append(int(handle))
+        return handles
+    except BaseException:
+        for handle in reversed(handles):
+            close_handle(handle)
+        raise
+
+
+class _PrivateWorkGuard:
+    def __init__(self, work_dir: Path) -> None:
+        self.components = _inspect_work_components(work_dir)
+        self.canonical = self.components[-1].path
+        resolved = self.canonical.resolve(strict=True)
+        if os.path.normcase(str(resolved)) != os.path.normcase(
+            str(self.canonical)
+        ):
+            raise ValueError(
+                "normalized source work_dir did not remain beneath its "
+                "requested canonical parent"
+            )
+        self._windows_handles: list[int] = []
+        self._parent_descriptor: int | None = None
+        self._closed = False
+        if os.name == "nt":
+            self._windows_handles = _open_windows_work_handles(self.components)
+        else:
+            flags = os.O_RDONLY
+            flags |= int(getattr(os, "O_DIRECTORY", 0))
+            flags |= int(getattr(os, "O_NOFOLLOW", 0))
+            self._parent_descriptor = os.open(self.canonical, flags)
+            pinned = os.fstat(self._parent_descriptor)
+            expected = self.components[-1]
+            if (
+                int(pinned.st_dev),
+                int(pinned.st_ino),
+                stat.S_IFMT(pinned.st_mode),
+            ) != (expected.device, expected.inode, expected.file_type):
+                self.close()
+                raise RuntimeError(
+                    "normalized source work_dir changed while being pinned"
+                )
+        try:
+            self.assert_unchanged("validation")
+        except BaseException:
+            self.close()
+            raise
+
+    def assert_unchanged(self, phase: str) -> None:
+        try:
+            actual = _inspect_work_components(self.canonical)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"normalized source work_dir changed during {phase}"
+            ) from exc
+        if not _same_work_components(self.components, actual):
+            raise RuntimeError(
+                f"normalized source work_dir changed during {phase}"
+            )
+
+    def create_child(self) -> Path:
+        for _ in range(100):
+            name = f"bitguard-verified-source-{secrets.token_hex(12)}"
+            child = self.canonical / name
+            try:
+                if os.name == "nt":
+                    child.mkdir(mode=0o700)
+                else:
+                    assert self._parent_descriptor is not None
+                    os.mkdir(name, mode=0o700, dir_fd=self._parent_descriptor)
+            except FileExistsError:
+                continue
+            try:
+                self.assert_unchanged("private child creation")
+                child_stat = child.lstat()
+                attributes = int(
+                    getattr(child_stat, "st_file_attributes", 0)
+                )
+                if (
+                    stat.S_ISLNK(child_stat.st_mode)
+                    or not stat.S_ISDIR(child_stat.st_mode)
+                    or bool(attributes & 0x400)
+                    or child.resolve(strict=True).parent != self.canonical
+                ):
+                    raise RuntimeError(
+                        "private work child escaped its canonical parent"
+                    )
+                return child
+            except BaseException as primary:
+                try:
+                    self.remove_child(child)
+                except BaseException as cleanup_error:
+                    _attach_cleanup_notes(primary, [cleanup_error])
+                raise
+        raise FileExistsError("could not allocate a unique private work directory")
+
+    def remove_child(self, child: Path) -> None:
+        if child.parent != self.canonical:
+            raise RuntimeError(
+                "refusing to remove a work directory outside its parent"
+            )
+        if os.name == "nt":
+            child.rmdir()
+        else:
+            assert self._parent_descriptor is not None
+            os.rmdir(child.name, dir_fd=self._parent_descriptor)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._parent_descriptor is not None:
+            os.close(self._parent_descriptor)
+            self._parent_descriptor = None
+        if self._windows_handles:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            for handle in reversed(self._windows_handles):
+                close_handle(handle)
+            self._windows_handles.clear()
+
+
+def _create_private_work_child(guard: _PrivateWorkGuard) -> Path:
+    return guard.create_child()
+
+
+def _new_snapshot_root() -> Path:
+    return Path(tempfile.mkdtemp(prefix="bitguard-verified-source-"))
 
 
 @functools.lru_cache(maxsize=1)
@@ -441,11 +654,20 @@ class _SnapshotBuilder:
 
 class _SnapshotStore:
     def __init__(self, work_dir: Path | None = None) -> None:
-        self.root = (
-            _new_snapshot_root()
-            if work_dir is None
-            else _new_snapshot_root(work_dir)
-        )
+        self._work_guard: _PrivateWorkGuard | None = None
+        if work_dir is None:
+            self.root = _new_snapshot_root()
+        else:
+            guard = _PrivateWorkGuard(work_dir)
+            try:
+                self.root = _create_private_work_child(guard)
+            except BaseException as primary:
+                try:
+                    guard.close()
+                except BaseException as cleanup_error:
+                    _attach_cleanup_notes(primary, [cleanup_error])
+                raise
+            self._work_guard = guard
         self._builders: set[_SnapshotBuilder] = set()
         self._snapshots: list[_VerifiedSnapshot] = []
         self._closed = False
@@ -459,10 +681,30 @@ class _SnapshotStore:
             else:
                 self.root.mkdir(mode=0o700)
             _secure_snapshot_root(self.root)
-        except BaseException:
-            if self.root.is_dir():
-                self.root.rmdir()
+        except BaseException as primary:
+            cleanups: list[BaseException] = []
+            try:
+                if self.root.is_dir():
+                    self._remove_root()
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+            try:
+                if self._work_guard is not None:
+                    self._work_guard.close()
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+            _attach_cleanup_notes(primary, cleanups)
             raise
+
+    def _remove_root(self) -> None:
+        if self._work_guard is None:
+            self.root.rmdir()
+        else:
+            self._work_guard.remove_child(self.root)
+
+    def assert_storage_unchanged(self) -> None:
+        if self._work_guard is not None:
+            self._work_guard.assert_unchanged("normalized source session")
 
     def begin(self, file_id: int) -> _SnapshotBuilder:
         builder = _SnapshotBuilder(self, file_id)
@@ -482,14 +724,30 @@ class _SnapshotStore:
         if self._closed:
             return
         self._closed = True
+        cleanups: list[BaseException] = []
         for builder in tuple(self._builders):
-            builder.abort()
+            try:
+                builder.abort()
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
         for snapshot in self._snapshots:
-            if snapshot.path.exists():
-                os.chmod(snapshot.path, 0o600)
-                snapshot.path.unlink()
+            try:
+                if snapshot.path.exists():
+                    os.chmod(snapshot.path, 0o600)
+                    snapshot.path.unlink()
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
         self._snapshots.clear()
-        self.root.rmdir()
+        try:
+            self._remove_root()
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
+        try:
+            if self._work_guard is not None:
+                self._work_guard.close()
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
+        _raise_cleanup_errors(cleanups)
 
 
 class _VerifiedCsvPass:
@@ -1687,7 +1945,97 @@ def _proof_digest_update(digest: Any, value: str) -> None:
     digest.update(encoded)
 
 
-def _normalized_source_proof(plan: _IterationPlan) -> NormalizedSourceProof:
+def _normalization_signature(
+    config: dict[str, Any],
+    plan: _IterationPlan,
+    *,
+    apply_sampling_caps: bool,
+) -> str:
+    cfg = config["dataset"]
+    effective_file_cap = (
+        cfg.get("max_rows_per_file") if apply_sampling_caps else None
+    )
+    effective_class_cap = (
+        cfg.get("max_rows_per_class") if apply_sampling_caps else None
+    )
+    sampling_active = (
+        effective_file_cap is not None or effective_class_cap is not None
+    )
+    payload = {
+        "algorithm": "bitguard.normalization-signature.v1",
+        "dataset_kind": plan.source.kind,
+        "chunk_size": int(cfg["chunk_size"]),
+        "drop_columns": sorted(
+            {str(value) for value in cfg.get("drop_columns", [])}
+        ),
+        "label_map": dict(sorted(plan.source.label_overrides.items())),
+        "caps": {
+            "applied": sampling_active,
+            "max_rows_per_file": (
+                int(effective_file_cap)
+                if effective_file_cap is not None
+                else None
+            ),
+            "max_rows_per_class": (
+                int(effective_class_cap)
+                if effective_class_cap is not None
+                else None
+            ),
+            "sampling_seed": (
+                int(config["experiment"]["seed"])
+                if sampling_active
+                else None
+            ),
+        },
+        "algorithms": {
+            "logical_source": LOGICAL_SOURCE_ALGORITHM,
+            "row_uid": ROW_UID_ALGORITHM,
+            "file_sampling": SOURCE_SAMPLING_ALGORITHM,
+            "class_sampling": "bitguard.class-reservoir.numpy-default-rng.v1",
+            "schema": "bitguard.source-schema.v1",
+            "timestamp": "bitguard.timestamp-plan.v1",
+            "behavior_mapping": "bitguard.behavior-mapping.v1",
+            "numeric_coercion": "bitguard.numeric-feature-coercion.float32.v1",
+        },
+        "feature_columns": list(plan.feature_columns),
+        "files": [
+            {
+                "relative_path": file_plan.relative_path,
+                "raw_columns": list(file_plan.raw_columns),
+                "schema": {
+                    "label": file_plan.schema.label,
+                    "raw_attack": file_plan.schema.raw_attack,
+                    "device": file_plan.schema.device,
+                    "timestamp": file_plan.schema.timestamp,
+                },
+                "timestamp_plan": (
+                    {
+                        "numeric_mode": file_plan.timestamp.numeric_mode,
+                        "datetime_format": file_plan.timestamp.datetime_format,
+                    }
+                    if file_plan.timestamp is not None
+                    else None
+                ),
+                "numeric_columns": list(file_plan.numeric_columns),
+            }
+            for file_plan in plan.files
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalized_source_proof(
+    config: dict[str, Any],
+    plan: _IterationPlan,
+    *,
+    apply_sampling_caps: bool,
+) -> NormalizedSourceProof:
     selected_counts = (
         plan.selection.selected_class_counts()
         if plan.class_limited and plan.selection is not None
@@ -1708,9 +2056,17 @@ def _normalized_source_proof(plan: _IterationPlan) -> NormalizedSourceProof:
         )
         for file_plan in plan.files
     )
+    normalization_signature = _normalization_signature(
+        config,
+        plan,
+        apply_sampling_caps=apply_sampling_caps,
+    )
     digest = hashlib.sha256()
     _proof_digest_update(digest, "algorithm:bitguard.normalized-source-proof.v1")
     _proof_digest_update(digest, f"dataset:{plan.source.kind}")
+    _proof_digest_update(
+        digest, f"normalization-signature:{normalization_signature}"
+    )
     _proof_digest_update(digest, f"feature-count:{len(plan.feature_columns)}")
     for feature in plan.feature_columns:
         _proof_digest_update(digest, f"feature:{feature}")
@@ -1739,6 +2095,7 @@ def _normalized_source_proof(plan: _IterationPlan) -> NormalizedSourceProof:
         row_count=row_count,
         files=file_proofs,
         snapshot_bytes=sum(proof.snapshot_byte_size for proof in file_proofs),
+        normalization_signature=normalization_signature,
         fingerprint=digest.hexdigest(),
     )
 
@@ -1808,59 +2165,106 @@ class NormalizedSource:
         self,
         config: dict[str, Any],
         plan: _IterationPlan,
+        *,
+        apply_sampling_caps: bool,
     ) -> None:
         self._config = config
         self._plan = plan
-        self._proof = _normalized_source_proof(plan)
-        self._state_lock = threading.Lock()
+        self._proof = _normalized_source_proof(
+            config,
+            plan,
+            apply_sampling_caps=apply_sampling_caps,
+        )
+        self._state_condition = threading.Condition()
         self._active_token: object | None = None
         self._active_iterator: (
             weakref.ReferenceType[_NormalizedSourceIterator] | None
         ) = None
-        self._closed = False
+        self._state = "open"
 
     @property
     def proof(self) -> NormalizedSourceProof:
         return self._proof
 
     def iter_chunks(self) -> _NormalizedSourceIterator:
-        with self._state_lock:
-            if self._closed:
+        with self._state_condition:
+            if self._state == "closing":
+                raise RuntimeError("normalized source is closing")
+            if self._state == "closed":
                 raise RuntimeError("normalized source is closed")
             if self._active_token is not None:
                 raise RuntimeError("a normalized source pass is already active")
+            self._plan.snapshots.assert_storage_unchanged()
             token = object()
-            self._active_token = token
-        try:
             iterator = iter(_iter_planned_chunks(self._config, self._plan))
-        except BaseException:
-            self._release_pass(token)
-            raise
-        source_iterator = _NormalizedSourceIterator(self, token, iterator)
-        with self._state_lock:
+            source_iterator = _NormalizedSourceIterator(self, token, iterator)
+            self._active_token = token
             self._active_iterator = weakref.ref(source_iterator)
-        return source_iterator
+            return source_iterator
 
     def _release_pass(self, token: object) -> None:
-        with self._state_lock:
+        with self._state_condition:
             if self._active_token is token:
                 self._active_token = None
                 self._active_iterator = None
+                self._state_condition.notify_all()
 
-    def close(self) -> None:
-        with self._state_lock:
-            if self._closed:
-                return
-            if self._active_token is not None:
+    def _begin_shutdown(
+        self, *, allow_active: bool
+    ) -> tuple[bool, _NormalizedSourceIterator | None]:
+        with self._state_condition:
+            while self._state == "closing":
+                self._state_condition.wait()
+            if self._state == "closed":
+                return False, None
+            if self._active_token is not None and not allow_active:
                 raise RuntimeError(
                     "cannot close normalized source while a pass is active"
                 )
-            self._closed = True
-        _close_iteration_plan(self._plan)
+            active = (
+                self._active_iterator()
+                if self._active_iterator is not None
+                else None
+            )
+            self._state = "closing"
+            return True, active
+
+    def _finish_shutdown(
+        self,
+        active: _NormalizedSourceIterator | None,
+        primary: BaseException | None,
+    ) -> None:
+        cleanups: list[BaseException] = []
+        if active is not None:
+            try:
+                active.close()
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+        try:
+            _close_iteration_plan(self._plan)
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
+        finally:
+            with self._state_condition:
+                self._active_token = None
+                self._active_iterator = None
+                self._state = "closed"
+                self._state_condition.notify_all()
+        if primary is not None:
+            _attach_cleanup_notes(primary, cleanups)
+        else:
+            _raise_cleanup_errors(cleanups)
+
+    def close(self) -> None:
+        started, active = self._begin_shutdown(allow_active=False)
+        if started:
+            self._finish_shutdown(active, None)
 
     def __enter__(self) -> NormalizedSource:
-        with self._state_lock:
-            if self._closed:
+        with self._state_condition:
+            if self._state == "closing":
+                raise RuntimeError("normalized source is closing")
+            if self._state == "closed":
                 raise RuntimeError("normalized source is closed")
         return self
 
@@ -1870,26 +2274,9 @@ class NormalizedSource:
         exc: BaseException | None,
         traceback: object | None,
     ) -> None:
-        with self._state_lock:
-            active = (
-                self._active_iterator()
-                if self._active_iterator is not None
-                else None
-            )
-        cleanups: list[BaseException] = []
-        if active is not None:
-            try:
-                active.close()
-            except BaseException as cleanup_error:
-                cleanups.append(cleanup_error)
-        try:
-            self.close()
-        except BaseException as cleanup_error:
-            cleanups.append(cleanup_error)
-        if exc is not None:
-            _attach_cleanup_notes(exc, cleanups)
-        else:
-            _raise_cleanup_errors(cleanups)
+        started, active = self._begin_shutdown(allow_active=True)
+        if started:
+            self._finish_shutdown(active, exc)
 
 
 def open_normalized_source(
@@ -1907,7 +2294,20 @@ def open_normalized_source(
         apply_sampling_caps,
         work_dir=work_dir,
     )
-    return NormalizedSource(captured_config, plan)
+    try:
+        return NormalizedSource(
+            captured_config,
+            plan,
+            apply_sampling_caps=apply_sampling_caps,
+        )
+    except BaseException as primary:
+        cleanups: list[BaseException] = []
+        try:
+            _close_iteration_plan(plan)
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
+        _attach_cleanup_notes(primary, cleanups)
+        raise
 
 
 def iter_normalized_chunks(

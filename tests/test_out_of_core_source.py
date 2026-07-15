@@ -6,7 +6,9 @@ import inspect
 import os
 import re
 import stat
+import subprocess
 import tempfile
+import threading
 import unittest
 import weakref
 from dataclasses import FrozenInstanceError
@@ -144,6 +146,61 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
             for repeated in passes[1:]:
                 pd.testing.assert_frame_equal(repeated, passes[0])
 
+    def test_normalized_source_proof_binds_botiot_normalization_semantics(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {
+                    "category": ["DDoS", "Normal"],
+                    "subcategory": ["Service_Scan", "Normal"],
+                    "saddr": ["a", "b"],
+                    "stime": [1, 2],
+                    "rate": [10.0, 0.1],
+                }
+            ).to_csv(root / "rows.csv", index=False)
+            baseline = _base_config(root, "botiot", "rows.csv")
+            remapped = copy.deepcopy(baseline)
+            remapped["dataset"]["label_map"] = {"ddos": "exfil_like"}
+            alternate_schema = copy.deepcopy(baseline)
+            alternate_schema["dataset"]["raw_attack_column"] = "category"
+            irrelevant = copy.deepcopy(remapped)
+            irrelevant["training"]["epochs"] += 100
+
+            def capture(config: dict) -> tuple[list[str], NormalizedSourceProof]:
+                with open_normalized_source(config) as source:
+                    labels = [
+                        str(label)
+                        for chunk in source.iter_chunks()
+                        for label in chunk.frame["behavior_label"]
+                    ]
+                    return labels, source.proof
+
+            baseline_labels, baseline_proof = capture(baseline)
+            remapped_labels, remapped_proof = capture(remapped)
+            schema_labels, schema_proof = capture(alternate_schema)
+            irrelevant_labels, irrelevant_proof = capture(irrelevant)
+
+            self.assertNotEqual(baseline_labels, remapped_labels)
+            self.assertNotEqual(baseline_labels, schema_labels)
+            self.assertNotEqual(
+                baseline_proof.normalization_signature,
+                remapped_proof.normalization_signature,
+            )
+            self.assertNotEqual(
+                baseline_proof.fingerprint, remapped_proof.fingerprint
+            )
+            self.assertNotEqual(
+                baseline_proof.fingerprint, schema_proof.fingerprint
+            )
+            self.assertEqual(remapped_labels, irrelevant_labels)
+            self.assertEqual(
+                remapped_proof.normalization_signature,
+                irrelevant_proof.normalization_signature,
+            )
+            self.assertEqual(remapped_proof.fingerprint, irrelevant_proof.fingerprint)
+
     def test_normalized_source_early_close_and_iterator_error_release_pass(
         self,
     ) -> None:
@@ -256,6 +313,51 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
 
             self.assertEqual(list(work_dir.iterdir()), [])
 
+    def test_normalized_source_context_exit_marks_closing_before_active_close(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 5, "x": range(5)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            source = open_normalized_source(config)
+            iterator = source.iter_chunks()
+            close_started = threading.Event()
+            allow_close = threading.Event()
+            failures: list[BaseException] = []
+            original_close = iterator.close
+
+            def blocked_close() -> None:
+                close_started.set()
+                if not allow_close.wait(timeout=10):
+                    raise RuntimeError("close barrier timed out")
+                original_close()
+
+            iterator.close = blocked_close  # type: ignore[method-assign]
+
+            def close_context() -> None:
+                try:
+                    source.__exit__(None, None, None)
+                except BaseException as exc:
+                    failures.append(exc)
+
+            closer = threading.Thread(target=close_context)
+            closer.start()
+            self.assertTrue(close_started.wait(timeout=10))
+            try:
+                with self.assertRaisesRegex(RuntimeError, "closing"):
+                    source.iter_chunks()
+            finally:
+                allow_close.set()
+                closer.join(timeout=10)
+
+            self.assertFalse(closer.is_alive())
+            self.assertEqual(failures, [])
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                source.iter_chunks()
+
     def test_abandoned_iterator_releases_session_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -312,6 +414,47 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
                 )
             )
 
+    def test_open_normalized_source_cleans_plan_when_proof_construction_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "work"
+            work_dir.mkdir(mode=0o700)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 3, "x": range(3)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            original_close = source_module._SnapshotStore.close
+
+            def close_then_fail(store: source_module._SnapshotStore) -> None:
+                original_close(store)
+                raise RuntimeError("proof cleanup secondary")
+
+            with (
+                patch.object(
+                    source_module,
+                    "_normalized_source_proof",
+                    side_effect=RuntimeError("proof primary"),
+                ),
+                patch.object(
+                    source_module._SnapshotStore,
+                    "close",
+                    close_then_fail,
+                ),
+                self.assertRaisesRegex(RuntimeError, "proof primary") as caught,
+            ):
+                open_normalized_source(config, work_dir=work_dir)
+
+            self.assertEqual(list(work_dir.iterdir()), [])
+            self.assertTrue(
+                any(
+                    "cleanup context" in note
+                    and "proof cleanup secondary" in note
+                    for note in getattr(caught.exception, "__notes__", ())
+                )
+            )
+
     def test_normalized_source_rejects_source_and_snapshot_tampering(self) -> None:
         for target in ("source", "snapshot"):
             with (
@@ -359,6 +502,107 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
                 )
 
             self.assertEqual(list(work_dir.iterdir()), [])
+
+    def test_normalized_source_rejects_linked_work_dir_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            requested = outside / "work"
+            requested.mkdir(parents=True, mode=0o700)
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_text("unchanged", encoding="utf-8")
+            linked = root / "linked"
+            if os.name == "nt":
+                created = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(linked), str(outside)],
+                    capture_output=True,
+                    check=False,
+                )
+                if created.returncode != 0:
+                    self.skipTest("could not create Windows junction")
+            else:
+                linked.symlink_to(outside, target_is_directory=True)
+            pd.DataFrame(
+                {"behavior_label": ["benign"], "x": [1]}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            try:
+                with self.assertRaisesRegex(ValueError, "link|junction|reparse"):
+                    open_normalized_source(config, work_dir=linked / "work")
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+                self.assertEqual(set(outside.iterdir()), {requested, sentinel})
+            finally:
+                if os.name == "nt":
+                    linked.rmdir()
+                else:
+                    linked.unlink()
+
+    def test_work_dir_identity_is_pinned_across_private_child_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "work"
+            work_dir.mkdir(mode=0o700)
+            moved = root / "moved-work"
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_text("unchanged", encoding="utf-8")
+            pd.DataFrame(
+                {"behavior_label": ["benign"], "x": [1]}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            replacement_blocked = False
+
+            def inject_replacement(guard):
+                nonlocal replacement_blocked
+                try:
+                    work_dir.rename(moved)
+                except OSError:
+                    replacement_blocked = True
+                else:
+                    if os.name == "nt":
+                        created = subprocess.run(
+                            [
+                                "cmd",
+                                "/c",
+                                "mklink",
+                                "/J",
+                                str(work_dir),
+                                str(outside),
+                            ],
+                            capture_output=True,
+                            check=False,
+                        )
+                        if created.returncode != 0:
+                            moved.rename(work_dir)
+                            replacement_blocked = True
+                    else:
+                        work_dir.symlink_to(outside, target_is_directory=True)
+                return guard.create_child()
+
+            with patch.object(
+                source_module,
+                "_create_private_work_child",
+                inject_replacement,
+                create=True,
+            ):
+                if os.name == "nt" and replacement_blocked:
+                    with open_normalized_source(
+                        config, work_dir=work_dir
+                    ) as source:
+                        list(source.iter_chunks())
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "changed"):
+                        open_normalized_source(config, work_dir=work_dir)
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+            self.assertEqual(set(outside.iterdir()), {sentinel})
+            if moved.exists():
+                if os.name == "nt":
+                    work_dir.rmdir()
+                else:
+                    work_dir.unlink()
+                moved.rename(work_dir)
 
     def test_normalized_source_does_not_retain_emitted_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
