@@ -191,6 +191,7 @@ class CalibrationCache:
         self._commits = commits
         self._readonly = readonly
         self._closed = False
+        self._poisoned = False
 
     @classmethod
     def create(cls, root: Path | str, layout: CacheLayout) -> CalibrationCache:
@@ -305,7 +306,14 @@ class CalibrationCache:
         }
         commits = [*self._commits, commit]
         journal = _journal_payload(self.layout.fingerprint, end, commits)
-        _write_journal(self.root, journal)
+        try:
+            _write_journal(self.root, journal)
+        except BaseException:
+            # Publication may have failed before or after os.replace.  The live
+            # object cannot know which prefix is authoritative, so only a fresh
+            # open that validates the on-disk journal may continue.
+            self._poison()
+            raise
         self._commits = commits
         self._committed_rows = end
 
@@ -335,9 +343,11 @@ class CalibrationCache:
     def close(self) -> None:
         if self._closed:
             return
-        _close_memmaps(self._arrays.values())
-        self._arrays.clear()
-        self._closed = True
+        try:
+            _close_memmaps(self._arrays.values())
+        finally:
+            self._arrays.clear()
+            self._closed = True
 
     def __enter__(self) -> CalibrationCache:
         self._ensure_open()
@@ -347,8 +357,22 @@ class CalibrationCache:
         self.close()
 
     def _ensure_open(self) -> None:
+        if self._poisoned:
+            raise RuntimeError(
+                "calibration cache writer is unusable after uncertain journal "
+                "publication; reopen and verify the cache"
+            )
         if self._closed:
             raise RuntimeError("calibration cache is closed")
+
+    def _poison(self) -> None:
+        self._poisoned = True
+        try:
+            self.close()
+        except BaseException:
+            # Preserve the journal-publication exception.  close() has already
+            # attempted every mapping and marked this writer closed.
+            pass
 
     def __del__(self) -> None:
         try:
@@ -686,10 +710,17 @@ def _verify_committed_ranges(
 
 
 def _close_memmaps(arrays: Sequence[np.memmap[Any, Any]] | Any) -> None:
+    first_error: BaseException | None = None
     for array in tuple(arrays):
         mmap = getattr(array, "_mmap", None)
         if mmap is not None:
-            mmap.close()
+            try:
+                mmap.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def _fsync_directory(path: Path) -> None:

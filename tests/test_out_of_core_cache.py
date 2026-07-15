@@ -151,12 +151,39 @@ class CalibrationCacheTests(unittest.TestCase):
             ):
                 with self.assertRaises(OSError):
                     cache.commit_range(2, self._batch(2, 2))
-            self.assertEqual(cache.committed_rows, 2)
+            with self.assertRaisesRegex(RuntimeError, "unusable"):
+                _ = cache.committed_rows
+            with self.assertRaisesRegex(RuntimeError, "unusable"):
+                cache.commit_range(2, self._batch(2, 2))
             cache.close()
             with CalibrationCache.open_resume(root, layout) as resumed:
                 self.assertEqual(resumed.committed_rows, 2)
                 resumed.commit_range(2, self._batch(2, 3))
                 self.assertEqual(resumed.committed_rows, 5)
+
+    def test_failure_after_journal_replace_requires_reopen_and_keeps_new_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "cache"
+            layout = self._layout()
+            cache = CalibrationCache.create(root, layout)
+            with mock.patch.object(
+                cache_module,
+                "_fsync_directory",
+                side_effect=OSError("injected after replace"),
+            ):
+                with self.assertRaisesRegex(OSError, "injected after replace"):
+                    cache.commit_range(0, self._batch(0, 2))
+            with self.assertRaisesRegex(RuntimeError, "unusable"):
+                _ = cache.arrays
+            with self.assertRaisesRegex(RuntimeError, "unusable"):
+                cache.commit_range(0, self._batch(0, 2))
+            cache.close()
+            with CalibrationCache.open_resume(root, layout) as resumed:
+                self.assertEqual(resumed.committed_rows, 2)
+                np.testing.assert_array_equal(
+                    resumed.arrays["cache_position"][:2],
+                    np.arange(2, dtype=np.int64),
+                )
 
     def test_mismatch_tamper_and_truncation_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
