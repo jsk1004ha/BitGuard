@@ -36,7 +36,7 @@ class ClassWeightTests(unittest.TestCase):
         for counts, labels in invalid:
             with self.subTest(counts=counts):
                 with self.assertRaises(ValueError):
-                    class_weights_from_counts(counts, labels)
+                    class_weights_from_counts(counts, labels)  # type: ignore[arg-type]
 
 
 class CalibrationCacheTests(unittest.TestCase):
@@ -48,7 +48,9 @@ class CalibrationCacheTests(unittest.TestCase):
             "source_fingerprint": "source",
             "split": "validation",
             "row_count": 5,
-            "class_labels": ("benign", "attack"),
+            "main_class_labels": ("benign", "scan_like"),
+            "routed_class_labels": ("benign", "scan_like", "unknown_like"),
+            "true_class_labels": ("benign", "scan_like", "unknown_like"),
             "selected_features": ("f1", "f2"),
             "boolean_features": ("flag",),
             "device_id_width": 12,
@@ -59,6 +61,9 @@ class CalibrationCacheTests(unittest.TestCase):
 
     def _batch(self, start: int, rows: int) -> dict[str, object]:
         known = np.tile(np.asarray([[0.75, 0.25]], dtype=np.float32), (rows, 1))
+        routed = np.tile(
+            np.asarray([[0.70, 0.20, 0.10]], dtype=np.float32), (rows, 1)
+        )
         return {
             "cache_position": np.arange(start, start + rows, dtype=np.int64),
             "uid_digest": np.arange(rows * 32, dtype=np.uint8).reshape(rows, 32),
@@ -71,7 +76,7 @@ class CalibrationCacheTests(unittest.TestCase):
             "sequence": np.arange(start, start + rows, dtype=np.int64),
             "device_id": [f"기기-{index}" for index in range(start, start + rows)],
             "source_id": [f"source\x00{index}" for index in range(start, start + rows)],
-            "routed_probabilities": known.copy(),
+            "routed_probabilities": routed,
             "exit_stage": np.zeros(rows, dtype=np.int16),
         }
 
@@ -81,6 +86,7 @@ class CalibrationCacheTests(unittest.TestCase):
             self.assertEqual(cache.committed_rows, 0)
             self.assertEqual(cache.arrays["uid_digest"].shape, (5, 32))
             self.assertEqual(cache.arrays["known_probabilities"].shape, (5, 2))
+            self.assertEqual(cache.arrays["routed_probabilities"].shape, (5, 3))
             self.assertEqual(cache.arrays["selected_values"].shape, (5, 2))
             self.assertEqual(cache.arrays["boolean_flags"].shape, (5, 1))
             for name, array in cache.arrays.items():
@@ -89,6 +95,32 @@ class CalibrationCacheTests(unittest.TestCase):
                     array.nbytes,
                 )
             cache.close()
+
+    def test_separate_probability_and_truth_label_axes_are_fingerprinted(self) -> None:
+        baseline = self._layout()
+        variants = (
+            self._layout(main_class_labels=("benign", "flood_like")),
+            self._layout(
+                routed_class_labels=(
+                    "benign",
+                    "scan_like",
+                    "flood_like",
+                    "unknown_like",
+                )
+            ),
+            self._layout(true_class_labels=("benign", "unknown_like")),
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotEqual(baseline.fingerprint, variant.fingerprint)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "cache"
+            with CalibrationCache.create(root, baseline):
+                pass
+            for variant in variants:
+                with self.subTest(open_variant=variant):
+                    with self.assertRaisesRegex(RuntimeError, "expected layout"):
+                        CalibrationCache.open_readonly(root, variant)
 
     def test_multiple_commits_reopen_readonly_and_preserve_identifiers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -165,6 +197,9 @@ class CalibrationCacheTests(unittest.TestCase):
             wrong_dtype = self._batch(0, 2)
             wrong_dtype["true_label"] = np.asarray([0, 1], dtype=np.int64)
             invalid_batches.append((0, wrong_dtype))
+            wrong_truth_axis = self._batch(0, 2)
+            wrong_truth_axis["true_label"] = np.asarray([0, 3], dtype=np.int32)
+            invalid_batches.append((0, wrong_truth_axis))
             nonfinite = self._batch(0, 2)
             nonfinite["selected_values"] = np.asarray(
                 [[0.0, np.nan], [1.0, 2.0]], dtype=np.float32

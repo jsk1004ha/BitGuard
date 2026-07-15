@@ -37,7 +37,9 @@ class CacheLayout:
     source_fingerprint: str
     split: str
     row_count: int
-    class_labels: tuple[str, ...]
+    main_class_labels: tuple[str, ...]
+    routed_class_labels: tuple[str, ...]
+    true_class_labels: tuple[str, ...]
     selected_features: tuple[str, ...]
     boolean_features: tuple[str, ...]
     device_id_width: int
@@ -60,7 +62,13 @@ class CacheLayout:
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"CacheLayout.{field} must be a positive integer")
-        for field in ("class_labels", "selected_features", "boolean_features"):
+        for field in (
+            "main_class_labels",
+            "routed_class_labels",
+            "true_class_labels",
+            "selected_features",
+            "boolean_features",
+        ):
             values = getattr(self, field)
             if not isinstance(values, tuple):
                 raise ValueError(f"CacheLayout.{field} must be a tuple")
@@ -73,7 +81,9 @@ class CacheLayout:
 
     def semantic_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["class_labels"] = list(self.class_labels)
+        payload["main_class_labels"] = list(self.main_class_labels)
+        payload["routed_class_labels"] = list(self.routed_class_labels)
+        payload["true_class_labels"] = list(self.true_class_labels)
         payload["selected_features"] = list(self.selected_features)
         payload["boolean_features"] = list(self.boolean_features)
         return payload
@@ -103,7 +113,13 @@ class CacheLayout:
         expected = set(cls.__dataclass_fields__)
         if set(value) != expected:
             raise RuntimeError("calibration cache layout schema mismatch")
-        for field in ("class_labels", "selected_features", "boolean_features"):
+        for field in (
+            "main_class_labels",
+            "routed_class_labels",
+            "true_class_labels",
+            "selected_features",
+            "boolean_features",
+        ):
             raw = value[field]
             if not isinstance(raw, list):
                 raise RuntimeError("calibration cache layout schema mismatch")
@@ -130,14 +146,15 @@ class _ArraySpec:
 
 def _array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
     rows = layout.row_count
-    classes = len(layout.class_labels)
+    main_classes = len(layout.main_class_labels)
+    routed_classes = len(layout.routed_class_labels)
     selected = len(layout.selected_features)
     boolean = len(layout.boolean_features)
     specs = {
         "cache_position": _ArraySpec("<i8", (rows,)),
         "uid_digest": _ArraySpec("|u1", (rows, 32)),
         "true_label": _ArraySpec("<i4", (rows,)),
-        "known_probabilities": _ArraySpec("<f4", (rows, classes)),
+        "known_probabilities": _ArraySpec("<f4", (rows, main_classes)),
         "selected_values": _ArraySpec("<f4", (rows, selected)),
         "tiny_benign_probability": _ArraySpec("<f4", (rows,)),
         "timestamp": _ArraySpec("<f8", (rows,)),
@@ -146,7 +163,7 @@ def _array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
         "device_id_length": _ArraySpec("<u4", (rows,)),
         "source_id_bytes": _ArraySpec("|u1", (rows, layout.source_id_width)),
         "source_id_length": _ArraySpec("<u4", (rows,)),
-        "routed_probabilities": _ArraySpec("<f4", (rows, classes)),
+        "routed_probabilities": _ArraySpec("<f4", (rows, routed_classes)),
         "exit_stage": _ArraySpec("<i2", (rows,)),
         "boolean_flags": _ArraySpec("|u1", (rows, boolean)),
     }
@@ -427,7 +444,9 @@ def _prepare_batch(
     rows = len(positions_value)
     if rows <= 0:
         raise ValueError("cache commit range must not be empty")
-    classes = len(layout.class_labels)
+    main_classes = len(layout.main_class_labels)
+    routed_classes = len(layout.routed_class_labels)
+    true_classes = len(layout.true_class_labels)
     selected = len(layout.selected_features)
     booleans = len(layout.boolean_features)
     positions = _require_array(values, "cache_position", np.dtype("<i8"), (rows,))
@@ -438,7 +457,7 @@ def _prepare_batch(
         "uid_digest": _require_array(values, "uid_digest", np.dtype("|u1"), (rows, 32)),
         "true_label": _require_array(values, "true_label", np.dtype("<i4"), (rows,)),
         "known_probabilities": _require_array(
-            values, "known_probabilities", np.dtype("<f4"), (rows, classes)
+            values, "known_probabilities", np.dtype("<f4"), (rows, main_classes)
         ),
         "selected_values": _require_array(
             values, "selected_values", np.dtype("<f4"), (rows, selected)
@@ -449,7 +468,7 @@ def _prepare_batch(
         "timestamp": _require_array(values, "timestamp", np.dtype("<f8"), (rows,)),
         "sequence": _require_array(values, "sequence", np.dtype("<i8"), (rows,)),
         "routed_probabilities": _require_array(
-            values, "routed_probabilities", np.dtype("<f4"), (rows, classes)
+            values, "routed_probabilities", np.dtype("<f4"), (rows, routed_classes)
         ),
         "exit_stage": _require_array(values, "exit_stage", np.dtype("<i2"), (rows,)),
     }
@@ -458,8 +477,8 @@ def _prepare_batch(
     )
     prepared["boolean_flags"] = boolean_flags.astype(np.uint8, copy=False)
     true_label = prepared["true_label"]
-    if np.any(true_label < 0) or np.any(true_label >= classes):
-        raise ValueError("true_label contains an index outside class_labels")
+    if np.any(true_label < 0) or np.any(true_label >= true_classes):
+        raise ValueError("true_label contains an index outside true_class_labels")
     for name in (
         "known_probabilities",
         "selected_values",
