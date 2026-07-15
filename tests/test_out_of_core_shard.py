@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from bitguard_bnn.out_of_core.source import NormalizedChunk
@@ -144,6 +148,10 @@ class OutOfCoreShardTests(unittest.TestCase):
             )
             self.assertEqual(
                 int(manifest["shard_contract"]["merge_read_rows"]), 1024
+            )
+            self.assertLessEqual(
+                int(manifest["resource_usage"]["max_merge_input_rows_buffered"]),
+                int(manifest["resource_usage"]["merge_input_rows_buffered_limit"]),
             )
             self.assertEqual(
                 manifest["source_coverage"],
@@ -293,6 +301,151 @@ class OutOfCoreShardTests(unittest.TestCase):
         self.assertGreater(
             int(manifest["class_counts"]["test"].get("unknown_like", 0)), 0
         )
+
+    def test_attack_relabel_rejects_replayed_source_outside_declared_heldout_group(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core.shard import write_parquet_shards
+
+        rows = _rows()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split = _split(rows, root, "attack")
+            replayed = [dict(row) for row in rows]
+            heldout = next(
+                row for row in replayed if row["raw_attack"] == "scan_like"
+            )
+            heldout["raw_attack"] = "flood_like"
+            with self.assertRaisesRegex(RuntimeError, "held-out attack|raw_attack"):
+                write_parquet_shards(
+                    _chunks(replayed, 9),
+                    split,
+                    ("f1", "f2"),
+                    root / "prepared",
+                    dataset_name="fixture",
+                    preprocessing_fingerprint="preprocess-v1",
+                    shard_target_rows=10,
+                    max_rows_per_run=12,
+                    merge_fan_in=2,
+                    merge_read_rows=4,
+                )
+            membership = split.membership_path
+            moved = membership.with_name("membership-handle-check.parquet")
+            membership.rename(moved)
+            moved.rename(membership)
+            self.assertFalse(any((root / "prepared").rglob("*.partial")))
+
+    def test_shard_path_rejects_linked_parent_and_resolved_root_escape(self) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            root = parent / "prepared"
+            root.mkdir()
+            outside = parent / "outside"
+            shard = outside / "split=train" / "label=benign" / "part-00000000.parquet"
+            shard.parent.mkdir(parents=True)
+            shard.write_bytes(b"fixture")
+            linked = root / "linked"
+            try:
+                linked.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                if os.name != "nt":
+                    self.skipTest(f"directory symlinks unavailable: {exc}")
+                created = subprocess.run(
+                    [
+                        "cmd",
+                        "/d",
+                        "/c",
+                        f"mklink /J {linked} {outside}",
+                    ],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+                if created.returncode != 0:
+                    self.skipTest(
+                        "directory links unavailable: "
+                        f"{created.stdout} {created.stderr}"
+                    )
+            relative = (
+                "linked/split=train/label=benign/part-00000000.parquet"
+            )
+            with self.assertRaisesRegex(RuntimeError, "link|unsafe"):
+                shard_module._safe_entry_path(root, relative)
+            junction_name = "is_junction"
+            junction_patch = (
+                patch.object(Path, junction_name, return_value=False)
+                if hasattr(Path, junction_name)
+                else nullcontext()
+            )
+            with (
+                patch.object(Path, "is_symlink", return_value=False),
+                junction_patch,
+                self.assertRaisesRegex(RuntimeError, "escape|beneath|root"),
+            ):
+                shard_module._safe_entry_path(root, relative)
+            self.assertEqual(shard.read_bytes(), b"fixture")
+            linked.rmdir()
+
+    def test_large_row_group_is_read_in_bounded_batches_and_closes_on_close(self) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        schema = pa.schema(
+            [
+                pa.field("row_uid", pa.string(), nullable=False),
+                pa.field("split", pa.string(), nullable=False),
+                pa.field("behavior_label", pa.string(), nullable=False),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "one-large-row-group.parquet"
+            pq.write_table(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            "row_uid": f"{index:064x}",
+                            "split": "train",
+                            "behavior_label": "benign",
+                        }
+                        for index in range(41)
+                    ],
+                    schema=schema,
+                ),
+                path,
+                row_group_size=41,
+            )
+            real_parquet_file = pq.ParquetFile
+            observed: list[int] = []
+
+            class InstrumentedParquetFile:
+                def __init__(self, *args: Any, **kwargs: Any) -> None:
+                    self._delegate = real_parquet_file(*args, **kwargs)
+
+                def iter_batches(self, *args: Any, **kwargs: Any):
+                    self.assert_batch_size(kwargs.get("batch_size"))
+                    for batch in self._delegate.iter_batches(*args, **kwargs):
+                        observed.append(batch.num_rows)
+                        yield batch
+
+                @staticmethod
+                def assert_batch_size(value: object) -> None:
+                    if value != 3:
+                        raise AssertionError(f"unbounded batch size: {value}")
+
+            tracker = shard_module._ResourceTracker(root, 100, 3)
+            with patch.object(shard_module.pq, "ParquetFile", InstrumentedParquetFile):
+                iterator = shard_module._iter_records(path, 3, tracker=tracker)
+                first = next(iterator)
+                iterator.close()
+            self.assertEqual(first["row_uid"], f"{0:064x}")
+            self.assertTrue(observed)
+            self.assertLessEqual(max(observed), 3)
+            self.assertLessEqual(tracker.max_merge_input_rows_buffered, 3)
+            moved = root / "moved.parquet"
+            path.rename(moved)
+            moved.rename(path)
 
     def test_manifest_publication_failure_rolls_back_only_owned_shards(self) -> None:
         from bitguard_bnn.out_of_core.shard import write_parquet_shards

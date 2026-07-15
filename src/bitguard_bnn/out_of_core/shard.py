@@ -11,7 +11,17 @@ import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, cast
+from typing import (
+    Any,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+    NoReturn,
+    Sequence,
+    cast,
+)
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -73,10 +83,13 @@ class ShardPlan:
 class _ResourceTracker:
     root: Path
     max_rows_per_run: int
+    merge_read_rows: int
     max_run_rows: int = 0
     run_count: int = 0
     max_merge_fan_in_observed: int = 0
     temporary_bytes_peak: int = 0
+    merge_input_rows_buffered: int = 0
+    max_merge_input_rows_buffered: int = 0
 
     def record_run(self, rows: int) -> None:
         self.max_run_rows = max(self.max_run_rows, int(rows))
@@ -87,6 +100,20 @@ class _ResourceTracker:
         self.max_merge_fan_in_observed = max(
             self.max_merge_fan_in_observed, int(fan_in)
         )
+
+    def open_merge_batch(self, rows: int) -> None:
+        if rows < 0 or rows > self.merge_read_rows:
+            raise RuntimeError("merge input batch exceeded configured row bound")
+        self.merge_input_rows_buffered += rows
+        self.max_merge_input_rows_buffered = max(
+            self.max_merge_input_rows_buffered,
+            self.merge_input_rows_buffered,
+        )
+
+    def close_merge_batch(self, rows: int) -> None:
+        self.merge_input_rows_buffered -= rows
+        if self.merge_input_rows_buffered < 0:
+            raise RuntimeError("merge input row accounting underflow")
 
     def observe_disk(self) -> None:
         total = 0
@@ -257,19 +284,52 @@ def _write_run(
 
 
 def _iter_records(
-    path: Path, batch_rows: int, columns: Sequence[str] | None = None
-) -> Iterator[dict[str, Any]]:
-    # Reopen per row group so an exception traceback cannot retain an open file
-    # handle and prevent strict work-tree cleanup on Windows.
+    path: Path,
+    batch_rows: int,
+    columns: Sequence[str] | None = None,
+    tracker: _ResourceTracker | None = None,
+) -> Generator[dict[str, Any], None, None]:
     with path.open("rb") as handle:
-        row_groups = pq.ParquetFile(handle).metadata.num_row_groups
-    for row_group in range(row_groups):
-        with path.open("rb") as handle:
-            table = pq.ParquetFile(handle).read_row_group(
-                row_group, columns=columns
+        parquet = pq.ParquetFile(handle)
+        for batch in parquet.iter_batches(batch_size=batch_rows, columns=columns):
+            rows = batch.to_pylist()
+            row_count = len(rows)
+            if tracker is not None:
+                tracker.open_merge_batch(row_count)
+            try:
+                yield from rows
+            finally:
+                rows.clear()
+                if tracker is not None:
+                    tracker.close_merge_batch(row_count)
+                del rows
+
+
+def _close_iterators(iterators: Iterable[object]) -> list[BaseException]:
+    cleanup: list[BaseException] = []
+    for iterator in iterators:
+        close = getattr(iterator, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except BaseException as error:
+            cleanup.append(error)
+    return cleanup
+
+
+def _raise_primary_with_cleanup(
+    primary: BaseException, cleanup: Sequence[BaseException]
+) -> NoReturn:
+    if cleanup:
+        for cleanup_error in cleanup:
+            attach_cleanup_context(
+                primary,
+                "cleanup failure: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}",
             )
-        for batch in table.to_batches(max_chunksize=batch_rows):
-            yield from batch.to_pylist()
+        raise primary from cleanup[0]
+    raise primary
 
 
 def _write_merged_group(
@@ -282,7 +342,9 @@ def _write_merged_group(
     read_batch_rows: int,
     tracker: _ResourceTracker | None,
 ) -> None:
-    iterators = [_iter_records(path, read_batch_rows) for path in inputs]
+    iterators = [
+        _iter_records(path, read_batch_rows, tracker=tracker) for path in inputs
+    ]
     merged = heapq.merge(*iterators, key=key)
     destination.parent.mkdir(parents=True, exist_ok=True)
     writer = pq.ParquetWriter(destination, schema, compression="zstd")
@@ -311,28 +373,13 @@ def _write_merged_group(
             writer.close()
         except BaseException as cleanup_failure:
             cleanup.append(cleanup_failure)
-        for iterator in iterators:
-            close = getattr(iterator, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except BaseException as cleanup_failure:
-                    cleanup.append(cleanup_failure)
-        if cleanup:
-            for cleanup_error in cleanup:
-                attach_cleanup_context(
-                    primary,
-                    "cleanup failure: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}",
-                )
-            raise primary from cleanup[0]
-        raise
+        cleanup.extend(_close_iterators(iterators))
+        _raise_primary_with_cleanup(primary, cleanup)
     else:
         writer.close()
-        for iterator in iterators:
-            close = getattr(iterator, "close", None)
-            if callable(close):
-                close()
+        cleanup = _close_iterators(iterators)
+        if cleanup:
+            raise cleanup[0]
     _fsync_file(destination)
     if tracker is not None:
         tracker.record_merge(len(inputs))
@@ -507,6 +554,8 @@ def _validate_split_plan(plan: SplitPlan) -> dict[str, Any]:
         semantic = split_manifest_semantic_fingerprint(manifest)
         membership = manifest["membership"]
         counts = manifest["counts"]
+        held_out = manifest["held_out"]
+        held_out_attacks = held_out["attacks"]
     except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("invalid split manifest for shard preparation") from exc
     expected_counts = {
@@ -515,13 +564,16 @@ def _validate_split_plan(plan: SplitPlan) -> dict[str, Any]:
         "test": plan.test_count,
     }
     if (
-        manifest.get("fingerprint") != plan.fingerprint
+        manifest.get("strategy") != plan.strategy
+        or manifest.get("fingerprint") != plan.fingerprint
         or manifest.get("semantic_fingerprint") != semantic
         or membership.get("path") != plan.membership_path.name
         or {name: int(counts.get(name, -1)) for name in _PARTITIONS}
         != expected_counts
         or int(membership.get("rows", -1)) != sum(expected_counts.values())
         or _sha256_file(plan.membership_path) != membership.get("sha256")
+        or not isinstance(held_out_attacks, list)
+        or any(not isinstance(value, str) for value in held_out_attacks)
     ):
         raise RuntimeError("split plan fingerprint or membership checksum mismatch")
     return manifest
@@ -535,13 +587,16 @@ def _join_membership(
     schema: pa.Schema,
     max_rows_per_run: int,
     merge_read_rows: int,
+    held_out_attacks: frozenset[str],
     tracker: _ResourceTracker,
 ) -> tuple[list[Path], int, str]:
     _validate_membership_file(split_plan.membership_path)
-    sources = _iter_records(source_path, merge_read_rows)
-    members = _iter_records(split_plan.membership_path, merge_read_rows)
-    source = next(sources, None)
-    member = next(members, None)
+    sources = _iter_records(source_path, merge_read_rows, tracker=tracker)
+    members = _iter_records(
+        split_plan.membership_path, merge_read_rows, tracker=tracker
+    )
+    source: dict[str, Any] | None = None
+    member: dict[str, Any] | None = None
     previous_source: str | None = None
     previous_member: str | None = None
     joined_runs: list[Path] = []
@@ -560,59 +615,89 @@ def _join_membership(
         joined_runs.append(path)
         buffer.clear()
 
-    while source is not None or member is not None:
-        if source is not None:
-            source_uid = str(source["row_uid"])
-            if source_uid == previous_source:
-                raise ValueError(f"duplicate source row_uid: {source_uid}")
-        else:
-            source_uid = ""
-        if member is not None:
-            member_uid = str(member["row_uid"])
-            if member_uid == previous_member:
-                raise RuntimeError(f"duplicate split membership row_uid: {member_uid}")
-        else:
-            member_uid = ""
-        if source is None:
-            raise RuntimeError(f"missing source coverage for membership UID: {member_uid}")
-        if member is None:
-            raise RuntimeError(f"extra source coverage UID: {source_uid}")
-        if source_uid < member_uid:
-            raise RuntimeError(f"extra source coverage UID: {source_uid}")
-        if source_uid > member_uid:
-            raise RuntimeError(f"missing source coverage for membership UID: {member_uid}")
-        split = str(member["split"])
-        label = str(member["behavior_label"])
-        if split not in _PARTITION_SET:
-            raise RuntimeError(f"invalid split membership partition: {split}")
-        if not _PATH_TOKEN.fullmatch(label):
-            raise RuntimeError(f"unsafe behavior label for partition path: {label!r}")
-        source_label = str(source["behavior_label"])
-        sanctioned_attack_relabel = (
-            split_plan.strategy == "attack"
-            and split == "test"
-            and label == "unknown_like"
-        )
-        if source_label != label and not sanctioned_attack_relabel:
-            raise RuntimeError(
-                "source and split membership behavior_label mismatch for UID: "
-                f"{source_uid}"
-            )
-        published = dict(source)
-        published["split"] = split
-        published["behavior_label"] = label
-        buffer.append(published)
-        uid_digest.update(source_uid.encode("utf-8"))
-        uid_digest.update(b"\n")
-        total += 1
-        previous_source = source_uid
-        previous_member = member_uid
+    try:
         source = next(sources, None)
         member = next(members, None)
-        if len(buffer) >= max_rows_per_run:
-            flush()
-    flush()
-    return joined_runs, total, uid_digest.hexdigest()
+        while source is not None or member is not None:
+            if source is not None:
+                source_uid = str(source["row_uid"])
+                if source_uid == previous_source:
+                    raise ValueError(f"duplicate source row_uid: {source_uid}")
+            else:
+                source_uid = ""
+            if member is not None:
+                member_uid = str(member["row_uid"])
+                if member_uid == previous_member:
+                    raise RuntimeError(
+                        f"duplicate split membership row_uid: {member_uid}"
+                    )
+            else:
+                member_uid = ""
+            if source is None:
+                raise RuntimeError(
+                    f"missing source coverage for membership UID: {member_uid}"
+                )
+            if member is None:
+                raise RuntimeError(f"extra source coverage UID: {source_uid}")
+            if source_uid < member_uid:
+                raise RuntimeError(f"extra source coverage UID: {source_uid}")
+            if source_uid > member_uid:
+                raise RuntimeError(
+                    f"missing source coverage for membership UID: {member_uid}"
+                )
+            split = str(member["split"])
+            label = str(member["behavior_label"])
+            if split not in _PARTITION_SET:
+                raise RuntimeError(f"invalid split membership partition: {split}")
+            if not _PATH_TOKEN.fullmatch(label):
+                raise RuntimeError(
+                    f"unsafe behavior label for partition path: {label!r}"
+                )
+            source_label = str(source["behavior_label"])
+            source_attack = normalize_token(source["raw_attack"])
+            sanctioned_attack_relabel = (
+                split_plan.strategy == "attack"
+                and split == "test"
+                and label == "unknown_like"
+                and source_attack in held_out_attacks
+            )
+            if source_label != label and not sanctioned_attack_relabel:
+                if (
+                    split_plan.strategy == "attack"
+                    and split == "test"
+                    and label == "unknown_like"
+                ):
+                    raise RuntimeError(
+                        "attack relabel raw_attack is not a declared held-out attack "
+                        f"for UID: {source_uid}"
+                    )
+                raise RuntimeError(
+                    "source and split membership behavior_label mismatch for UID: "
+                    f"{source_uid}"
+                )
+            published = dict(source)
+            published["split"] = split
+            published["behavior_label"] = label
+            buffer.append(published)
+            uid_digest.update(source_uid.encode("utf-8"))
+            uid_digest.update(b"\n")
+            total += 1
+            previous_source = source_uid
+            previous_member = member_uid
+            source = next(sources, None)
+            member = next(members, None)
+            if len(buffer) >= max_rows_per_run:
+                flush()
+        flush()
+        result = (joined_runs, total, uid_digest.hexdigest())
+    except BaseException as primary:
+        _raise_primary_with_cleanup(
+            primary, _close_iterators((sources, members))
+        )
+    cleanup = _close_iterators((sources, members))
+    if cleanup:
+        raise cleanup[0]
+    return result
 
 
 def _finalize_staged_shard(
@@ -719,8 +804,9 @@ def _write_staged_shards(
         partial = directory / f".part-{part:08d}.parquet.partial"
         writer = pq.ParquetWriter(partial, shard_schema, compression="zstd")
 
+    records = _iter_records(sorted_path, record_batch_rows)
     try:
-        for record in _iter_records(sorted_path, record_batch_rows):
+        for record in records:
             bucket = (str(record["split"]), str(record["behavior_label"]))
             if writer is None:
                 open_shard(bucket)
@@ -740,16 +826,16 @@ def _write_staged_shards(
                 flush_buffer()
         close_shard()
     except BaseException as primary:
+        cleanup = _close_iterators((records,))
         if writer is not None:
             try:
                 writer.close()
-            except BaseException as cleanup:
-                attach_cleanup_context(
-                    primary,
-                    f"cleanup failure: {type(cleanup).__name__}: {cleanup}",
-                )
-                raise primary from cleanup
-        raise
+            except BaseException as cleanup_failure:
+                cleanup.append(cleanup_failure)
+        _raise_primary_with_cleanup(primary, cleanup)
+    cleanup = _close_iterators((records,))
+    if cleanup:
+        raise cleanup[0]
     return sorted(entries, key=lambda entry: str(entry["path"]))
 
 
@@ -792,6 +878,11 @@ def _build_manifest(
     merge_fan_in: int,
     merge_read_rows: int,
 ) -> dict[str, Any]:
+    if tracker.merge_input_rows_buffered != 0:
+        raise RuntimeError("merge input rows remained buffered at manifest boundary")
+    merge_input_limit = merge_fan_in * merge_read_rows
+    if tracker.max_merge_input_rows_buffered > merge_input_limit:
+        raise RuntimeError("merge input rows exceeded configured memory bound")
     counts: Counter[str] = Counter()
     class_counts: dict[str, Counter[str]] = defaultdict(Counter)
     source_coverage: Counter[str] = Counter()
@@ -839,6 +930,12 @@ def _build_manifest(
             "merge_fan_in_limit": merge_fan_in,
             "merge_read_rows": merge_read_rows,
             "max_merge_fan_in_observed": tracker.max_merge_fan_in_observed,
+            "max_merge_input_rows_buffered": (
+                tracker.max_merge_input_rows_buffered
+            ),
+            "merge_input_rows_buffered_limit": (
+                merge_input_limit
+            ),
             "temporary_bytes_peak": tracker.temporary_bytes_peak,
         },
     }
@@ -863,18 +960,40 @@ def load_shard_manifest(path: Path | str) -> dict[str, Any]:
     return payload
 
 
+def _is_link_like(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(callable(is_junction) and is_junction())
+
+
 def _safe_entry_path(root: Path, relative: object) -> Path:
     value = str(relative)
     pure = PurePosixPath(value)
     if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
         raise RuntimeError(f"unsafe shard manifest path: {value!r}")
-    path = root.joinpath(*pure.parts)
-    if path.is_symlink() or not path.is_file():
+    if _is_link_like(root) or not root.is_dir():
+        raise RuntimeError(f"unsafe shard output root: {root}")
+    resolved_root = root.resolve(strict=True)
+    current = root
+    for part in pure.parts[:-1]:
+        current = current / part
+        if _is_link_like(current) or not current.is_dir():
+            raise RuntimeError(f"unsafe linked shard parent directory: {current}")
+    path = current / pure.parts[-1]
+    if _is_link_like(path) or not path.is_file():
         raise RuntimeError(f"shard is not a regular file: {value}")
-    return path
+    resolved = path.resolve(strict=True)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise RuntimeError(f"resolved shard path escapes output root: {value}") from exc
+    return resolved
 
 
 def _ensure_safe_directory(root: Path, directory: Path) -> None:
+    if _is_link_like(root) or not root.is_dir():
+        raise RuntimeError(f"unsafe shard output root: {root}")
     try:
         relative = directory.relative_to(root)
     except ValueError as exc:
@@ -883,11 +1002,11 @@ def _ensure_safe_directory(root: Path, directory: Path) -> None:
     for part in relative.parts:
         current = current / part
         if current.exists():
-            if current.is_symlink() or not current.is_dir():
+            if _is_link_like(current) or not current.is_dir():
                 raise RuntimeError(f"unsafe shard destination directory: {current}")
             continue
         current.mkdir()
-        if current.is_symlink() or not current.is_dir():
+        if _is_link_like(current) or not current.is_dir():
             raise RuntimeError(f"unsafe shard destination directory: {current}")
 
 
@@ -962,30 +1081,39 @@ def _verify_entry_and_index(
         run_paths.append(run)
         coverage_buffer.clear()
 
-    for row in _iter_records(path, max_rows_per_run):
-        split = expected_split
-        label = str(row["behavior_label"])
-        if label != expected_label:
-            raise RuntimeError(f"shard partition metadata mismatch: {entry.get('path')}")
-        uid = str(row["row_uid"])
-        key = _ordering_key(row)
-        if ordering_max is not None and tuple(key) < tuple(ordering_max):
-            raise RuntimeError(f"shard ordering mismatch: {entry.get('path')}")
-        ordering_min = key if ordering_min is None else ordering_min
-        ordering_max = key
-        uid_min = uid if uid_min is None else min(uid_min, uid)
-        uid_max = uid if uid_max is None else max(uid_max, uid)
-        source = str(row["source_file"])
-        counts[split] += 1
-        classes[split][label] += 1
-        sources[source] += 1
-        entry_sources[source] += 1
-        label_counts[label] += 1
-        coverage_buffer.append(
-            {"row_uid": uid, "split": split, "behavior_label": label}
-        )
-        if len(coverage_buffer) >= max_rows_per_run:
-            flush()
+    records = _iter_records(path, merge_read_rows, tracker=tracker)
+    try:
+        for row in records:
+            split = expected_split
+            label = str(row["behavior_label"])
+            if label != expected_label:
+                raise RuntimeError(
+                    f"shard partition metadata mismatch: {entry.get('path')}"
+                )
+            uid = str(row["row_uid"])
+            key = _ordering_key(row)
+            if ordering_max is not None and tuple(key) < tuple(ordering_max):
+                raise RuntimeError(f"shard ordering mismatch: {entry.get('path')}")
+            ordering_min = key if ordering_min is None else ordering_min
+            ordering_max = key
+            uid_min = uid if uid_min is None else min(uid_min, uid)
+            uid_max = uid if uid_max is None else max(uid_max, uid)
+            source = str(row["source_file"])
+            counts[split] += 1
+            classes[split][label] += 1
+            sources[source] += 1
+            entry_sources[source] += 1
+            label_counts[label] += 1
+            coverage_buffer.append(
+                {"row_uid": uid, "split": split, "behavior_label": label}
+            )
+            if len(coverage_buffer) >= max_rows_per_run:
+                flush()
+    except BaseException as primary:
+        _raise_primary_with_cleanup(primary, _close_iterators((records,)))
+    cleanup = _close_iterators((records,))
+    if cleanup:
+        raise cleanup[0]
     flush()
     if dict(sorted(entry_sources.items())) != {
         str(name): int(value) for name, value in entry.get("source_coverage", {}).items()
@@ -1011,55 +1139,75 @@ def _verify_uid_coverage(
     manifest: Mapping[str, Any],
     split_plan: SplitPlan | None,
     batch_rows: int,
+    tracker: _ResourceTracker,
 ) -> None:
-    actual_iter = _iter_records(actual_path, batch_rows)
+    actual_iter = _iter_records(actual_path, batch_rows, tracker=tracker)
     expected_iter = (
-        _iter_records(split_plan.membership_path, batch_rows)
+        _iter_records(split_plan.membership_path, batch_rows, tracker=tracker)
         if split_plan is not None
         else None
     )
     previous: str | None = None
     digest = hashlib.sha256()
     rows = 0
-    for actual in actual_iter:
-        uid = str(actual["row_uid"])
-        if uid == previous:
-            raise RuntimeError(f"duplicate shard row_uid or split overlap: {uid}")
-        if previous is not None and uid < previous:
-            raise RuntimeError("coverage UID index is not sorted")
-        digest.update(uid.encode("utf-8"))
-        digest.update(b"\n")
-        previous = uid
-        rows += 1
-        if expected_iter is not None:
-            expected = next(expected_iter, None)
-            if expected is None:
-                raise RuntimeError(f"extra shard coverage UID: {uid}")
-            expected_tuple = (
-                str(expected["row_uid"]),
-                str(expected["split"]),
-                str(expected["behavior_label"]),
-            )
-            actual_tuple = (
-                uid,
-                str(actual["split"]),
-                str(actual["behavior_label"]),
-            )
-            if actual_tuple != expected_tuple:
-                if uid < expected_tuple[0]:
+    try:
+        for actual in actual_iter:
+            uid = str(actual["row_uid"])
+            if uid == previous:
+                raise RuntimeError(f"duplicate shard row_uid or split overlap: {uid}")
+            if previous is not None and uid < previous:
+                raise RuntimeError("coverage UID index is not sorted")
+            digest.update(uid.encode("utf-8"))
+            digest.update(b"\n")
+            previous = uid
+            rows += 1
+            if expected_iter is not None:
+                expected = next(expected_iter, None)
+                if expected is None:
                     raise RuntimeError(f"extra shard coverage UID: {uid}")
-                if uid > expected_tuple[0]:
-                    raise RuntimeError(f"missing shard coverage UID: {expected_tuple[0]}")
-                raise RuntimeError(f"shard split or label mismatch for UID: {uid}")
-    if expected_iter is not None:
-        remaining = next(expected_iter, None)
-        if remaining is not None:
-            raise RuntimeError(f"missing shard coverage UID: {remaining['row_uid']}")
-    coverage = manifest.get("coverage", {})
-    if rows != int(coverage.get("rows", -1)):
-        raise RuntimeError("shard coverage row count mismatch")
-    if digest.hexdigest() != coverage.get("uid_digest"):
-        raise RuntimeError("shard coverage UID digest mismatch")
+                expected_tuple = (
+                    str(expected["row_uid"]),
+                    str(expected["split"]),
+                    str(expected["behavior_label"]),
+                )
+                actual_tuple = (
+                    uid,
+                    str(actual["split"]),
+                    str(actual["behavior_label"]),
+                )
+                if actual_tuple != expected_tuple:
+                    if uid < expected_tuple[0]:
+                        raise RuntimeError(f"extra shard coverage UID: {uid}")
+                    if uid > expected_tuple[0]:
+                        raise RuntimeError(
+                            f"missing shard coverage UID: {expected_tuple[0]}"
+                        )
+                    raise RuntimeError(
+                        f"shard split or label mismatch for UID: {uid}"
+                    )
+        if expected_iter is not None:
+            remaining = next(expected_iter, None)
+            if remaining is not None:
+                raise RuntimeError(
+                    f"missing shard coverage UID: {remaining['row_uid']}"
+                )
+        coverage = manifest.get("coverage", {})
+        if rows != int(coverage.get("rows", -1)):
+            raise RuntimeError("shard coverage row count mismatch")
+        if digest.hexdigest() != coverage.get("uid_digest"):
+            raise RuntimeError("shard coverage UID digest mismatch")
+    except BaseException as primary:
+        _raise_primary_with_cleanup(
+            primary,
+            _close_iterators(
+                (actual_iter,) if expected_iter is None else (actual_iter, expected_iter)
+            ),
+        )
+    cleanup = _close_iterators(
+        (actual_iter,) if expected_iter is None else (actual_iter, expected_iter)
+    )
+    if cleanup:
+        raise cleanup[0]
 
 
 def _cleanup_work(work: Path, primary: BaseException | None = None) -> None:
@@ -1125,9 +1273,26 @@ def verify_shard_manifest(
         "schema_fingerprint"
     ) != stable_fingerprint(descriptor):
         raise RuntimeError("shard manifest schema fingerprint mismatch")
+    contract = manifest.get("shard_contract", {})
+    resources = manifest.get("resource_usage", {})
+    contract_merge_read = int(contract.get("merge_read_rows", -1))
+    contract_merge_fan_in = int(contract.get("merge_fan_in", -1))
+    expected_merge_limit = contract_merge_fan_in * contract_merge_read
+    observed_merge_rows = int(resources.get("max_merge_input_rows_buffered", -1))
+    if (
+        contract_merge_read <= 0
+        or contract_merge_fan_in < 2
+        or int(resources.get("merge_read_rows", -1)) != contract_merge_read
+        or int(resources.get("merge_fan_in_limit", -1)) != contract_merge_fan_in
+        or int(resources.get("merge_input_rows_buffered_limit", -1))
+        != expected_merge_limit
+        or observed_merge_rows < 0
+        or observed_merge_rows > expected_merge_limit
+    ):
+        raise RuntimeError("shard manifest merge resource contract mismatch")
     work = path.parent / f".verify-shards-{uuid.uuid4().hex}.partial"
     work.mkdir(parents=True)
-    tracker = _ResourceTracker(work, max_rows_per_run)
+    tracker = _ResourceTracker(work, max_rows_per_run, merge_read_rows)
     try:
         entries_value = manifest.get("entries")
         if not isinstance(entries_value, list) or not entries_value:
@@ -1226,11 +1391,21 @@ def verify_shard_manifest(
             sorted_coverage,
             manifest=manifest,
             split_plan=split_plan,
-            batch_rows=max_rows_per_run,
+            batch_rows=merge_read_rows,
+            tracker=tracker,
         )
+        if (
+            tracker.merge_input_rows_buffered != 0
+            or tracker.max_merge_input_rows_buffered
+            > merge_fan_in * merge_read_rows
+        ):
+            raise RuntimeError("verification merge input exceeded configured bound")
         dataset_root = path.parent / f"dataset={manifest['dataset']}"
-        if dataset_root.is_symlink() or not dataset_root.is_dir():
+        if _is_link_like(dataset_root) or not dataset_root.is_dir():
             raise RuntimeError("shard dataset directory is missing or unsafe")
+        for candidate in dataset_root.rglob("*"):
+            if _is_link_like(candidate):
+                raise RuntimeError(f"unsafe linked shard artifact: {candidate}")
         for partial in dataset_root.rglob("*.partial"):
             raise RuntimeError(f"unsafe partial shard artifact: {partial}")
         discovered = {
@@ -1292,13 +1467,16 @@ def write_parquet_shards(
         raise ValueError("preprocessing_fingerprint must not be empty")
     if not isinstance(split_plan, SplitPlan):
         raise TypeError("split_plan must be a SplitPlan")
-    _validate_split_plan(split_plan)
+    split_manifest = _validate_split_plan(split_plan)
+    held_out_attacks = frozenset(
+        normalize_token(value) for value in split_manifest["held_out"]["attacks"]
+    )
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     _reject_stale_work(output)
     work = output / f".shards-{uuid.uuid4().hex}.partial"
     work.mkdir()
-    tracker = _ResourceTracker(work, max_rows_per_run)
+    tracker = _ResourceTracker(work, max_rows_per_run, merge_read_rows)
     shard_schema = _shard_schema(features)
     working_schema = _working_schema(features)
     manifest_path = output / "shard_manifest.json"
@@ -1332,6 +1510,7 @@ def write_parquet_shards(
             schema=working_schema,
             max_rows_per_run=max_rows_per_run,
             merge_read_rows=merge_read_rows,
+            held_out_attacks=held_out_attacks,
             tracker=tracker,
         )
         sorted_joined = _collapse_runs(
