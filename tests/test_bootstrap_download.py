@@ -123,6 +123,8 @@ class _RangeServer:
         self.httpd.shutdown()
         self.httpd.server_close()
         self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            raise AssertionError("range test server thread did not stop")
 
 
 class _GuardedResponse:
@@ -473,7 +475,7 @@ class DownloadFileTest(unittest.TestCase):
         self.assertEqual(self.destination.read_bytes(), winner)
         self.assertEqual(self.partial.read_bytes(), PAYLOAD)
 
-    def test_publish_never_links_a_substituted_partial_inode(self) -> None:
+    def test_publication_never_links_the_mutable_partial_inode(self) -> None:
         winner = b"P" * len(PAYLOAD)
         replacement = self.root / "publish-replacement"
         displaced = self.root / "verified-owned-partial"
@@ -491,13 +493,126 @@ class DownloadFileTest(unittest.TestCase):
 
         with _RangeServer() as server:
             with patch.object(download_module.os, "link", side_effect=substitute_before_link):
-                with self.assertRaisesRegex(DownloadError, "changed|identity"):
-                    download_file(server.url, self.destination)
+                result = download_file(server.url, self.destination)
+
+        self.assertFalse(substituted)
+        self.assertEqual(self.destination.read_bytes(), PAYLOAD)
+        self.assertEqual(result.sha256, PAYLOAD_SHA256)
+        self.assertEqual(replacement.read_bytes(), winner)
+        self.assertFalse(displaced.exists())
+        self.assertFalse(self.partial.exists())
+
+    def test_same_partial_inode_mutated_after_verification_cannot_change_final(self) -> None:
+        real_require_identity = download_module._require_path_identity
+        mutated = False
+
+        def mutate_after_verified_check(
+            path: Path,
+            expected: tuple[int, int],
+            *,
+            subject: str,
+        ):
+            nonlocal mutated
+            result = real_require_identity(path, expected, subject=subject)
+            if subject == "Hashed partial" and not mutated:
+                mutated = True
+                with path.open("r+b", buffering=0) as stream:
+                    stream.seek(0)
+                    stream.write(b"X" * len(PAYLOAD))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            return result
+
+        with _RangeServer() as server:
+            with patch.object(
+                download_module,
+                "_require_path_identity",
+                side_effect=mutate_after_verified_check,
+            ):
+                result = download_file(
+                    server.url,
+                    self.destination,
+                    expected_sha256=PAYLOAD_SHA256,
+                )
+
+        self.assertTrue(mutated)
+        self.assertEqual(self.destination.read_bytes(), PAYLOAD)
+        self.assertEqual(result.byte_size, len(PAYLOAD))
+        self.assertEqual(result.sha256, hashlib.sha256(self.destination.read_bytes()).hexdigest())
+
+    def test_same_partial_inode_mutated_during_snapshot_is_rejected(self) -> None:
+        real_read = download_module.os.read
+        partial_identity: tuple[int, int] | None = None
+        mutated = False
+
+        def mutate_after_first_snapshot_read(descriptor: int, amount: int) -> bytes:
+            nonlocal mutated
+            payload = real_read(descriptor, amount)
+            descriptor_stat = os.fstat(descriptor)
+            descriptor_identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            if payload and descriptor_identity == partial_identity and not mutated:
+                mutated = True
+                with self.partial.open("r+b", buffering=0) as stream:
+                    stream.seek(0)
+                    stream.write(b"Y" * len(PAYLOAD))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            return payload
+
+        self.partial.write_bytes(PAYLOAD)
+        partial_stat = self.partial.stat()
+        partial_identity = (partial_stat.st_dev, partial_stat.st_ino)
+        with _RangeServer(mode="range-416") as server:
+            with patch.object(
+                download_module.os,
+                "read",
+                side_effect=mutate_after_first_snapshot_read,
+            ):
+                with self.assertRaisesRegex(DownloadError, "changed|snapshot|verified"):
+                    download_file(
+                        server.url,
+                        self.destination,
+                        expected_sha256=PAYLOAD_SHA256,
+                        chunk_size=64,
+                    )
+
+        self.assertTrue(mutated)
+        self.assertTrue(self.partial.exists())
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list(self.root.glob(".*.verified*")), [])
+
+    def test_substituted_private_download_pin_is_never_reported_as_published(self) -> None:
+        real_link = download_module.os.link
+        displaced = self.root / "verified-pin-before-swap"
+        attacker = b"attacker-controlled-final"
+        substituted = False
+
+        def substitute_private_pin(source: object, target: object) -> None:
+            nonlocal substituted
+            source_path = Path(source)
+            target_path = Path(target)
+            if (
+                not substituted
+                and source_path.name.endswith(".verified.pin")
+                and target_path == self.destination
+            ):
+                substituted = True
+                source_path.replace(displaced)
+                source_path.write_bytes(attacker)
+            real_link(source, target)
+
+        with _RangeServer() as server:
+            with patch.object(download_module.os, "link", side_effect=substitute_private_pin):
+                with self.assertRaisesRegex(DownloadError, "identity|publish|verified"):
+                    download_file(
+                        server.url,
+                        self.destination,
+                        expected_sha256=PAYLOAD_SHA256,
+                    )
 
         self.assertTrue(substituted)
-        self.assertEqual(self.partial.read_bytes(), winner)
-        self.assertEqual(displaced.read_bytes(), PAYLOAD)
         self.assertFalse(self.destination.exists())
+        self.assertEqual(self.partial.read_bytes(), PAYLOAD)
 
     def test_valid_416_complete_partial_publishes_and_incomplete_retries_once(self) -> None:
         self.partial.write_bytes(PAYLOAD)
@@ -735,12 +850,20 @@ class SourceManifestTest(unittest.TestCase):
             ],
         )
         self.assertEqual(manifest.total_bytes, len(b"a-datab-dataz-data"))
+        self.assertEqual(
+            [record.mtime_ns for record in manifest.files],
+            [
+                (self.root / "nested" / "a.csv").stat().st_mtime_ns,
+                (self.root / "nested" / "b.csv").stat().st_mtime_ns,
+                (self.root / "z.csv").stat().st_mtime_ns,
+            ],
+        )
 
     def test_source_changed_during_hash_is_rejected(self) -> None:
         target = self.root / "nested" / "a.csv"
         real_hash_file = manifest_module._hash_file
 
-        def mutate_after_hash(path: Path) -> str:
+        def mutate_after_hash(path: Path) -> tuple[str, tuple[int, ...]]:
             digest = real_hash_file(path)
             if path == target:
                 path.write_bytes(b"changed after hashing")
@@ -748,6 +871,66 @@ class SourceManifestTest(unittest.TestCase):
 
         with patch.object(manifest_module, "_hash_file", side_effect=mutate_after_hash):
             with self.assertRaisesRegex(SourceManifestError, "changed.*hash"):
+                self.official_manifest()
+
+    def test_late_added_file_invalidates_complete_tree_snapshot(self) -> None:
+        real_content_digest = manifest_module._manifest_content_digest
+        mutated = False
+
+        def add_file_before_final_validation(value: dict[str, object]) -> str:
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                (self.root / "nested" / "late.csv").write_bytes(b"late")
+            return real_content_digest(value)
+
+        with patch.object(
+            manifest_module,
+            "_manifest_content_digest",
+            side_effect=add_file_before_final_validation,
+        ):
+            with self.assertRaisesRegex(SourceManifestError, "changed|snapshot|tree|directory"):
+                self.official_manifest()
+
+    def test_late_removed_file_invalidates_complete_tree_snapshot(self) -> None:
+        real_content_digest = manifest_module._manifest_content_digest
+        mutated = False
+
+        def remove_file_before_final_validation(value: dict[str, object]) -> str:
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                (self.root / "nested" / "a.csv").unlink()
+            return real_content_digest(value)
+
+        with patch.object(
+            manifest_module,
+            "_manifest_content_digest",
+            side_effect=remove_file_before_final_validation,
+        ):
+            with self.assertRaisesRegex(SourceManifestError, "changed|snapshot|tree|file"):
+                self.official_manifest()
+
+    def test_late_replaced_file_invalidates_complete_tree_snapshot(self) -> None:
+        real_content_digest = manifest_module._manifest_content_digest
+        target = self.root / "nested" / "a.csv"
+        replacement = self.root / "replacement.csv"
+        replacement.write_bytes(b"a-data")
+        mutated = False
+
+        def replace_file_before_final_validation(value: dict[str, object]) -> str:
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                os.replace(replacement, target)
+            return real_content_digest(value)
+
+        with patch.object(
+            manifest_module,
+            "_manifest_content_digest",
+            side_effect=replace_file_before_final_validation,
+        ):
+            with self.assertRaisesRegex(SourceManifestError, "changed|snapshot|tree|identity"):
                 self.official_manifest()
 
     def test_file_and_directory_symlinks_are_rejected(self) -> None:
@@ -860,6 +1043,52 @@ class SourceManifestTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(json.dumps(first.to_dict())), first.to_dict())
 
+    def test_mtime_is_serialized_validated_and_changes_content_digest(self) -> None:
+        first = self.official_manifest()
+        target = self.root / "z.csv"
+        original = target.stat().st_mtime_ns
+        requested = original + 2_000_000_000
+        os.utime(target, ns=(requested, requested))
+        second = self.official_manifest()
+
+        first_record = next(record for record in first.files if record.relative_path == "z.csv")
+        second_record = next(record for record in second.files if record.relative_path == "z.csv")
+        self.assertEqual(getattr(first_record, "mtime_ns", None), original)
+        self.assertEqual(
+            getattr(second_record, "mtime_ns", None),
+            target.stat().st_mtime_ns,
+        )
+        self.assertNotEqual(
+            getattr(first_record, "mtime_ns", None),
+            getattr(second_record, "mtime_ns", None),
+        )
+        self.assertNotEqual(first.content_sha256, second.content_sha256)
+        self.assertIn("mtime_ns", second_record.to_dict())
+
+    def test_legacy_invalid_mtime_and_boolean_versions_are_rejected(self) -> None:
+        manifest = self.official_manifest()
+        serialized = manifest.to_dict()
+        self.assertEqual(serialized["version"], 2)
+
+        for invalid_version in (True, False, 1, 2.0, "2"):
+            with self.subTest(version=invalid_version):
+                invalid = dict(serialized)
+                invalid["version"] = invalid_version
+                with self.assertRaisesRegex(SourceManifestError, "version"):
+                    manifest_module.SourceManifest.from_dict(invalid)
+
+        legacy = json.loads(json.dumps(serialized))
+        legacy["files"][0].pop("mtime_ns")
+        with self.assertRaisesRegex(SourceManifestError, "file record|fields"):
+            manifest_module.SourceManifest.from_dict(legacy)
+
+        for invalid_mtime in (True, -1, 1.5, "1"):
+            with self.subTest(mtime_ns=invalid_mtime):
+                invalid = json.loads(json.dumps(serialized))
+                invalid["files"][0]["mtime_ns"] = invalid_mtime
+                with self.assertRaisesRegex(SourceManifestError, "mtime"):
+                    manifest_module.SourceManifest.from_dict(invalid)
+
     def test_serialization_rejects_a_directly_constructed_credential_url(self) -> None:
         unsafe = replace(
             self.official_manifest(),
@@ -887,10 +1116,13 @@ class SourceManifestTest(unittest.TestCase):
         manifest = self.official_manifest()
         path = self.root.parent / "source-manifest.json"
         winner = b'{"winner":true}\n'
+        real_link = manifest_module.os.link
 
         def concurrent_publish(source: object, target: object) -> None:
-            Path(target).write_bytes(winner)
-            raise FileExistsError(str(target))
+            if Path(target) == path:
+                Path(target).write_bytes(winner)
+                raise FileExistsError(str(target))
+            real_link(source, target)
 
         with patch.object(manifest_module.os, "link", side_effect=concurrent_publish):
             with self.assertRaisesRegex(SourceManifestError, "different|overwrite"):
@@ -898,6 +1130,165 @@ class SourceManifestTest(unittest.TestCase):
 
         self.assertEqual(path.read_bytes(), winner)
         self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+
+    def test_manifest_temp_substitution_cannot_publish_unverified_bytes(self) -> None:
+        manifest = self.official_manifest()
+        path = self.root.parent / "source-manifest.json"
+        displaced = self.root.parent / "owned-manifest-temp"
+        attacker = b'{"attacker":true}\n'
+        real_link = manifest_module.os.link
+        substituted = False
+
+        def substitute_temporary(source: object, target: object) -> None:
+            nonlocal substituted
+            source_path = Path(source)
+            if not substituted and source_path.name.endswith(".tmp"):
+                substituted = True
+                source_path.replace(displaced)
+                source_path.write_bytes(attacker)
+            real_link(source, target)
+
+        with patch.object(manifest_module.os, "link", side_effect=substitute_temporary):
+            with self.assertRaisesRegex(SourceManifestError, "changed|identity|temporary|pin"):
+                write_source_manifest(path, manifest)
+
+        self.assertTrue(substituted)
+        self.assertFalse(path.exists())
+        if displaced.exists():
+            self.assertEqual(displaced.read_bytes(), manifest_json_bytes(manifest))
+        self.assertEqual(list(path.parent.glob(f".{path.name}.*.pin")), [])
+
+    def test_manifest_private_pin_substitution_cannot_leave_a_final(self) -> None:
+        manifest = self.official_manifest()
+        path = self.root.parent / "source-manifest.json"
+        displaced = self.root.parent / "owned-manifest-pin"
+        attacker = b'{"attacker":true}\n'
+        real_link = manifest_module.os.link
+        substituted = False
+
+        def substitute_pin(source: object, target: object) -> None:
+            nonlocal substituted
+            source_path = Path(source)
+            if (
+                not substituted
+                and source_path.name.endswith(".pin")
+                and Path(target) == path
+            ):
+                substituted = True
+                source_path.replace(displaced)
+                source_path.write_bytes(attacker)
+            real_link(source, target)
+
+        with patch.object(manifest_module.os, "link", side_effect=substitute_pin):
+            with self.assertRaisesRegex(SourceManifestError, "identity|publish|verified|pin"):
+                write_source_manifest(path, manifest)
+
+        self.assertTrue(substituted)
+        self.assertFalse(path.exists())
+        self.assertEqual(displaced.read_bytes(), manifest_json_bytes(manifest))
+
+    def test_existing_manifest_replacement_during_pinned_read_is_rejected(self) -> None:
+        manifest = self.official_manifest()
+        path = self.root.parent / "source-manifest.json"
+        displaced = self.root.parent / "original-source-manifest.json"
+        payload = manifest_json_bytes(manifest)
+        self.assertTrue(write_source_manifest(path, manifest))
+        real_open = manifest_module.os.open
+        substituted = False
+
+        def substitute_after_open(
+            opened_path: object,
+            flags: int,
+            mode: int = 0o777,
+        ) -> int:
+            nonlocal substituted
+            descriptor = real_open(opened_path, flags, mode)
+            if Path(opened_path) == path and not substituted:
+                substituted = True
+                try:
+                    path.replace(displaced)
+                    path.write_bytes(payload)
+                except OSError:
+                    os.close(descriptor)
+                    raise
+            return descriptor
+
+        with patch.object(manifest_module.os, "open", side_effect=substitute_after_open):
+            with self.assertRaisesRegex(
+                SourceManifestError,
+                "changed|identity|replacement|safely open",
+            ):
+                write_source_manifest(path, manifest)
+
+        self.assertTrue(substituted)
+        if displaced.exists():
+            self.assertEqual(displaced.read_bytes(), payload)
+        self.assertEqual(path.read_bytes(), payload)
+
+    def test_manifest_base_exceptions_close_and_clean_private_files(self) -> None:
+        manifest = self.official_manifest()
+        real_create = manifest_module._create_temporary
+        real_fsync = manifest_module.os.fsync
+
+        for phase, signal in (
+            ("write", KeyboardInterrupt("manifest-write-interrupt")),
+            ("fsync", SystemExit("manifest-fsync-exit")),
+        ):
+            with self.subTest(phase=phase):
+                path = self.root.parent / f"{phase}-source-manifest.json"
+                descriptors: list[int] = []
+
+                def track_create(target: Path) -> tuple[Path, int]:
+                    temporary, descriptor = real_create(target)
+                    descriptors.append(descriptor)
+                    return temporary, descriptor
+
+                def interrupt_fsync(descriptor: int) -> None:
+                    if phase == "fsync" and descriptor in descriptors:
+                        raise signal
+                    real_fsync(descriptor)
+
+                write_effect = signal if phase == "write" else None
+                with (
+                    patch.object(
+                        manifest_module,
+                        "_create_temporary",
+                        side_effect=track_create,
+                    ),
+                    patch.object(
+                        manifest_module,
+                        "_write_all",
+                        side_effect=write_effect,
+                        wraps=None if write_effect is not None else manifest_module._write_all,
+                    ),
+                    patch.object(
+                        manifest_module.os,
+                        "fsync",
+                        side_effect=interrupt_fsync,
+                    ),
+                ):
+                    with self.assertRaises(type(signal)) as caught:
+                        write_source_manifest(path, manifest)
+
+                self.assertIs(caught.exception, signal)
+                self.assertEqual(len(descriptors), 1)
+                try:
+                    os.fstat(descriptors[0])
+                except OSError:
+                    descriptor_closed = True
+                else:
+                    descriptor_closed = False
+                    os.close(descriptors[0])
+                self.assertTrue(descriptor_closed)
+                self.assertFalse(path.exists())
+                self.assertEqual(
+                    list(path.parent.glob(f".{path.name}.*.tmp")),
+                    [],
+                )
+                self.assertEqual(
+                    list(path.parent.glob(f".{path.name}.*.pin")),
+                    [],
+                )
 
 
 if __name__ == "__main__":

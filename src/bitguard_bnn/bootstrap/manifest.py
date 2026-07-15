@@ -16,13 +16,14 @@ from .registry import load_registry
 from .types import DatasetSpec
 
 
-MANIFEST_FORMAT_VERSION = 1
+MANIFEST_FORMAT_VERSION = 2
 ALLOWED_ACQUISITION_METHODS = frozenset(
     {"official-download", "manual-local-source"}
 )
 _DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
 _TEMP_CREATE_ATTEMPTS = 16
 _HASH_CHUNK_SIZE = 1024 * 1024
+_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 
 
 class SourceManifestError(RuntimeError):
@@ -56,18 +57,20 @@ def _require_sha256(value: object, field: str) -> str:
 class SourceFileRecord:
     relative_path: str
     byte_size: int
+    mtime_ns: int
     sha256: str
 
     def to_dict(self) -> dict[str, object]:
         return {
             "relative_path": self.relative_path,
             "byte_size": self.byte_size,
+            "mtime_ns": self.mtime_ns,
             "sha256": self.sha256,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> SourceFileRecord:
-        expected = {"relative_path", "byte_size", "sha256"}
+        expected = {"relative_path", "byte_size", "mtime_ns", "sha256"}
         if set(value) != expected:
             raise SourceManifestError("A manifest file record has invalid fields.")
         relative_path = _require_string(value["relative_path"], "relative_path")
@@ -83,9 +86,13 @@ class SourceFileRecord:
         byte_size = value["byte_size"]
         if not isinstance(byte_size, int) or isinstance(byte_size, bool) or byte_size < 0:
             raise SourceManifestError("A manifest file record has an invalid byte size.")
+        mtime_ns = value["mtime_ns"]
+        if not isinstance(mtime_ns, int) or isinstance(mtime_ns, bool) or mtime_ns < 0:
+            raise SourceManifestError("A manifest file record has an invalid mtime_ns.")
         return cls(
             relative_path=relative_path,
             byte_size=byte_size,
+            mtime_ns=mtime_ns,
             sha256=_require_sha256(value["sha256"], "file.sha256"),
         )
 
@@ -131,7 +138,13 @@ class SourceManifest:
             "total_bytes",
             "content_sha256",
         }
-        if set(value) != expected or value["version"] != MANIFEST_FORMAT_VERSION:
+        version = value.get("version")
+        if (
+            set(value) != expected
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != MANIFEST_FORMAT_VERSION
+        ):
             raise SourceManifestError("Source manifest has invalid fields or version.")
         raw_files = value["files"]
         if not isinstance(raw_files, list) or not all(
@@ -228,40 +241,50 @@ def _validate_acquisition_metadata(
     raise SourceManifestError(f"Dataset {spec.name!r} is not supported by the registry.")
 
 
-def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
-    return (
-        value.st_dev,
-        value.st_ino,
-        value.st_size,
-        value.st_mtime_ns,
-    )
-
-
-def _directory_identity(value: os.stat_result) -> tuple[int, int, int]:
+def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (
         value.st_dev,
         value.st_ino,
         stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns if os.name != "nt" else 0,
+    )
+
+
+def _inode_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode))
+
+
+def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns if os.name != "nt" else 0,
     )
 
 
 @dataclass(frozen=True, slots=True)
 class _DirectoryPin:
     path: Path
-    identity: tuple[int, int, int]
+    identity: tuple[int, int, int, int, int, int]
 
 
 @dataclass(frozen=True, slots=True)
 class _EnumeratedFile:
     relative_path: str
     path: Path
-    identity: tuple[int, int, int, int]
+    identity: tuple[int, int, int, int, int, int]
     ancestors: tuple[_DirectoryPin, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _SourceEnumeration:
     files: tuple[_EnumeratedFile, ...]
+    directories: tuple[_DirectoryPin, ...]
     root: _DirectoryPin
 
 
@@ -310,7 +333,7 @@ def _validate_enumerated_file(record: _EnumeratedFile, *, phase: str) -> None:
 
 def _hash_file(
     path: Path,
-) -> tuple[str, tuple[int, int, int, int]]:
+) -> tuple[str, tuple[int, int, int, int, int, int]]:
     digest = hashlib.sha256()
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -336,12 +359,13 @@ def _hash_file(
 
 def _enumerate_files(root: Path) -> _SourceEnumeration:
     collected: list[_EnumeratedFile] = []
+    directories: list[_DirectoryPin] = []
 
     def visit(
         directory: Path,
         parts: tuple[str, ...],
         parents: tuple[_DirectoryPin, ...],
-        expected_identity: tuple[int, int, int] | None = None,
+        expected_identity: tuple[int, int, int, int, int, int] | None = None,
     ) -> _DirectoryPin:
         directory_stat = _lstat_directory(directory, subject="source ancestor")
         directory_identity = _directory_identity(directory_stat)
@@ -350,6 +374,7 @@ def _enumerate_files(root: Path) -> _SourceEnumeration:
                 f"Source ancestor directory {directory} changed before enumeration."
             )
         current_pin = _DirectoryPin(directory, directory_identity)
+        directories.append(current_pin)
         ancestors = (*parents, current_pin)
         try:
             with os.scandir(directory) as iterator:
@@ -402,7 +427,44 @@ def _enumerate_files(root: Path) -> _SourceEnumeration:
         raise SourceManifestError("Source tree contains duplicate normalized relative paths.")
     if normalized != tuple(sorted(normalized)):
         collected.sort(key=lambda record: record.relative_path)
-    return _SourceEnumeration(tuple(collected), root_pin)
+    return _SourceEnumeration(tuple(collected), tuple(directories), root_pin)
+
+
+def _validate_source_enumeration(enumeration: _SourceEnumeration) -> None:
+    for directory in enumeration.directories:
+        current = _lstat_directory(directory.path, subject="source snapshot")
+        if _directory_identity(current) != directory.identity:
+            raise SourceManifestError(
+                f"Source directory {directory.path} changed after tree snapshot."
+            )
+    for source_file in enumeration.files:
+        _validate_ancestor_chain(source_file.ancestors, source_file.relative_path)
+        _validate_enumerated_file(source_file, phase="after tree snapshot")
+
+
+def _compare_source_enumerations(
+    expected: _SourceEnumeration,
+    observed: _SourceEnumeration,
+) -> None:
+    expected_files = tuple(
+        (record.relative_path, record.identity) for record in expected.files
+    )
+    observed_files = tuple(
+        (record.relative_path, record.identity) for record in observed.files
+    )
+    expected_directories = tuple(
+        (record.path, record.identity) for record in expected.directories
+    )
+    observed_directories = tuple(
+        (record.path, record.identity) for record in observed.directories
+    )
+    if (
+        observed_files != expected_files
+        or observed_directories != expected_directories
+    ):
+        raise SourceManifestError(
+            "Source tree changed between its initial and final ordered snapshots."
+        )
 
 
 def _manifest_content_digest(value: Mapping[str, object]) -> str:
@@ -455,11 +517,14 @@ def build_source_manifest(
         records.append(
             SourceFileRecord(
                 source_file.relative_path,
-                source_file.identity[2],
+                source_file.identity[3],
+                source_file.identity[4],
                 digest,
             )
         )
-    _validate_ancestor_chain((enumeration.root,), root.as_posix())
+    observed = _enumerate_files(root)
+    _compare_source_enumerations(enumeration, observed)
+    _validate_source_enumeration(enumeration)
     total_bytes = sum(record.byte_size for record in records)
     provisional = SourceManifest(
         dataset_name=spec.name,
@@ -473,6 +538,9 @@ def build_source_manifest(
         content_sha256="0" * 64,
     )
     digest = _manifest_content_digest(provisional.to_dict())
+    final_observed = _enumerate_files(root)
+    _compare_source_enumerations(enumeration, final_observed)
+    _validate_source_enumeration(enumeration)
     return SourceManifest(
         dataset_name=provisional.dataset_name,
         project_url=provisional.project_url,
@@ -528,18 +596,107 @@ def _fsync_parent_directory(path: Path) -> None:
 
 
 def _existing_manifest_bytes(path: Path) -> bytes | None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
-        value = path.lstat()
+        descriptor = os.open(path, flags)
     except FileNotFoundError:
         return None
     except OSError as error:
-        raise SourceManifestError(f"Cannot inspect source manifest {path}: {error}.") from error
-    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
-        raise SourceManifestError(f"Source manifest {path} must be a regular non-symlink file.")
+        raise SourceManifestError(
+            f"Cannot safely open source manifest {path}: {error}."
+        ) from error
+    base_exception_active = False
     try:
-        return path.read_bytes()
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SourceManifestError(
+                f"Source manifest {path} must be a regular non-symlink file."
+            )
+        if before.st_size < 0 or before.st_size > _MAX_MANIFEST_BYTES:
+            raise SourceManifestError(
+                f"Source manifest {path} exceeds the bounded read limit."
+            )
+        remaining = before.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(_HASH_CHUNK_SIZE, remaining))
+            if not chunk:
+                raise SourceManifestError(
+                    f"Source manifest {path} ended before its recorded size."
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SourceManifestError(
+                f"Source manifest {path} grew during its bounded read."
+            )
+        after = os.fstat(descriptor)
+        try:
+            current = path.lstat()
+        except OSError as error:
+            raise SourceManifestError(
+                f"Source manifest {path} changed during its pinned read: {error}."
+            ) from error
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+            raise SourceManifestError(
+                f"Source manifest {path} became a symlink or non-regular file."
+            )
+        if _file_identity(after) != _file_identity(before) or _file_identity(
+            current
+        ) != _file_identity(before):
+            raise SourceManifestError(
+                f"Source manifest {path} changed identity during its pinned read."
+            )
+        return b"".join(chunks)
+    except BaseException:
+        base_exception_active = True
+        raise
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError as close_error:
+            if not base_exception_active:
+                raise SourceManifestError(
+                    f"Cannot close source manifest {path}: {close_error}."
+                ) from close_error
+
+
+def _lstat_manifest_file(path: Path, *, subject: str) -> os.stat_result:
+    try:
+        value = path.lstat()
     except OSError as error:
-        raise SourceManifestError(f"Cannot read source manifest {path}: {error}.") from error
+        raise SourceManifestError(f"Cannot inspect {subject} {path}: {error}.") from error
+    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+        raise SourceManifestError(f"{subject.capitalize()} {path} is not a regular file.")
+    return value
+
+
+def _unlink_owned_manifest_path(
+    path: Path,
+    expected_identity: tuple[int, int, int],
+) -> None:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise SourceManifestError(
+            f"Cannot inspect private manifest path {path}: {error}."
+        ) from error
+    if _inode_identity(current) != expected_identity:
+        raise SourceManifestError(
+            f"Private manifest path {path} changed identity and was preserved."
+        )
+    try:
+        path.unlink()
+    except OSError as error:
+        raise SourceManifestError(
+            f"Cannot remove private manifest path {path}: {error}."
+        ) from error
 
 
 def _create_temporary(path: Path) -> tuple[Path, int]:
@@ -563,6 +720,46 @@ def _create_temporary(path: Path) -> tuple[Path, int]:
     raise SourceManifestError("Cannot reserve a unique source manifest temporary file.")
 
 
+def _pin_manifest_temporary(
+    temporary: Path,
+    descriptor: int,
+    expected_identity: tuple[int, int, int],
+) -> Path:
+    for _attempt in range(_TEMP_CREATE_ATTEMPTS):
+        pin = temporary.with_name(f"{temporary.name}.{uuid.uuid4().hex}.pin")
+        try:
+            os.link(temporary, pin)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise SourceManifestError(
+                f"Cannot create private manifest pin for {temporary}: {error}."
+            ) from error
+        pin_stat = _lstat_manifest_file(pin, subject="private manifest pin")
+        pin_identity = _inode_identity(pin_stat)
+        try:
+            temporary_stat = _lstat_manifest_file(
+                temporary,
+                subject="manifest temporary",
+            )
+            temporary_identity = _inode_identity(temporary_stat)
+            descriptor_identity = _inode_identity(os.fstat(descriptor))
+        except (OSError, SourceManifestError):
+            _unlink_owned_manifest_path(pin, pin_identity)
+            raise
+        if (
+            pin_identity != expected_identity
+            or temporary_identity != expected_identity
+            or descriptor_identity != expected_identity
+        ):
+            _unlink_owned_manifest_path(pin, pin_identity)
+            raise SourceManifestError(
+                f"Manifest temporary {temporary} changed identity while creating its pin."
+            )
+        return pin
+    raise SourceManifestError("Cannot reserve a unique private manifest pin.")
+
+
 def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
     """Publish stable JSON without ever replacing an existing manifest.
 
@@ -570,6 +767,8 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
     """
 
     payload = manifest_json_bytes(manifest)
+    if len(payload) > _MAX_MANIFEST_BYTES:
+        raise SourceManifestError("Serialized source manifest exceeds the write limit.")
     raw = Path(path).expanduser()
     try:
         parent = raw.parent.resolve(strict=True)
@@ -587,34 +786,75 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
         )
 
     temporary, descriptor = _create_temporary(target)
-    failure: OSError | None = None
+    temporary_identity: tuple[int, int, int] | None = None
+    pin: Path | None = None
+    prepared = False
+    base_exception_active = False
     try:
-        _write_all(descriptor, payload)
-        os.fsync(descriptor)
-    except OSError as error:
-        failure = error
-    try:
-        os.close(descriptor)
-    except OSError as error:
-        failure = error if failure is None else OSError(f"{failure}; close also failed: {error}")
-    if failure is not None:
         try:
-            temporary.unlink()
-        except OSError:
-            pass
-        raise SourceManifestError(
-            f"Cannot durably write source manifest temporary: {failure}."
-        ) from failure
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise SourceManifestError(
+                    f"Manifest temporary {temporary} is not a regular file."
+                )
+            temporary_identity = _inode_identity(opened)
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            written = os.fstat(descriptor)
+            if (
+                _inode_identity(written) != temporary_identity
+                or written.st_size != len(payload)
+            ):
+                raise SourceManifestError(
+                    f"Manifest temporary {temporary} changed while it was written."
+                )
+            pin = _pin_manifest_temporary(
+                temporary,
+                descriptor,
+                temporary_identity,
+            )
+        except OSError as error:
+            raise SourceManifestError(
+                f"Cannot durably prepare source manifest temporary: {error}."
+            ) from error
+        except BaseException:
+            base_exception_active = True
+            raise
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                if not base_exception_active:
+                    raise SourceManifestError(
+                        f"Cannot close source manifest temporary: {close_error}."
+                    ) from close_error
+
+        assert temporary_identity is not None
+        assert pin is not None
+        _unlink_owned_manifest_path(temporary, temporary_identity)
+        prepared = True
+    finally:
+        if not prepared:
+            for candidate in (pin, temporary):
+                if candidate is None or temporary_identity is None:
+                    continue
+                try:
+                    _unlink_owned_manifest_path(candidate, temporary_identity)
+                except Exception:
+                    pass
+
+    assert pin is not None
+    assert temporary_identity is not None
 
     try:
-        os.link(temporary, target)
+        os.link(pin, target)
     except FileExistsError as error:
         try:
             existing = _existing_manifest_bytes(target)
         finally:
             try:
-                temporary.unlink()
-            except OSError:
+                _unlink_owned_manifest_path(pin, temporary_identity)
+            except SourceManifestError:
                 pass
         if existing == payload:
             return False
@@ -624,18 +864,40 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
         ) from error
     except OSError as error:
         try:
-            temporary.unlink()
-        except OSError:
+            _unlink_owned_manifest_path(pin, temporary_identity)
+        except SourceManifestError:
             pass
         raise SourceManifestError(
             f"Cannot publish source manifest {target} without overwrite: {error}."
         ) from error
 
     try:
+        final_stat = _lstat_manifest_file(target, subject="published source manifest")
+    except SourceManifestError:
+        try:
+            _unlink_owned_manifest_path(pin, temporary_identity)
+        except SourceManifestError:
+            pass
+        raise
+    final_identity = _inode_identity(final_stat)
+    if final_identity != temporary_identity:
+        try:
+            _unlink_owned_manifest_path(target, final_identity)
+        except SourceManifestError:
+            pass
+        try:
+            _unlink_owned_manifest_path(pin, temporary_identity)
+        except SourceManifestError:
+            pass
+        raise SourceManifestError(
+            f"Published source manifest {target} does not have the verified pin identity."
+        )
+
+    try:
         _fsync_parent_directory(target)
-        temporary.unlink()
+        _unlink_owned_manifest_path(pin, temporary_identity)
         _fsync_parent_directory(target)
-    except OSError as error:
+    except (OSError, SourceManifestError) as error:
         raise SourceManifestError(
             f"Source manifest {target} was published, but durable cleanup failed: {error}."
         ) from error

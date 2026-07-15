@@ -59,6 +59,15 @@ class _StreamResult:
     identity: tuple[int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedSnapshot:
+    pin: Path
+    identity: tuple[int, int]
+    source_identity: tuple[int, int]
+    byte_size: int
+    sha256: str
+
+
 def sanitize_url(value: str) -> str:
     """Return a URL suitable for durable results and error messages."""
 
@@ -121,6 +130,17 @@ def _lstat_regular(path: Path, *, allow_absent: bool) -> os.stat_result | None:
 
 def _file_identity(value: os.stat_result) -> tuple[int, int]:
     return (value.st_dev, value.st_ino)
+
+
+def _content_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def _require_path_identity(
@@ -347,57 +367,228 @@ def _unlink_private_candidate(candidate: Path, expected: tuple[int, int]) -> Non
         raise DownloadError(f"Cannot remove private publish link {candidate}: {error}.") from error
 
 
-def _pin_partial_for_publication(
-    partial: Path, expected: tuple[int, int]
-) -> Path:
+def _create_private_snapshot(partial: Path) -> tuple[Path, int]:
+    flags = (
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_WRONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     for _attempt in range(16):
-        candidate = partial.with_name(f".{partial.name}.{uuid.uuid4().hex}.publish")
+        candidate = partial.with_name(
+            f".{partial.name}.{uuid.uuid4().hex}.verified"
+        )
         try:
-            os.link(partial, candidate)
+            return candidate, os.open(candidate, flags, 0o600)
         except FileExistsError:
             continue
         except OSError as error:
             raise DownloadError(
-                f"Cannot pin verified partial {partial} for publication: {error}."
+                f"Cannot create a private verified snapshot for {partial}: {error}."
             ) from error
-        candidate_stat = _lstat_regular(candidate, allow_absent=False)
-        assert candidate_stat is not None
-        candidate_identity = _file_identity(candidate_stat)
-        if candidate_identity != expected:
-            _unlink_private_candidate(candidate, candidate_identity)
+    raise DownloadError(f"Cannot reserve a private verified snapshot for {partial}.")
+
+
+def _write_descriptor(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("verified snapshot write made no progress")
+        offset += written
+
+
+def _pin_private_snapshot(
+    private: Path,
+    descriptor: int,
+    expected_identity: tuple[int, int],
+) -> Path:
+    for _attempt in range(16):
+        pin = private.with_name(f".{private.name}.{uuid.uuid4().hex}.verified.pin")
+        try:
+            os.link(private, pin)
+        except FileExistsError:
+            continue
+        except OSError as error:
             raise DownloadError(
-                f"Verified partial {partial} changed identity before publication; "
-                "the replacement was not published."
+                f"Cannot pin private verified snapshot {private}: {error}."
+            ) from error
+        pin_stat = _lstat_regular(pin, allow_absent=False)
+        assert pin_stat is not None
+        pin_identity = _file_identity(pin_stat)
+        descriptor_identity = _file_identity(os.fstat(descriptor))
+        try:
+            private_stat = _lstat_regular(private, allow_absent=False)
+            assert private_stat is not None
+            private_identity = _file_identity(private_stat)
+        except DownloadError:
+            _unlink_private_candidate(pin, pin_identity)
+            raise
+        if (
+            pin_identity != expected_identity
+            or descriptor_identity != expected_identity
+            or private_identity != expected_identity
+        ):
+            _unlink_private_candidate(pin, pin_identity)
+            raise DownloadError(
+                f"Private verified snapshot {private} changed identity while it was pinned."
             )
-        return candidate
-    raise DownloadError(f"Cannot reserve a private publish link for {partial}.")
+        return pin
+    raise DownloadError(f"Cannot reserve a private publish pin for {private}.")
 
 
-def _publish_partial(
-    partial: Path, destination: Path, expected_identity: tuple[int, int]
-) -> None:
-    _require_path_identity(partial, expected_identity, subject="Verified partial")
-    candidate = _pin_partial_for_publication(partial, expected_identity)
+def _snapshot_partial(
+    partial: Path,
+    expected_identity: tuple[int, int],
+    chunk_size: int,
+) -> _VerifiedSnapshot:
+    _require_path_identity(partial, expected_identity, subject="Completed partial")
+    source_descriptor: int | None = None
+    private_descriptor: int | None = None
+    private: Path | None = None
+    private_identity: tuple[int, int] | None = None
+    pin: Path | None = None
+    success = False
+    base_exception_active = False
+    size = 0
+    digest = hashlib.sha256()
     try:
-        os.link(candidate, destination)
+        try:
+            source_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            source_descriptor = os.open(partial, source_flags)
+            source_before = os.fstat(source_descriptor)
+            if not stat.S_ISREG(source_before.st_mode):
+                raise DownloadError(f"Completed partial {partial} is not a regular file.")
+            if _file_identity(source_before) != expected_identity:
+                raise DownloadError(
+                    f"Completed partial {partial} changed before snapshot verification."
+                )
+            source_version = _content_identity(source_before)
+
+            private, private_descriptor = _create_private_snapshot(partial)
+            private_before = os.fstat(private_descriptor)
+            if not stat.S_ISREG(private_before.st_mode):
+                raise DownloadError(
+                    f"Private verified snapshot {private} is not a regular file."
+                )
+            private_identity = _file_identity(private_before)
+
+            while True:
+                chunk = os.read(source_descriptor, chunk_size)
+                if not chunk:
+                    break
+                _write_descriptor(private_descriptor, chunk)
+                digest.update(chunk)
+                size += len(chunk)
+            os.fsync(private_descriptor)
+
+            if _content_identity(os.fstat(source_descriptor)) != source_version:
+                raise DownloadError(
+                    f"Completed partial {partial} changed while its verified snapshot was copied."
+                )
+            private_after = os.fstat(private_descriptor)
+            if (
+                _file_identity(private_after) != private_identity
+                or private_after.st_size != size
+            ):
+                raise DownloadError(
+                    f"Private verified snapshot {private} changed while it was written."
+                )
+            _require_path_identity(partial, expected_identity, subject="Hashed partial")
+            pin = _pin_private_snapshot(
+                private,
+                private_descriptor,
+                private_identity,
+            )
+        except OSError as error:
+            raise DownloadError(
+                f"Cannot create a verified snapshot of partial download {partial}: {error}."
+            ) from error
+        except BaseException:
+            base_exception_active = True
+            raise
+        finally:
+            close_errors: list[OSError] = []
+            for descriptor in (source_descriptor, private_descriptor):
+                if descriptor is None:
+                    continue
+                try:
+                    os.close(descriptor)
+                except OSError as close_error:
+                    close_errors.append(close_error)
+            if close_errors and not base_exception_active:
+                raise DownloadError(
+                    f"Could not close verified snapshot descriptors for {partial}: "
+                    f"{close_errors[0]}."
+                ) from close_errors[0]
+
+        assert private is not None
+        assert private_identity is not None
+        assert pin is not None
+        _unlink_private_candidate(private, private_identity)
+        success = True
+        return _VerifiedSnapshot(
+            pin=pin,
+            identity=private_identity,
+            source_identity=expected_identity,
+            byte_size=size,
+            sha256=digest.hexdigest(),
+        )
+    finally:
+        if not success:
+            for candidate, identity in (
+                (pin, private_identity),
+                (private, private_identity),
+            ):
+                if candidate is None or identity is None:
+                    continue
+                try:
+                    _unlink_private_candidate(candidate, identity)
+                except Exception:
+                    pass
+
+
+def _publish_snapshot(
+    snapshot: _VerifiedSnapshot,
+    partial: Path,
+    destination: Path,
+) -> None:
+    pin_stat = _lstat_regular(snapshot.pin, allow_absent=False)
+    assert pin_stat is not None
+    if _file_identity(pin_stat) != snapshot.identity:
+        raise DownloadError(
+            f"Private verified snapshot pin {snapshot.pin} changed before publication."
+        )
+    try:
+        os.link(snapshot.pin, destination)
     except FileExistsError as error:
-        _unlink_private_candidate(candidate, expected_identity)
+        _unlink_private_candidate(snapshot.pin, snapshot.identity)
         raise DownloadError(
             f"Download destination {destination} already exists, possibly from a concurrent "
             f"publisher; the verified partial remains at {partial}."
         ) from error
     except OSError as error:
-        _unlink_private_candidate(candidate, expected_identity)
+        _unlink_private_candidate(snapshot.pin, snapshot.identity)
         raise DownloadError(
-            f"Cannot atomically publish verified partial {partial} without overwriting "
+            f"Cannot atomically publish verified snapshot of {partial} without overwriting "
             f"{destination}: {error}."
         ) from error
     final_stat = _lstat_regular(destination, allow_absent=False)
     assert final_stat is not None
-    if _file_identity(final_stat) != expected_identity:
+    final_identity = _file_identity(final_stat)
+    if final_identity != snapshot.identity:
+        try:
+            _unlink_private_candidate(destination, final_identity)
+        except DownloadError:
+            pass
         raise DownloadError(
             f"Download destination {destination} was not linked from the verified identity; "
-            f"private link {candidate} was preserved for inspection."
+            f"private pin {snapshot.pin} was preserved for inspection."
         )
     try:
         _fsync_parent_directory(destination)
@@ -408,8 +599,8 @@ def _publish_partial(
         ) from error
 
     try:
-        _unlink_private_candidate(candidate, expected_identity)
-        _require_path_identity(partial, expected_identity, subject="Owned partial")
+        _unlink_private_candidate(snapshot.pin, snapshot.identity)
+        _require_path_identity(partial, snapshot.source_identity, subject="Owned partial")
         partial.unlink()
         _fsync_parent_directory(destination)
     except DownloadError:
@@ -579,27 +770,37 @@ def download_file(
     partial_stat = _require_path_identity(
         partial, verified_identity, subject="Completed partial"
     )
-    if expected_total is not None and partial_stat.st_size != expected_total:
-        raise DownloadError(
-            f"Complete partial size mismatch for {safe_source}: expected {expected_total} bytes "
-            f"but have {partial_stat.st_size}; the partial was not published."
-        )
-    size, digest, hashed_identity = _hash_file(partial, chunk_size)
-    if hashed_identity != verified_identity:
-        raise DownloadError(
-            f"Completed partial {partial} changed identity before hashing."
-        )
-    _require_path_identity(partial, verified_identity, subject="Hashed partial")
-    if expected_sha256 is not None and digest != expected_sha256:
-        raise DownloadError(
-            f"Downloaded content SHA-256 does not match the expected SHA-256; verified "
-            f"publication was refused and {partial} remains resumable."
-        )
-    _publish_partial(partial, target, verified_identity)
+    snapshot = _snapshot_partial(partial, verified_identity, chunk_size)
+    published = False
+    try:
+        if expected_total is not None and snapshot.byte_size != expected_total:
+            raise DownloadError(
+                f"Complete partial size mismatch for {safe_source}: expected "
+                f"{expected_total} bytes but copied {snapshot.byte_size}; the partial was "
+                "not published."
+            )
+        if partial_stat.st_size != snapshot.byte_size:
+            raise DownloadError(
+                f"Completed partial {partial} changed size before its verified snapshot "
+                "could be published."
+            )
+        if expected_sha256 is not None and snapshot.sha256 != expected_sha256:
+            raise DownloadError(
+                f"Downloaded content SHA-256 does not match the expected SHA-256; verified "
+                f"publication was refused and {partial} remains resumable."
+            )
+        _publish_snapshot(snapshot, partial, target)
+        published = True
+    finally:
+        if not published:
+            try:
+                _unlink_private_candidate(snapshot.pin, snapshot.identity)
+            except Exception:
+                pass
     return DownloadResult(
         destination=str(target),
-        byte_size=size,
-        sha256=digest,
+        byte_size=snapshot.byte_size,
+        sha256=snapshot.sha256,
         resumed=resumed,
         restarted=restarted,
         reused=False,
