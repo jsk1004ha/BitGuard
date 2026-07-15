@@ -203,6 +203,59 @@ class OutOfCoreShardTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "immutable|checksum"):
                 self._write(rows, root)
 
+    def test_unsigned_resource_claim_tamper_breaks_manifest_fingerprint(self) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        rows = _rows()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split, plan = self._write(rows, root)
+            payload = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            payload["resource_usage"]["temporary_bytes_peak"] += 1
+            plan.manifest_path.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "fingerprint"):
+                shard_module.verify_shard_manifest(
+                    plan.manifest_path, split_plan=split
+                )
+
+    def test_resigned_invalid_resource_claims_are_rejected_fail_closed(self) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        rows = _rows()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split, plan = self._write(rows, root)
+            original = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            shard_module.verify_shard_manifest(plan.manifest_path, split_plan=split)
+            cases = (
+                ("boolean run count", "run_count", True),
+                (
+                    "run maximum exceeds coverage",
+                    "max_run_rows",
+                    int(original["coverage"]["rows"]) + 1,
+                ),
+                ("negative temporary bytes", "temporary_bytes_peak", -1),
+            )
+            for name, field, value in cases:
+                payload = json.loads(json.dumps(original))
+                payload["resource_usage"][field] = value
+                payload["fingerprint"] = shard_module.stable_fingerprint(
+                    shard_module._manifest_semantics(payload)
+                )
+                plan.manifest_path.write_text(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    RuntimeError, "resource"
+                ):
+                    shard_module.verify_shard_manifest(
+                        plan.manifest_path, split_plan=split
+                    )
+
     def test_missing_extra_and_duplicate_uids_are_rejected(self) -> None:
         rows = _rows()
         cases: list[tuple[str, list[dict[str, object]], str]] = []
@@ -583,8 +636,81 @@ class OutOfCoreShardTests(unittest.TestCase):
             path.rename(moved)
             moved.rename(path)
 
+    def test_membership_replacement_after_validation_aborts_cleanly_and_retries(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        rows = _rows()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split = _split(rows, root)
+            membership = split.membership_path
+            original_bytes = membership.read_bytes()
+            table = pq.read_table(membership)
+            swapped_rows = table.to_pylist()
+            swap: tuple[int, int] | None = None
+            for left in range(len(swapped_rows)):
+                for right in range(left + 1, len(swapped_rows)):
+                    if swapped_rows[left]["split"] != swapped_rows[right]["split"]:
+                        swap = (left, right)
+                        break
+                if swap is not None:
+                    break
+            self.assertIsNotNone(swap)
+            assert swap is not None
+            left, right = swap
+            swapped_rows[left]["split"], swapped_rows[right]["split"] = (
+                swapped_rows[right]["split"],
+                swapped_rows[left]["split"],
+            )
+            replacement = root / "replacement-membership.parquet"
+            pq.write_table(
+                pa.Table.from_pylist(swapped_rows, schema=table.schema),
+                replacement,
+                compression="zstd",
+            )
+            real_validate = shard_module._validate_split_plan
+
+            def replace_after_validation(plan: object):
+                manifest = real_validate(plan)
+                os.replace(replacement, membership)
+                return manifest
+
+            prepared = root / "prepared"
+
+            def write():
+                return shard_module.write_parquet_shards(
+                    _chunks(rows, 9),
+                    split,
+                    ("f1", "f2"),
+                    prepared,
+                    dataset_name="fixture",
+                    preprocessing_fingerprint="preprocess-v1",
+                    shard_target_rows=10,
+                    max_rows_per_run=12,
+                    merge_fan_in=2,
+                    merge_read_rows=4,
+                )
+
+            try:
+                with patch.object(
+                    shard_module,
+                    "_validate_split_plan",
+                    side_effect=replace_after_validation,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "membership|checksum"):
+                        write()
+            finally:
+                membership.write_bytes(original_bytes)
+            self.assertFalse((prepared / "shard_manifest.json").exists())
+            self.assertEqual(list(prepared.rglob("*.parquet")), [])
+            self.assertEqual(list(prepared.rglob("*.partial")), [])
+            retried = write()
+            shard_module.verify_shard_manifest(retried.manifest_path, split_plan=split)
+
     def test_manifest_publication_failure_rolls_back_only_owned_shards(self) -> None:
-        from bitguard_bnn.out_of_core.shard import write_parquet_shards
+        from bitguard_bnn.out_of_core import shard as shard_module
 
         rows = _rows()
         with tempfile.TemporaryDirectory() as temp:
@@ -596,7 +722,7 @@ class OutOfCoreShardTests(unittest.TestCase):
                 side_effect=OSError("injected manifest failure"),
             ):
                 with self.assertRaisesRegex(OSError, "manifest failure"):
-                    write_parquet_shards(
+                    shard_module.write_parquet_shards(
                         _chunks(rows, 9),
                         split,
                         ("f1", "f2"),
@@ -611,6 +737,20 @@ class OutOfCoreShardTests(unittest.TestCase):
             self.assertFalse((prepared / "shard_manifest.json").exists())
             self.assertEqual(list(prepared.rglob("*.parquet")), [])
             self.assertEqual(list(prepared.rglob("*.partial")), [])
+            self.assertFalse((prepared / "dataset=fixture").exists())
+            retried = shard_module.write_parquet_shards(
+                _chunks(rows, 9),
+                split,
+                ("f1", "f2"),
+                prepared,
+                dataset_name="fixture",
+                preprocessing_fingerprint="preprocess-v1",
+                shard_target_rows=10,
+                max_rows_per_run=12,
+                merge_fan_in=2,
+                merge_read_rows=4,
+            )
+            shard_module.verify_shard_manifest(retried.manifest_path, split_plan=split)
 
     def test_unmanifested_existing_shard_is_never_replaced(self) -> None:
         from bitguard_bnn.out_of_core.shard import write_parquet_shards

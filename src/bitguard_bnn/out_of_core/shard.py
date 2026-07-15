@@ -547,6 +547,19 @@ def _validate_membership_file(path: Path) -> None:
             raise RuntimeError("split membership schema drift")
 
 
+def _snapshot_verified_membership(
+    source: Path, destination: Path, expected_sha256: str
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as source_handle, destination.open("xb") as destination_handle:
+        shutil.copyfileobj(source_handle, destination_handle, length=1024 * 1024)
+        destination_handle.flush()
+        os.fsync(destination_handle.fileno())
+    _validate_membership_file(destination)
+    if _sha256_file(destination) != expected_sha256:
+        raise RuntimeError("split membership snapshot checksum mismatch")
+
+
 def _validate_split_plan(plan: SplitPlan) -> dict[str, Any]:
     _validate_membership_file(plan.membership_path)
     try:
@@ -582,6 +595,7 @@ def _validate_split_plan(plan: SplitPlan) -> dict[str, Any]:
 def _join_membership(
     source_path: Path,
     split_plan: SplitPlan,
+    membership_path: Path,
     work: Path,
     *,
     schema: pa.Schema,
@@ -590,10 +604,10 @@ def _join_membership(
     held_out_attacks: frozenset[str],
     tracker: _ResourceTracker,
 ) -> tuple[list[Path], int, str]:
-    _validate_membership_file(split_plan.membership_path)
+    _validate_membership_file(membership_path)
     sources = _iter_records(source_path, merge_read_rows, tracker=tracker)
     members = _iter_records(
-        split_plan.membership_path, merge_read_rows, tracker=tracker
+        membership_path, merge_read_rows, tracker=tracker
     )
     source: dict[str, Any] | None = None
     member: dict[str, Any] | None = None
@@ -855,6 +869,7 @@ def _manifest_semantics(payload: Mapping[str, Any]) -> dict[str, Any]:
         "schema_fingerprint",
         "algorithm_versions",
         "entries",
+        "resource_usage",
     )
     try:
         return {name: payload[name] for name in fields}
@@ -943,6 +958,123 @@ def _build_manifest(
     return payload
 
 
+_SHARD_CONTRACT_FIELDS = frozenset(
+    {
+        "shard_target_rows",
+        "record_batch_rows",
+        "max_rows_per_run",
+        "merge_fan_in",
+        "merge_read_rows",
+    }
+)
+_RESOURCE_USAGE_FIELDS = frozenset(
+    {
+        "shard_target_rows",
+        "record_batch_rows",
+        "configured_max_rows_per_run",
+        "max_run_rows",
+        "run_count",
+        "merge_fan_in_limit",
+        "merge_read_rows",
+        "max_merge_fan_in_observed",
+        "max_merge_input_rows_buffered",
+        "merge_input_rows_buffered_limit",
+        "temporary_bytes_peak",
+    }
+)
+
+
+def _strict_resource_int(
+    values: Mapping[str, Any], name: str, *, minimum: int
+) -> int:
+    value = values.get(name)
+    if type(value) is not int or value < minimum:
+        raise RuntimeError(f"invalid shard resource claim: {name}")
+    return value
+
+
+def _validate_resource_claims(manifest: Mapping[str, Any]) -> int:
+    contract = manifest.get("shard_contract")
+    resources = manifest.get("resource_usage")
+    coverage = manifest.get("coverage")
+    entries = manifest.get("entries")
+    if (
+        not isinstance(contract, Mapping)
+        or set(contract) != _SHARD_CONTRACT_FIELDS
+        or not isinstance(resources, Mapping)
+        or set(resources) != _RESOURCE_USAGE_FIELDS
+        or not isinstance(coverage, Mapping)
+        or not isinstance(entries, list)
+    ):
+        raise RuntimeError("invalid shard resource claim structure")
+
+    shard_target_rows = _strict_resource_int(
+        contract, "shard_target_rows", minimum=1
+    )
+    record_batch_rows = _strict_resource_int(
+        contract, "record_batch_rows", minimum=1
+    )
+    max_rows_per_run = _strict_resource_int(
+        contract, "max_rows_per_run", minimum=1
+    )
+    merge_fan_in = _strict_resource_int(contract, "merge_fan_in", minimum=2)
+    merge_read_rows = _strict_resource_int(
+        contract, "merge_read_rows", minimum=1
+    )
+    coverage_rows = _strict_resource_int(coverage, "rows", minimum=1)
+    resource_shard_target = _strict_resource_int(
+        resources, "shard_target_rows", minimum=1
+    )
+    resource_record_batch = _strict_resource_int(
+        resources, "record_batch_rows", minimum=1
+    )
+    resource_max_rows = _strict_resource_int(
+        resources, "configured_max_rows_per_run", minimum=1
+    )
+    max_run_rows = _strict_resource_int(resources, "max_run_rows", minimum=1)
+    _strict_resource_int(resources, "run_count", minimum=2)
+    resource_merge_fan_in = _strict_resource_int(
+        resources, "merge_fan_in_limit", minimum=2
+    )
+    resource_merge_read = _strict_resource_int(
+        resources, "merge_read_rows", minimum=1
+    )
+    max_merge_fan_in = _strict_resource_int(
+        resources, "max_merge_fan_in_observed", minimum=0
+    )
+    max_merge_rows = _strict_resource_int(
+        resources, "max_merge_input_rows_buffered", minimum=1
+    )
+    merge_limit = _strict_resource_int(
+        resources, "merge_input_rows_buffered_limit", minimum=1
+    )
+    temporary_peak = _strict_resource_int(
+        resources, "temporary_bytes_peak", minimum=0
+    )
+    entry_bytes = 0
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise RuntimeError("invalid shard resource claim entries")
+        entry_bytes += _strict_resource_int(entry, "byte_size", minimum=1)
+    expected_merge_limit = merge_fan_in * merge_read_rows
+    observed_merge_limit = max(2, max_merge_fan_in) * merge_read_rows
+    if (
+        resource_shard_target != shard_target_rows
+        or resource_record_batch != record_batch_rows
+        or resource_max_rows != max_rows_per_run
+        or resource_merge_fan_in != merge_fan_in
+        or resource_merge_read != merge_read_rows
+        or max_run_rows != coverage_rows
+        or max_merge_fan_in == 1
+        or max_merge_fan_in > merge_fan_in
+        or max_merge_rows > observed_merge_limit
+        or merge_limit != expected_merge_limit
+        or temporary_peak < entry_bytes
+    ):
+        raise RuntimeError("inconsistent shard resource claims")
+    return shard_target_rows
+
+
 def load_shard_manifest(path: Path | str) -> dict[str, Any]:
     manifest_path = Path(path)
     try:
@@ -1015,7 +1147,9 @@ def _safe_entry_path(root: Path, relative: object) -> Path:
     return resolved
 
 
-def _ensure_safe_directory(root: Path, directory: Path) -> None:
+def _ensure_safe_directory(
+    root: Path, directory: Path
+) -> list[tuple[Path, FileIdentity]]:
     if _is_link_like(root) or not root.is_dir():
         raise RuntimeError(f"unsafe shard output root: {root}")
     try:
@@ -1023,6 +1157,7 @@ def _ensure_safe_directory(root: Path, directory: Path) -> None:
     except ValueError as exc:
         raise RuntimeError(f"shard directory escapes output root: {directory}") from exc
     current = root
+    created: list[tuple[Path, FileIdentity]] = []
     for part in relative.parts:
         current = current / part
         if current.exists():
@@ -1032,6 +1167,8 @@ def _ensure_safe_directory(root: Path, directory: Path) -> None:
         current.mkdir()
         if _is_link_like(current) or not current.is_dir():
             raise RuntimeError(f"unsafe shard destination directory: {current}")
+        created.append((current, file_identity(current)))
+    return created
 
 
 def _coverage_key(row: Mapping[str, Any]) -> tuple[str]:
@@ -1300,23 +1437,7 @@ def verify_shard_manifest(
         "schema_fingerprint"
     ) != stable_fingerprint(descriptor):
         raise RuntimeError("shard manifest schema fingerprint mismatch")
-    contract = manifest.get("shard_contract", {})
-    resources = manifest.get("resource_usage", {})
-    contract_merge_read = int(contract.get("merge_read_rows", -1))
-    contract_merge_fan_in = int(contract.get("merge_fan_in", -1))
-    expected_merge_limit = contract_merge_fan_in * contract_merge_read
-    observed_merge_rows = int(resources.get("max_merge_input_rows_buffered", -1))
-    if (
-        contract_merge_read <= 0
-        or contract_merge_fan_in < 2
-        or int(resources.get("merge_read_rows", -1)) != contract_merge_read
-        or int(resources.get("merge_fan_in_limit", -1)) != contract_merge_fan_in
-        or int(resources.get("merge_input_rows_buffered_limit", -1))
-        != expected_merge_limit
-        or observed_merge_rows < 0
-        or observed_merge_rows > expected_merge_limit
-    ):
-        raise RuntimeError("shard manifest merge resource contract mismatch")
+    target_rows = _validate_resource_claims(manifest)
     work = path.parent / f".verify-shards-{uuid.uuid4().hex}.partial"
     work.mkdir(parents=True)
     tracker = _ResourceTracker(work, max_rows_per_run, merge_read_rows)
@@ -1368,9 +1489,6 @@ def verify_shard_manifest(
             for split, values in entry_classes.items():
                 classes[split].update(values)
             sources.update(entry_sources)
-        target_rows = int(manifest.get("shard_contract", {}).get("shard_target_rows", -1))
-        if target_rows <= 0:
-            raise RuntimeError("invalid shard target row contract")
         for bucket, bucket_values in bucket_entries.items():
             previous_max: tuple[Any, ...] | None = None
             for index, entry in enumerate(bucket_values):
@@ -1508,8 +1626,15 @@ def write_parquet_shards(
     working_schema = _working_schema(features)
     manifest_path = output / "shard_manifest.json"
     published: list[tuple[Path, FileIdentity]] = []
+    created_directories: list[tuple[Path, FileIdentity]] = []
     published_manifest: FileIdentity | None = None
     try:
+        membership_snapshot = work / "membership.snapshot.parquet"
+        _snapshot_verified_membership(
+            split_plan.membership_path,
+            membership_snapshot,
+            str(split_manifest["membership"]["sha256"]),
+        )
         source_runs = _write_source_runs(
             chunks,
             work,
@@ -1533,6 +1658,7 @@ def write_parquet_shards(
         joined_runs, row_count, uid_digest = _join_membership(
             sorted_source,
             split_plan,
+            membership_snapshot,
             work,
             schema=working_schema,
             max_rows_per_run=max_rows_per_run,
@@ -1604,7 +1730,9 @@ def write_parquet_shards(
             relative = PurePosixPath(str(entry["path"]))
             staged = staging.joinpath(*relative.parts)
             destination = output.joinpath(*relative.parts)
-            _ensure_safe_directory(output, destination.parent)
+            created_directories.extend(
+                _ensure_safe_directory(output, destination.parent)
+            )
             identity = _publish_file_no_replace(staged, destination)
             published.append((destination, identity))
         _cleanup_work(work)
@@ -1625,6 +1753,33 @@ def write_parquet_shards(
             try:
                 removed_public = unlink_file_if_identity(path, identity) or removed_public
             except BaseException as error:
+                cleanup.append(error)
+        for directory, identity in reversed(created_directories):
+            try:
+                actual = file_identity(directory)
+                if (
+                    _is_link_like(directory)
+                    or not directory.is_dir()
+                    or (actual.device, actual.inode, actual.mode)
+                    != (identity.device, identity.inode, identity.mode)
+                ):
+                    cleanup.append(
+                        RuntimeError(
+                            "published directory identity changed during rollback: "
+                            f"{directory}"
+                        )
+                    )
+                    continue
+                directory.rmdir()
+                removed_public = True
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                try:
+                    if directory.is_dir() and any(directory.iterdir()):
+                        continue
+                except OSError:
+                    pass
                 cleanup.append(error)
         if work.exists():
             try:
