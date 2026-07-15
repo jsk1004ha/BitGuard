@@ -113,7 +113,8 @@ _INFINITY_NUMERIC = {
     "-infinity",
 }
 _ASCII_DECIMAL = re.compile(
-    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+    r"(?:[eE](?P<exponent_sign>[+-]?)(?P<exponent>[0-9]+))?",
     re.ASCII,
 )
 _DEFAULT_REQUIRED = {
@@ -381,8 +382,27 @@ def _find(mapping: dict[str, str], preferred: str | None, candidates: Iterable[s
     return None
 
 
+def _finite_decimal(value: str) -> float | None:
+    match = _ASCII_DECIMAL.fullmatch(value)
+    if match is None:
+        return None
+    exponent = match.group("exponent")
+    if exponent is not None and match.group("exponent_sign") != "-":
+        significant = exponent.lstrip("0")
+        if len(significant) > 3 or (
+            len(significant) == 3 and significant > "308"
+        ):
+            return None
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
 def _numeric_convertible(value: str) -> bool:
-    token = value.strip().casefold()
+    raw_token = value.casefold()
+    token = raw_token.strip()
     if token in _MISSING_NUMERIC:
         return False
     # Keep bootstrap column eligibility synchronized with data._numeric_features,
@@ -391,30 +411,25 @@ def _numeric_convertible(value: str) -> bool:
     # ASCII-only: pandas-recognized infinity spellings are non-missing, while NaN,
     # Python-only underscores, grouping separators, hex, and decimal overflow are
     # ineligible.  The record-size ceiling bounds this per-cell linear parse.
-    if token in _INFINITY_NUMERIC:
+    # pandas accepts these spellings only when they are not whitespace-padded.
+    if raw_token in _INFINITY_NUMERIC:
         return True
-    if _ASCII_DECIMAL.fullmatch(token) is None:
-        return False
-    try:
-        numeric = float(token)
-    except (OverflowError, ValueError):
-        return False
-    return math.isfinite(numeric)
+    return _finite_decimal(token) is not None
 
 
 def _timestamp_valid(value: str) -> bool:
     token = value.strip()
     if not token:
         return False
-    try:
-        numeric = float(token)
-    except ValueError:
-        try:
-            dt.datetime.fromisoformat(token.replace("Z", "+00:00"))
-        except ValueError:
-            return False
+    # Reuse the feature decimal grammar, but require finite timestamps because
+    # downstream ordering and elapsed-time state cannot safely consume infinity.
+    if _finite_decimal(token) is not None:
         return True
-    return math.isfinite(numeric)
+    try:
+        dt.datetime.fromisoformat(token.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)

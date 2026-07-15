@@ -8,10 +8,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
 from bitguard_bnn.bootstrap.inspect import (
     SchemaInspectionError,
     _BoundedLines,
     _numeric_convertible,
+    _timestamp_valid,
     inspect_csv_dataset,
 )
 
@@ -241,6 +244,78 @@ class SchemaInspectionTest(unittest.TestCase):
         for token in rejected:
             with self.subTest(token=token, expected=False):
                 self.assertFalse(_numeric_convertible(token))
+
+    def test_numeric_eligibility_matches_pandas_for_specials_and_exponents(self) -> None:
+        cases = (
+            ("inf", True),
+            ("+inf", True),
+            ("-inf", True),
+            ("infinity", True),
+            ("+infinity", True),
+            ("-infinity", True),
+            (" inf ", False),
+            (" +inf ", False),
+            (" -inf ", False),
+            (" infinity ", False),
+            (" +infinity ", False),
+            (" -infinity ", False),
+            (" 1 ", True),
+            (" -2.5 ", True),
+            ("0e308", True),
+            ("1e308", True),
+            ("0e309", False),
+            ("-0e309", False),
+            ("0e9999", False),
+            ("0e+9999", False),
+            ("1e-400", True),
+            ("99e307", False),
+        )
+
+        for token, expected in cases:
+            with self.subTest(token=token):
+                converted = pd.to_numeric(pd.Series([token]), errors="coerce").iloc[0]
+                self.assertEqual(bool(pd.notna(converted)), expected)
+                self.assertEqual(_numeric_convertible(token), expected)
+
+    def test_timestamp_numeric_grammar_is_strict_and_finite(self) -> None:
+        # The adapter accepts non-missing numeric timestamps, but downstream
+        # sorting and elapsed-time state require finite values. Bootstrap is
+        # deliberately stricter for infinity while sharing the decimal grammar.
+        cases = (
+            ("1", True),
+            (" 1.5 ", True),
+            ("0e308", True),
+            ("1e-400", True),
+            ("2019-01-01T00:00:00Z", True),
+            ("1_000", False),
+            ("1,000", False),
+            ("0e309", False),
+            ("inf", False),
+            ("-infinity", False),
+        )
+
+        for token, expected in cases:
+            with self.subTest(token=token):
+                self.assertEqual(_timestamp_valid(token), expected)
+
+    def test_underscore_timestamp_is_rejected_during_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory,saddr,stime,x\n"
+                "ddos,tcp,device,1_000,1\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                required_columns=("category", "subcategory", "saddr", "stime"),
+                fail_on_rejected=False,
+            )
+
+            self.assertEqual(report.accepted_rows, 0)
+            self.assertEqual(report.rejected_reasons, (("invalid_timestamp", 1),))
 
     def test_pandas_divergent_numeric_forms_are_unusable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
