@@ -220,6 +220,16 @@ class PriorityRowSketch:
         result.flags.writeable = False
         return result
 
+    def retained_rows(self) -> tuple[tuple[str, NDArray[np.float64]], ...]:
+        """Return canonical copies of retained complete rows for bounded consumers."""
+
+        result: list[tuple[str, NDArray[np.float64]]] = []
+        for row in sorted(self._heap, key=lambda item: item.key):
+            values = np.asarray(row.values, dtype=np.float64)
+            values.flags.writeable = False
+            result.append((row.row_uid, values))
+        return tuple(result)
+
     def _validate_uid(self, row_uid: object) -> str:
         if not isinstance(row_uid, str) or not row_uid:
             raise ValueError("row_uid must be a non-empty string")

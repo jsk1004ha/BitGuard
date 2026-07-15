@@ -135,6 +135,24 @@ class PriorityRowSketchTests(unittest.TestCase):
         self.assertEqual(sketch.retained_count, 7)
         self.assertLessEqual(len(sketch.snapshot()["retained_rows"]), 7)
 
+    def test_retained_rows_are_canonical_read_only_copies(self) -> None:
+        sketch = PriorityRowSketch(capacity=2, seed=1, width=2)
+        sketch.update_many(["b", "a", "c"], [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        before = sketch.to_bytes()
+
+        rows = sketch.retained_rows()
+
+        self.assertEqual(len(rows), 2)
+        repeated = sketch.retained_rows()
+        self.assertEqual([uid for uid, _ in rows], [uid for uid, _ in repeated])
+        for (_, values), (_, repeated_values) in zip(rows, repeated):
+            np.testing.assert_array_equal(values, repeated_values)
+        for _, values in rows:
+            self.assertFalse(values.flags.writeable)
+            with self.assertRaises(ValueError):
+                values[0] = -1.0
+        self.assertEqual(sketch.to_bytes(), before)
+
     def test_shape_and_sampling_identity_are_immutable(self) -> None:
         sketch = PriorityRowSketch(capacity=7, seed=1, width=3)
         for name, value in (("capacity", 8), ("seed", 2), ("width", 4)):

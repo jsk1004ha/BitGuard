@@ -108,6 +108,19 @@ class FeaturePreprocessor:
         self.label_to_index: dict[str, int] = {}
         self.benign_center: np.ndarray | None = None
         self.open_distance_threshold: float = 1.0
+        self.fit_provenance: dict[str, Any] = {
+            "fit_mode": "in_memory_exact",
+            "passes": 1,
+            "exact_fields": [
+                "imputation_medians",
+                "feature_selection",
+                "scaler_statistics",
+                "encoder_thresholds",
+                "benign_center_and_distance_quantile",
+            ],
+            "approximate_fields": [],
+            "validation_calibration_used": False,
+        }
         self.fitted = False
 
     def _cost_lookup(self, features: list[str]) -> np.ndarray:
@@ -129,6 +142,19 @@ class FeaturePreprocessor:
         return values / values.mean()
 
     def fit(self, train: pd.DataFrame, candidate_features: list[str]) -> "FeaturePreprocessor":
+        self.fit_provenance = {
+            "fit_mode": "in_memory_exact",
+            "passes": 1,
+            "exact_fields": [
+                "imputation_medians",
+                "feature_selection",
+                "scaler_statistics",
+                "encoder_thresholds",
+                "benign_center_and_distance_quantile",
+            ],
+            "approximate_fields": [],
+            "validation_calibration_used": False,
+        }
         if (train["behavior_label"] == "unknown_like").any():
             raise ValueError("unknown_like must not appear in training; use an attack-held-out test")
         self.candidate_features = list(candidate_features)
@@ -156,7 +182,7 @@ class FeaturePreprocessor:
         except ValueError:
             scores = np.nanvar(imputed, axis=0)
         scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
-        costs = self._cost_lookup(self.candidate_features).astype(np.float64)
+        costs: np.ndarray = self._cost_lookup(self.candidate_features).astype(np.float64)
         if self.selection == "variance":
             rank_score = np.nanvar(imputed, axis=0)
         elif self.selection == "cost_aware":
@@ -305,7 +331,14 @@ class FeaturePreprocessor:
     def feature_manifest(self) -> dict[str, Any]:
         self._check_fitted()
         assert self.feature_costs is not None and self.selection_scores is not None
+        provenance = getattr(
+            self,
+            "fit_provenance",
+            {"fit_mode": "in_memory_exact", "validation_calibration_used": False},
+        )
         return {
+            "fit_mode": str(provenance.get("fit_mode", "in_memory_exact")),
+            "fit_provenance": provenance,
             "candidate_count": len(self.candidate_features),
             "selected_count": len(self.selected_features),
             "selected_features": self.selected_features,
