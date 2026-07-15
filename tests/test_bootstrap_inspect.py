@@ -349,6 +349,71 @@ class SchemaInspectionTest(unittest.TestCase):
         self.assertEqual(report.accepted_rows, int(expected.sum()))
         self.assertEqual(report.rejected_rows, int((~expected).sum()))
 
+    def test_boolean_timestamp_with_missing_chunk_matches_concatenated_adapter(
+        self,
+    ) -> None:
+        csv_text = (
+            "category,subcategory,saddr,stime,x\n"
+            "Normal,Normal,device,True,1\n"
+            "Normal,Normal,device,True,2\n"
+            "Normal,Normal,device,True,3\n"
+            "Normal,Normal,device,,4\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "flows.csv"
+            path.write_text(csv_text, encoding="utf-8")
+            inferred = pd.concat(
+                pd.read_csv(path, chunksize=1, low_memory=False),
+                ignore_index=True,
+            )["stime"]
+            expected = _coerce_timestamp(inferred).notna()
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                chunk_size=1,
+                fail_on_rejected=False,
+            )
+
+        self.assertEqual(int(expected.sum()), 3)
+        self.assertEqual(report.accepted_rows, int(expected.sum()))
+        self.assertEqual(report.rejected_rows, int((~expected).sum()))
+
+    def test_mixed_datetime_formats_match_concatenated_adapter_context(self) -> None:
+        timestamps = (
+            "2020-01-02",
+            "03/04/2020",
+            "2020-05-06T07:08:09Z",
+            "",
+        )
+        csv_text = (
+            "category,subcategory,saddr,stime,x\n"
+            + "".join(
+                f"Normal,Normal,device,{timestamp},{index}\n"
+                for index, timestamp in enumerate(timestamps, start=1)
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "flows.csv"
+            path.write_text(csv_text, encoding="utf-8")
+            inferred = pd.concat(
+                pd.read_csv(path, chunksize=1, low_memory=False),
+                ignore_index=True,
+            )["stime"]
+            expected = _coerce_timestamp(inferred).notna()
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                chunk_size=1,
+                fail_on_rejected=False,
+            )
+
+        self.assertEqual(report.accepted_rows, int(expected.sum()))
+        self.assertEqual(report.rejected_rows, int((~expected).sum()))
+
     def test_underscore_timestamp_is_rejected_during_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -461,6 +526,64 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertLessEqual(max(numeric_sizes), 5)
             self.assertTrue(datetime_sizes)
             self.assertLessEqual(max(datetime_sizes), 5)
+
+    def test_timestamp_dtype_witnesses_stay_constant_across_thousands_of_chunks(
+        self,
+    ) -> None:
+        timestamp_cycle = ("True", "", "2020-01-02", "1")
+        rows = [
+            f"Normal,Normal,device,{timestamp_cycle[index % 4]},{index}\n"
+            for index in range(2_000)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory,saddr,stime,x\n" + "".join(rows),
+                encoding="utf-8",
+            )
+            witness_counts: list[int] = []
+            promotion_sizes: list[int] = []
+            conversion_sizes: list[int] = []
+            real_promote = inspect_module._promote_timestamp_series
+            real_numeric = pd.to_numeric
+            real_datetime = pd.to_datetime
+
+            def record_promotion(values, witnesses):
+                witness_counts.append(len(witnesses))
+                promotion_sizes.append(
+                    len(values) + sum(len(witness) for witness in witnesses)
+                )
+                return real_promote(values, witnesses)
+
+            def record_numeric(values, *args, **kwargs):
+                conversion_sizes.append(len(values))
+                return real_numeric(values, *args, **kwargs)
+
+            def record_datetime(values, *args, **kwargs):
+                conversion_sizes.append(len(values))
+                return real_datetime(values, *args, **kwargs)
+
+            with (
+                patch.object(
+                    inspect_module,
+                    "_promote_timestamp_series",
+                    side_effect=record_promotion,
+                ),
+                patch.object(inspect_module.pd, "to_numeric", record_numeric),
+                patch.object(inspect_module.pd, "to_datetime", record_datetime),
+            ):
+                report = inspect_csv_dataset(
+                    "botiot",
+                    root,
+                    chunk_size=1,
+                    fail_on_rejected=False,
+                )
+
+        self.assertEqual(report.total_rows, 2_000)
+        self.assertTrue(witness_counts)
+        self.assertLessEqual(max(witness_counts), 4)
+        self.assertLessEqual(max(promotion_sizes), 5)
+        self.assertLessEqual(max(conversion_sizes), 5)
 
     def test_missing_pandas_dependency_reports_actionable_bootstrap_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

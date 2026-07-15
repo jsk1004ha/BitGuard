@@ -589,18 +589,43 @@ class _FileInspectionPlan:
     timestamp_numeric_mode: bool
     source_fingerprint: tuple[int, int, int, int]
     source_sha256: str
+    timestamp_witnesses: tuple[object, ...]
+    timestamp_datetime_context: object | None
 
 
-def _converted_numeric(values: Sequence[str]):
+def _pandas_series(values: object):
+    _require_pandas()
+    assert pd is not None
+    if isinstance(values, pd.Series):
+        return values.reset_index(drop=True)
+    return pd.Series(values, dtype="object")
+
+
+def _converted_numeric(values: object):
     _require_pandas()
     assert pd is not None
     try:
-        return pd.to_numeric(pd.Series(values, dtype="object"), errors="coerce")
+        return pd.to_numeric(_pandas_series(values), errors="coerce")
     except Exception as error:
         raise SchemaInspectionError(
             "pandas numeric conversion failed; rerun bootstrap to restore the locked "
             "dependency environment"
         ) from error
+
+
+def _promote_timestamp_series(values: object, witnesses: Sequence[object]):
+    """Reproduce pandas concat dtype promotion using bounded dtype witnesses."""
+
+    _require_pandas()
+    assert pd is not None
+    series = _pandas_series(values)
+    if not witnesses:
+        return series
+    promoted = pd.concat(
+        [series, *(_pandas_series(witness) for witness in witnesses)],
+        ignore_index=True,
+    )
+    return promoted.iloc[: len(series)].reset_index(drop=True)
 
 
 def _pandas_inferred_chunk(
@@ -625,11 +650,17 @@ def _pandas_inferred_chunk(
         ) from error
 
 
-def _timestamp_validity(values: Sequence[str], *, numeric_mode: bool):
+def _timestamp_validity(
+    values: object,
+    *,
+    numeric_mode: bool,
+    datetime_context: object | None = None,
+):
     _require_pandas()
     assert pd is not None
+    series = _pandas_series(values)
     if numeric_mode:
-        converted = _converted_numeric(values)
+        converted = _converted_numeric(series)
         # Training accepts numeric infinity, but ordering and elapsed-time state
         # cannot safely consume it. This is the sole intentional safety narrowing.
         return (
@@ -642,9 +673,23 @@ def _timestamp_validity(values: Sequence[str], *, numeric_mode: bool):
                 message="Could not infer format, so each element will be parsed individually",
                 category=UserWarning,
             )
-            return pd.to_datetime(
-                pd.Series(values, dtype="object"), errors="coerce", utc=True
-            ).notna()
+            if datetime_context is None or not len(series):
+                return pd.to_datetime(
+                    series, errors="coerce", utc=True
+                ).notna().reset_index(drop=True)
+            # Reserve one slot for the global first-value context so each
+            # conversion remains within the original bounded chunk ceiling.
+            batch_size = max(1, len(series) - 1)
+            valid_parts: list[bool] = []
+            for start in range(0, len(series), batch_size):
+                batch = series.iloc[start : start + batch_size]
+                context = pd.Series([datetime_context], dtype=series.dtype)
+                contextual = pd.concat([context, batch], ignore_index=True)
+                converted = pd.to_datetime(
+                    contextual, errors="coerce", utc=True
+                ).notna()
+                valid_parts.extend(converted.iloc[1:].tolist())
+            return pd.Series(valid_parts, dtype="bool")
     except Exception as error:
         raise SchemaInspectionError(
             "pandas timestamp conversion failed; rerun bootstrap to restore the locked "
@@ -681,6 +726,8 @@ def _plan_file_inspection(
     numeric_keys: set[str] = set()
     timestamp_numeric = 0
     timestamp_total = 0
+    timestamp_witnesses: dict[str, object] = {}
+    first_timestamp_value: object | None = None
     source_sha256 = ""
     try:
         bounded_lines = _BoundedLines(handle, max_record_chars)
@@ -712,7 +759,18 @@ def _plan_file_inspection(
                 if bool(converted.notna().any()):
                     numeric_keys.add(key)
             if schema.timestamp is not None:
-                timestamp_values = inferred_chunk[schema.timestamp]
+                timestamp_values = inferred_chunk[schema.timestamp].reset_index(
+                    drop=True
+                )
+                dtype_key = str(timestamp_values.dtype)
+                if dtype_key not in timestamp_witnesses:
+                    timestamp_witnesses[dtype_key] = timestamp_values.iloc[:1].copy()
+                if first_timestamp_value is None:
+                    non_missing = timestamp_values.notna().to_numpy().nonzero()[0]
+                    if len(non_missing):
+                        first_timestamp_value = timestamp_values.iloc[
+                            [int(non_missing[0])]
+                        ].copy()
                 converted_timestamp = _converted_numeric(timestamp_values)
                 timestamp_numeric += int(converted_timestamp.notna().sum())
                 timestamp_total += len(timestamp_values)
@@ -735,6 +793,15 @@ def _plan_file_inspection(
     )
     if not features:
         raise SchemaInspectionError(f"no numeric feature columns found in {path}")
+    witness_values = tuple(timestamp_witnesses.values())
+    datetime_context: object | None = None
+    if first_timestamp_value is not None:
+        promoted_context = _promote_timestamp_series(
+            first_timestamp_value,
+            witness_values,
+        )
+        if len(promoted_context) and bool(promoted_context.notna().iloc[0]):
+            datetime_context = promoted_context.iloc[0]
     return _FileInspectionPlan(
         header=tuple(header),
         schema=schema,
@@ -745,6 +812,8 @@ def _plan_file_inspection(
         ),
         source_fingerprint=_content_fingerprint(path_before),
         source_sha256=source_sha256,
+        timestamp_witnesses=witness_values,
+        timestamp_datetime_context=datetime_context,
     )
 
 
@@ -865,9 +934,14 @@ def _inspect_csv_dataset_unlocked(
                             inferred_chunk = _pandas_inferred_chunk(
                                 schema.header, normalized_rows
                             )
-                            timestamp_flags = _timestamp_validity(
+                            timestamp_values = _promote_timestamp_series(
                                 inferred_chunk[schema.timestamp],
+                                plan.timestamp_witnesses,
+                            )
+                            timestamp_flags = _timestamp_validity(
+                                timestamp_values,
                                 numeric_mode=plan.timestamp_numeric_mode,
+                                datetime_context=plan.timestamp_datetime_context,
                             ).tolist()
                         else:
                             timestamp_flags = [True] * len(normalized_rows)
