@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -362,6 +363,68 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "no numeric feature"):
                 list(iter_normalized_chunks(config))
+
+    def test_invalid_generic_header_is_enforced_before_later_valid_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid = root / "00-invalid.csv"
+            invalid.write_text("x\n", encoding="utf-8")
+            pd.DataFrame(
+                {"behavior_label": ["benign"], "x": [1]}
+            ).to_csv(root / "01-valid.csv", index=False)
+            config = _base_config(root, "csv", "*.csv")
+            pattern = re.escape(
+                f"label column 'behavior_label' missing from {invalid}"
+            )
+
+            for loader in (load_dataset, load_generic_csv):
+                with self.subTest(loader=loader.__name__), self.assertRaisesRegex(
+                    ValueError, pattern
+                ):
+                    loader(config)
+
+    def test_header_only_error_order_matches_legacy_for_type_and_cap(self) -> None:
+        cases = (
+            ("csv", "behavior_label,x\n", load_generic_csv),
+            ("nbaiot", "f1,f2\n", load_nbaiot),
+            ("botiot", "category,rate\n", load_botiot),
+        )
+        for dataset_type, header, typed_loader in cases:
+            for class_cap, expected in (
+                (None, "no numeric feature columns were found"),
+                (2, "dataset contains no rows"),
+            ):
+                for loader in (load_dataset, typed_loader):
+                    with (
+                        self.subTest(
+                            dataset_type=dataset_type,
+                            class_cap=class_cap,
+                            loader=loader.__name__,
+                        ),
+                        tempfile.TemporaryDirectory() as directory,
+                    ):
+                        root = Path(directory)
+                        if dataset_type == "nbaiot":
+                            dataset = root / "dataset"
+                            dataset.mkdir()
+                            (dataset / "header.csv").write_text(
+                                header, encoding="utf-8"
+                            )
+                            path = "dataset"
+                        else:
+                            (root / "header.csv").write_text(
+                                header, encoding="utf-8"
+                            )
+                            path = "header.csv"
+                        config = _base_config(
+                            root, dataset_type, path
+                        )
+                        config["dataset"]["max_rows_per_class"] = class_cap
+
+                        with self.assertRaisesRegex(
+                            ValueError, f"^{expected}$"
+                        ):
+                            loader(config)
 
     def test_iterator_options_are_keyword_only(self) -> None:
         parameters = inspect.signature(iter_normalized_chunks).parameters

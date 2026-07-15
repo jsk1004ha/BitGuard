@@ -249,13 +249,12 @@ def _plan_schema_and_timestamp(
     cfg: dict[str, Any],
     chunk_size: int,
 ) -> tuple[_Schema, _TimestampPlan | None]:
-    schema: _Schema | None = None
+    header = pd.read_csv(path, nrows=0, low_memory=False)
+    schema = _schema_for(kind, header, cfg, path)
     numeric_count = 0
     timestamp_count = 0
     first_timestamp: object | None = None
     for _, frame in _iter_selected_raw((path, selected_rows), chunk_size):
-        if schema is None:
-            schema = _schema_for(kind, frame, cfg, path)
         if schema.timestamp is None:
             continue
         values = frame[schema.timestamp]
@@ -266,8 +265,6 @@ def _plan_schema_and_timestamp(
             non_missing = values[values.notna()]
             if not non_missing.empty:
                 first_timestamp = non_missing.iloc[0]
-    if schema is None:
-        raise ValueError(f"empty CSV after sampling: {path}")
     if schema.timestamp is None:
         return schema, None
     numeric_mode = timestamp_count > 0 and numeric_count / timestamp_count >= 0.95
@@ -527,6 +524,8 @@ def _build_iteration_plan(
     max_loaded_rows = cfg.get("max_loaded_rows") if apply_sampling_caps else None
     max_loaded_rows = int(max_loaded_rows) if max_loaded_rows is not None else None
     budget = _SourceRowBudget(max_loaded_rows)
+    class_limit = cfg.get("max_rows_per_class") if apply_sampling_caps else None
+    class_limit = int(class_limit) if class_limit is not None else None
     file_plans: list[_FilePlan] = []
     for path, relative_path in zip(source.files, source.relative_paths):
         selected_rows = _scan_selected_rows(
@@ -536,19 +535,21 @@ def _build_iteration_plan(
             seed=data_module._source_seed(int(config["experiment"]["seed"]), path),
             budget=budget,
         )
-        if selected_rows == frozenset():
-            continue
         schema, timestamp = _plan_schema_and_timestamp(
             source.kind, path, selected_rows, cfg, chunk_size
         )
+        if selected_rows == frozenset():
+            continue
         file_plans.append(
             _FilePlan(path, relative_path, selected_rows, schema, timestamp)
         )
     files = tuple(file_plans)
     if not files:
+        if class_limit is not None:
+            if class_limit <= 0:
+                raise ValueError("max_rows_per_class must be positive or null")
+            raise ValueError("dataset contains no rows")
         raise ValueError("no numeric feature columns were found")
-    class_limit = cfg.get("max_rows_per_class") if apply_sampling_caps else None
-    class_limit = int(class_limit) if class_limit is not None else None
     retained_uids, materialization_order = _select_class_uids(
         files,
         source,
