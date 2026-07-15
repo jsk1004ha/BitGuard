@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
 
 from .state import STAGE_ORDER
 from .types import BootstrapOptions
@@ -69,17 +69,24 @@ def parse_bootstrap_options(argv: list[str]) -> BootstrapOptions:
     return options_from_namespace(parser.parse_args(argv))
 
 
-def validation_report(args: argparse.Namespace, options: BootstrapOptions) -> dict[str, Any]:
-    return {
-        "status": "validated",
-        "scope": "bootstrap-options",
-        "message": "Bootstrap stages are not implemented yet; no data was acquired or trained.",
-        "inputs": {
-            "botiot_source": str(args.botiot_source)
-            if args.botiot_source is not None
-            else None,
-            "data_root": str(args.data_root),
-            "runs_root": str(args.runs_root),
+def run_from_namespace(
+    args: argparse.Namespace,
+    *,
+    runner: Callable[..., Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """Resolve validated options while preserving original path spellings."""
+
+    options = options_from_namespace(args)
+    if runner is None:
+        from .orchestrator import run_bootstrap
+
+        runner = run_bootstrap
+    result = runner(
+        options,
+        raw_inputs={
+            "botiot_source": args.botiot_source,
+            "data_root": args.data_root,
+            "runs_root": args.runs_root,
         },
-        "options": options.to_dict(),
-    }
+    )
+    return dict(result)

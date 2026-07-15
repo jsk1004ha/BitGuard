@@ -76,6 +76,28 @@ class ResourceRequestTests(unittest.TestCase):
         self.assertEqual(request.as_dict()["required_bytes"], 70)
         json.dumps(request.as_dict())
 
+    def test_fresh_download_reserves_full_partial_plus_verified_final(self):
+        inspection = inspect_local_archives([])
+
+        estimate = estimate_resources(
+            inspection,
+            final_download_bytes=100,
+            planned_partial_bytes=100,
+            extracted_bytes=0,
+            shards_bytes=0,
+            evaluation_bytes=0,
+            temporary_bytes=0,
+            reserve_bytes=0,
+        )
+
+        self.assertEqual(estimate.request.download, 100)
+        self.assertEqual(estimate.request.partial, 100)
+        self.assertEqual(estimate.request.required_bytes, 200)
+        self.assertEqual(
+            dict(estimate.estimate_sources)["partial_downloads"],
+            "planned_peak_minus_observed_local_files",
+        )
+
     def test_resource_sizes_reject_bool_negative_and_non_integer_values(self):
         invalid_values = (True, -1, 1.5, "1")
         for value in invalid_values:

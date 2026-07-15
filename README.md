@@ -50,6 +50,56 @@ python -m pip install -e .
 For CUDA, install the PyTorch build matching the local CUDA driver first, then
 run `python -m pip install -e .`. The project itself does not force a CUDA wheel.
 
+## Full-dataset source bootstrap
+
+On a fresh checkout, the platform wrapper creates the locked `.venv`, verifies
+compute and disk capacity, acquires the selected sources, safely extracts them,
+and writes resumable state plus a machine-readable report. Python 3.10-3.12 is
+required.
+
+Windows PowerShell:
+
+```powershell
+.\bootstrap.ps1 --full --prepare-only --botiot-source D:\Downloads\BoT-IoT --accept-botiot-academic-license
+```
+
+Linux shell:
+
+```bash
+./bootstrap.sh --full --prepare-only --botiot-source ~/Downloads/BoT-IoT --accept-botiot-academic-license
+```
+
+N-BaIoT is downloaded automatically only from the [official UCI dataset
+record](https://archive.ics.uci.edu/dataset/442/detection+of+iot+botnet+attacks+n+baiot).
+BoT-IoT is never downloaded automatically: review the [official UNSW project
+page](https://research.unsw.edu.au/projects/bot-iot-dataset), download the
+model-ready CSV distribution yourself, and supply its local directory, ZIP, or
+RAR. `--accept-botiot-academic-license` records your acknowledgement that you
+reviewed the terms; it does not grant or replace a license. Credential-bearing
+URLs are neither accepted nor persisted.
+
+PCAP capture acquisition and PCAP-to-flow conversion are excluded because this
+trainer consumes model-ready CSV features. Full CSV preparation and training
+can take many hours or days and require substantial disk. The acquisition
+preflight reserves a complete partial N-BaIoT download and a complete verified
+archive/snapshot (approximately 2x the archive), extraction space, metadata
+overhead, and a safety reserve. When remote size is unavailable, it uses a
+documented conservative 4 GiB archive estimate.
+
+At the current acquisition milestone, `--prepare-only` stops after schema
+inspection with `status: "sources_verified"`. Later out-of-core stages consume
+these immutable manifests. Resume is automatic; use `--restart-stage NAME` only
+after inspecting a reported failure. The final report is
+`data/.bitguard/bootstrap-report.json`.
+
+The filesystem safety boundary covers untrusted network/archive content and
+cooperative BitGuard writers inside a trusted workspace. Malicious
+same-account mutation of parent directory entries or hardlinks is outside that
+contract. Retained `.bitguard-retired-*` and `.bitguard-extract-*` artifacts are
+reported with apparent and inode-deduplicated byte counts and are never deleted
+automatically; inspect their link counts and active processes before manual
+cleanup.
+
 ## 2. End-to-end smoke run
 
 This path requires no external dataset and validates preprocessing, training,

@@ -400,6 +400,7 @@ def estimate_resources(
     inspection: ArchiveInspection,
     *,
     final_download_bytes: int,
+    planned_partial_bytes: int = 0,
     extracted_bytes: int,
     shards_bytes: int,
     evaluation_bytes: int,
@@ -412,6 +413,7 @@ def estimate_resources(
         raise TypeError("inspection must be an ArchiveInspection.")
     supplied = {
         "final_download_bytes": final_download_bytes,
+        "planned_partial_bytes": planned_partial_bytes,
         "extracted_bytes": extracted_bytes,
         "shards_bytes": shards_bytes,
         "evaluation_bytes": evaluation_bytes,
@@ -425,13 +427,21 @@ def estimate_resources(
             "The final download estimate cannot be smaller than files already observed: "
             f"final_download_bytes={checked['final_download_bytes']}, observed={observed}."
         )
+    remaining_planned_partial = (
+        inspection.total_partial_bytes
+        if checked["planned_partial_bytes"] == 0
+        else max(
+            0,
+            checked["planned_partial_bytes"] - inspection.total_partial_bytes,
+        )
+    )
     request = ResourceRequest(
         download=checked["final_download_bytes"],
         extracted=checked["extracted_bytes"],
         shards=checked["shards_bytes"],
         temporary=checked["temporary_bytes"],
         reserve=checked["reserve_bytes"],
-        partial=inspection.total_partial_bytes,
+        partial=remaining_planned_partial,
         evaluation=checked["evaluation_bytes"],
     )
     sources = (
@@ -441,7 +451,12 @@ def estimate_resources(
         ("evaluation_artifacts", "caller_supplied"),
         ("temporary_workspace", "caller_supplied"),
         ("reserve", "caller_supplied"),
-        ("partial_downloads", "observed_local_files"),
+        (
+            "partial_downloads",
+            "observed_local_files"
+            if checked["planned_partial_bytes"] == 0
+            else "planned_peak_minus_observed_local_files",
+        ),
     )
     return ResourceEstimate(request=request, inspection=inspection, estimate_sources=sources)
 

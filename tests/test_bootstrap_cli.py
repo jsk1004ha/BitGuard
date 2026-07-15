@@ -262,6 +262,10 @@ class BootstrapDispatchTest(unittest.TestCase):
     def test_bootstrap_report_preserves_raw_path_spellings_byte_for_byte(self):
         source, data_root, runs_root = self._noncanonical_paths()
         output = StringIO()
+
+        def fake_runner(_options, *, raw_inputs):
+            return {"status": "sources_verified", "inputs": raw_inputs}
+
         with redirect_stdout(output):
             main(
                 [
@@ -275,7 +279,8 @@ class BootstrapDispatchTest(unittest.TestCase):
                     data_root,
                     "--runs-root",
                     runs_root,
-                ]
+                ],
+                bootstrap_runner=fake_runner,
             )
 
         report = json.loads(output.getvalue())
@@ -288,8 +293,17 @@ class BootstrapDispatchTest(unittest.TestCase):
             },
         )
 
-    def test_valid_bootstrap_dispatch_reports_validation_without_mutation(self):
+    def test_valid_bootstrap_dispatch_delegates_to_injected_runner(self):
         output = StringIO()
+
+        def fake_runner(options, *, raw_inputs):
+            return {
+                "status": "sources_verified",
+                "scope": "verified-sources",
+                "options": options.to_dict(),
+                "inputs": raw_inputs,
+            }
+
         with redirect_stdout(output):
             status = main(
                 [
@@ -302,15 +316,30 @@ class BootstrapDispatchTest(unittest.TestCase):
                     "--install-system-tools",
                     "--restart-stage",
                     "inspect",
-                ]
+                ],
+                bootstrap_runner=fake_runner,
             )
 
         report = json.loads(output.getvalue())
         self.assertEqual(status, 0)
-        self.assertEqual(report["status"], "validated")
-        self.assertEqual(report["scope"], "bootstrap-options")
+        self.assertEqual(report["status"], "sources_verified")
+        self.assertEqual(report["scope"], "verified-sources")
         self.assertEqual(report["options"]["datasets"], ["nbaiot"])
         self.assertEqual(report["options"]["restart_stage"], "inspect")
+
+    def test_failed_bootstrap_report_returns_nonzero(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            status = main(
+                ["bootstrap", "--dataset", "nbaiot", "--prepare-only"],
+                bootstrap_runner=lambda *_args, **_kwargs: {
+                    "status": "failed",
+                    "failed_stage": "acquire",
+                },
+            )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(json.loads(output.getvalue())["failed_stage"], "acquire")
 
     def test_module_entrypoint_reports_bootstrap_semantic_error_without_traceback(self):
         environment = os.environ.copy()

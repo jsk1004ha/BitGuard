@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 
@@ -29,7 +30,7 @@ def _build_parser() -> argparse.ArgumentParser:
     replay = subparsers.add_parser("replay", help="rerun temporal/action simulation from predictions")
     replay.add_argument("--run", type=Path, required=True)
     bootstrap = subparsers.add_parser(
-        "bootstrap", help="validate dataset bootstrap options and official-source requirements"
+        "bootstrap", help="acquire, verify, and resume official dataset sources"
     )
     from .bootstrap.cli import add_bootstrap_arguments
 
@@ -38,18 +39,22 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int | None:
+def main(
+    argv: list[str] | None = None,
+    *,
+    bootstrap_runner: Callable[..., Mapping[str, object]] | None = None,
+) -> int | None:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "bootstrap":
-        from .bootstrap.cli import options_from_namespace, validation_report
+        from .bootstrap.cli import run_from_namespace
 
         try:
-            options = options_from_namespace(args)
+            report = run_from_namespace(args, runner=bootstrap_runner)
         except ValueError as exc:
             args._command_parser.error(str(exc))
-        print(json.dumps(validation_report(args, options), ensure_ascii=False))
-        return 0
+        print(json.dumps(report, ensure_ascii=False))
+        return 0 if report.get("status") != "failed" else 1
     if args.command == "make-demo":
         from .demo import generate_demo
 
