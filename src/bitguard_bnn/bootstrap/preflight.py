@@ -247,7 +247,19 @@ def _observe_regular_file(
         first_result = stat_fn(path)
     except FileNotFoundError as error:
         if allow_missing:
-            return None
+            try:
+                stat_fn(path)
+            except FileNotFoundError:
+                return None
+            except OSError as second_error:
+                raise ResourceProbeError(
+                    f"{kind.capitalize()} {path} changed during inspection: "
+                    f"{second_error}."
+                ) from second_error
+            raise ResourceProbeError(
+                f"{kind.capitalize()} {path} changed during inspection: "
+                "it appeared after initially being absent."
+            ) from error
         raise ResourceProbeError(f"Archive does not exist: {path}.") from error
     except OSError as error:
         raise ResourceProbeError(f"Cannot inspect {kind} {path}: {error}.") from error
@@ -645,11 +657,49 @@ def probe_nvidia_driver(
     )
 
 
-def choose_compute(requested: str, *, driver: DriverInfo, torch_cuda: bool) -> str:
+_CUDA_BUILD_PROFILES = {
+    (11, 8): "cu118",
+    (12, 4): "cu124",
+}
+
+
+def _profile_for_torch_cuda_build(torch_cuda_version: object) -> str:
+    if not isinstance(torch_cuda_version, str) or not torch_cuda_version.strip():
+        raise RuntimeError(
+            "CUDA profile verification failed: Torch CUDA build version is missing; "
+            "no CPU fallback was applied."
+        )
+    match = re.fullmatch(
+        r"(?P<major>[0-9]+)\.(?P<minor>[0-9]+)(?:\.[0-9]+)?",
+        torch_cuda_version.strip(),
+    )
+    if match is None:
+        raise RuntimeError(
+            "CUDA profile verification failed: malformed Torch CUDA build version "
+            f"{torch_cuda_version!r}; no CPU fallback was applied."
+        )
+    build = (int(match.group("major")), int(match.group("minor")))
+    try:
+        return _CUDA_BUILD_PROFILES[build]
+    except KeyError as error:
+        normalized = f"{build[0]}.{build[1]}"
+        raise RuntimeError(
+            "CUDA profile verification failed: unsupported Torch CUDA build "
+            f"{normalized}; expected 11.8 or 12.4 and no CPU fallback was applied."
+        ) from error
+
+
+def choose_compute(
+    requested: str,
+    *,
+    driver: DriverInfo,
+    torch_cuda: bool,
+    torch_cuda_version: str | None = None,
+) -> str:
     """Select compute without downgrading a detected CUDA failure.
 
-    ``cuda`` denotes the already-installed, verified CUDA build when ``auto`` has
-    no installer-profile hint; explicit ``cu118`` and ``cu124`` are preserved.
+    CUDA selections resolve only to the pinned ``cu118`` or ``cu124`` profile
+    matching the installed Torch CUDA build.
     """
 
     if requested not in {"auto", "cpu", "cu118", "cu124"}:
@@ -674,8 +724,15 @@ def choose_compute(requested: str, *, driver: DriverInfo, torch_cuda: bool) -> s
             "CUDA profile verification failed: an NVIDIA driver/GPU was detected but "
             "Torch CUDA is unavailable; no CPU fallback was applied."
         )
+    installed_profile = _profile_for_torch_cuda_build(torch_cuda_version)
     if requested == "auto":
-        return driver.cuda_profile or "cuda"
+        return installed_profile
+    if requested != installed_profile:
+        raise RuntimeError(
+            "CUDA profile verification failed: requested profile "
+            f"{requested} does not match Torch CUDA build {torch_cuda_version!r} "
+            f"({installed_profile}); no CPU fallback was applied."
+        )
     return requested
 
 
@@ -688,7 +745,7 @@ class TorchVerification:
     torch_cuda_version: str | None
 
     def __post_init__(self) -> None:
-        if self.selected_profile not in {"cpu", "cuda", "cu118", "cu124"}:
+        if self.selected_profile not in {"cpu", "cu118", "cu124"}:
             raise ValueError(f"Unknown selected_profile {self.selected_profile!r}.")
         for value, name in (
             (self.device, "device"),
@@ -720,7 +777,7 @@ def verify_torch_compute(
 ) -> TorchVerification:
     """Lazily smoke-test the selected Torch device with allocation, addition, and sync."""
 
-    if selected_profile not in {"cpu", "cuda", "cu118", "cu124"}:
+    if selected_profile not in {"cpu", "cu118", "cu124"}:
         raise ValueError(f"Unknown selected compute profile {selected_profile!r}.")
     if torch_module is None:
         import_module = importlib.import_module if importer is None else importer
@@ -763,6 +820,14 @@ def verify_torch_compute(
         if torch_cuda_version is None:
             raise RuntimeError(
                 "CUDA profile verification failed: Torch does not report a CUDA build version; "
+                "no CPU fallback was applied."
+            )
+        installed_profile = _profile_for_torch_cuda_build(torch_cuda_version)
+        if selected_profile != installed_profile:
+            raise RuntimeError(
+                "CUDA profile verification failed: selected profile "
+                f"{selected_profile} does not match Torch CUDA build "
+                f"{torch_cuda_version!r} ({installed_profile}); "
                 "no CPU fallback was applied."
             )
         device = "cuda:0"

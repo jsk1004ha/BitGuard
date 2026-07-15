@@ -179,6 +179,83 @@ class ArchiveInspectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ResourceProbeError, "partial.*not a regular file"):
             inspect_local_archives([archive])
 
+    def test_partial_appearing_during_absence_probe_fails_closed(self):
+        archive = (self.root / "archive.zip").resolve()
+        archive.write_bytes(b"archive")
+        partial = Path(f"{archive}.partial").resolve()
+        partial_calls = 0
+
+        def missing_then_present(path: Path):
+            nonlocal partial_calls
+            if path == archive:
+                return path.stat()
+            if path == partial:
+                partial_calls += 1
+                if partial_calls == 1:
+                    raise FileNotFoundError(path)
+                return SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o600,
+                    st_size=4,
+                    st_mtime_ns=1,
+                    st_dev=1,
+                    st_ino=2,
+                )
+            raise AssertionError(path)
+
+        with self.assertRaisesRegex(
+            ResourceProbeError, "Archive partial.*changed during inspection"
+        ):
+            inspect_local_archives([archive], stat_fn=missing_then_present)
+
+    def test_partial_disappearing_during_present_probe_fails_closed(self):
+        archive = (self.root / "archive.zip").resolve()
+        archive.write_bytes(b"archive")
+        partial = Path(f"{archive}.partial").resolve()
+        partial_calls = 0
+
+        def present_then_missing(path: Path):
+            nonlocal partial_calls
+            if path == archive:
+                return path.stat()
+            if path == partial:
+                partial_calls += 1
+                if partial_calls == 2:
+                    raise FileNotFoundError(path)
+                return SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o600,
+                    st_size=4,
+                    st_mtime_ns=1,
+                    st_dev=1,
+                    st_ino=2,
+                )
+            raise AssertionError(path)
+
+        with self.assertRaisesRegex(
+            ResourceProbeError, "Archive partial.*changed during inspection"
+        ):
+            inspect_local_archives([archive], stat_fn=present_then_missing)
+
+    def test_stable_partial_absence_requires_two_missing_observations(self):
+        archive = (self.root / "archive.zip").resolve()
+        archive.write_bytes(b"archive")
+        partial = Path(f"{archive}.partial").resolve()
+        partial_calls = 0
+
+        def stable_absence(path: Path):
+            nonlocal partial_calls
+            if path == archive:
+                return path.stat()
+            if path == partial:
+                partial_calls += 1
+                raise FileNotFoundError(path)
+            raise AssertionError(path)
+
+        inspection = inspect_local_archives([archive], stat_fn=stable_absence)
+
+        self.assertEqual(partial_calls, 2)
+        self.assertEqual(inspection.total_partial_bytes, 0)
+        self.assertIsNone(inspection.archives[0].partial_path)
+
     def test_changing_archive_observation_fails_closed(self):
         archive = (self.root / "changing.zip").resolve()
         archive.write_bytes(b"123")
@@ -391,7 +468,15 @@ class NvidiaProbeAndSelectionTests(unittest.TestCase):
 
     def test_explicit_cpu_is_preserved_even_when_gpu_exists(self):
         driver = DriverInfo(nvidia=True, device_name="GPU", memory_bytes=1024)
-        self.assertEqual(choose_compute("cpu", driver=driver, torch_cuda=True), "cpu")
+        self.assertEqual(
+            choose_compute(
+                "cpu",
+                driver=driver,
+                torch_cuda=True,
+                torch_cuda_version="12.1",
+            ),
+            "cpu",
+        )
 
     def test_auto_without_nvidia_selects_cpu(self):
         self.assertEqual(
@@ -405,15 +490,67 @@ class NvidiaProbeAndSelectionTests(unittest.TestCase):
             choose_compute("cu124", driver=DriverInfo(nvidia=True), torch_cuda=False)
 
     def test_successful_compute_selection_preserves_profiles(self):
-        driver = DriverInfo(nvidia=True, cuda_profile="cu124")
-        self.assertEqual(choose_compute("cu118", driver=driver, torch_cuda=True), "cu118")
-        self.assertEqual(choose_compute("cu124", driver=driver, torch_cuda=True), "cu124")
-        self.assertEqual(choose_compute("auto", driver=driver, torch_cuda=True), "cu124")
-
-    def test_auto_cuda_without_profile_returns_documented_cuda_device_selection(self):
+        driver = DriverInfo(nvidia=True)
         self.assertEqual(
-            choose_compute("auto", driver=DriverInfo(nvidia=True), torch_cuda=True), "cuda"
+            choose_compute(
+                "cu118",
+                driver=driver,
+                torch_cuda=True,
+                torch_cuda_version="11.8",
+            ),
+            "cu118",
         )
+        self.assertEqual(
+            choose_compute(
+                "cu124",
+                driver=driver,
+                torch_cuda=True,
+                torch_cuda_version="12.4",
+            ),
+            "cu124",
+        )
+
+    def test_auto_cuda_resolves_only_supported_pinned_profiles(self):
+        driver = DriverInfo(nvidia=True)
+        for build_version, expected in (("11.8", "cu118"), ("12.4", "cu124")):
+            with self.subTest(build_version=build_version):
+                self.assertEqual(
+                    choose_compute(
+                        "auto",
+                        driver=driver,
+                        torch_cuda=True,
+                        torch_cuda_version=build_version,
+                    ),
+                    expected,
+                )
+
+    def test_auto_cuda_rejects_missing_or_unsupported_torch_build(self):
+        driver = DriverInfo(nvidia=True)
+        for build_version in (None, "12.1"):
+            with self.subTest(build_version=build_version):
+                with self.assertRaisesRegex(
+                    RuntimeError, "CUDA profile verification failed"
+                ):
+                    choose_compute(
+                        "auto",
+                        driver=driver,
+                        torch_cuda=True,
+                        torch_cuda_version=build_version,
+                    )
+
+    def test_explicit_cuda_rejects_profile_build_mismatch_both_directions(self):
+        driver = DriverInfo(nvidia=True)
+        for requested, build_version in (("cu118", "12.4"), ("cu124", "11.8")):
+            with self.subTest(requested=requested, build_version=build_version):
+                with self.assertRaisesRegex(
+                    RuntimeError, "CUDA profile verification failed"
+                ):
+                    choose_compute(
+                        requested,
+                        driver=driver,
+                        torch_cuda=True,
+                        torch_cuda_version=build_version,
+                    )
 
     def test_unknown_compute_profile_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "requested compute profile"):
@@ -503,6 +640,30 @@ class TorchVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CUDA profile verification failed"):
             verify_torch_compute("cu124", torch_module=torch)
         self.assertEqual(torch.allocations, [])
+
+    def test_direct_cuda_verification_rejects_profile_build_mismatch(self):
+        for selected, build_version in (("cu118", "12.4"), ("cu124", "11.8")):
+            with self.subTest(selected=selected, build_version=build_version):
+                torch = _FakeTorch(cuda_available=True, cuda_build=build_version)
+                with self.assertRaisesRegex(
+                    RuntimeError, "CUDA profile verification failed"
+                ):
+                    verify_torch_compute(selected, torch_module=torch)
+                self.assertEqual(torch.allocations, [])
+
+    def test_generic_cuda_profile_is_rejected_as_ambiguous(self):
+        torch = _FakeTorch(cuda_available=True, cuda_build="12.4")
+        with self.assertRaisesRegex(ValueError, "selected compute profile"):
+            verify_torch_compute("cuda", torch_module=torch)
+
+    def test_cpu_verification_ignores_unsupported_cuda_build(self):
+        torch = _FakeTorch(cuda_available=True, cuda_build="12.1")
+
+        verification = verify_torch_compute("cpu", torch_module=torch)
+
+        self.assertEqual(verification.selected_profile, "cpu")
+        self.assertEqual(torch.allocations, [((1,), "cpu")])
+        self.assertFalse(torch.cuda.synchronized)
 
     def test_import_allocation_and_sync_failures_are_actionable(self):
         with self.assertRaisesRegex(RuntimeError, "Torch import failed.*not installed"):
