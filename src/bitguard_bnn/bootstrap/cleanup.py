@@ -148,6 +148,60 @@ def scan_cleanup_debt(roots: Iterable[Path | str]) -> dict[str, Any]:
         except OSError as error:
             scan_errors.append(_scan_error(root, f"scan failed: {error}"))
             continue
+        if root.name == "preparation-work":
+            generation_paths: list[Path] = []
+            for dataset_entry in children:
+                dataset_path = Path(dataset_entry.path)
+                try:
+                    dataset_stat = dataset_path.lstat()
+                except OSError as error:
+                    scan_errors.append(
+                        _scan_error(dataset_path, f"lstat failed: {error}")
+                    )
+                    continue
+                if _unsafe_link_or_reparse(dataset_stat):
+                    scan_errors.append(
+                        _scan_error(
+                            dataset_path,
+                            "preparation-work link or reparse point was not traversed",
+                        )
+                    )
+                    continue
+                if not stat.S_ISDIR(dataset_stat.st_mode):
+                    scan_errors.append(
+                        _scan_error(
+                            dataset_path,
+                            "preparation-work dataset entry is not a directory",
+                        )
+                    )
+                    continue
+                try:
+                    with os.scandir(dataset_path) as iterator:
+                        generation_paths.extend(
+                            Path(entry.path)
+                            for entry in sorted(iterator, key=lambda value: value.name)
+                        )
+                except OSError as error:
+                    scan_errors.append(
+                        _scan_error(dataset_path, f"scan failed: {error}")
+                    )
+            for candidate in generation_paths:
+                apparent, unique = _artifact_sizes(
+                    candidate,
+                    globally_seen=globally_seen,
+                    scan_errors=scan_errors,
+                )
+                apparent_total += apparent
+                unique_total += unique
+                artifacts.append(
+                    {
+                        "path": str(candidate),
+                        "kind": "preparation_work_generation",
+                        "apparent_bytes": apparent,
+                        "unique_bytes": unique,
+                    }
+                )
+            continue
         for entry in children:
             kind = _debt_kind(entry.name)
             if kind is None:

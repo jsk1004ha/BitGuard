@@ -7,6 +7,7 @@ import json
 import math
 import shutil
 import sqlite3
+import stat
 import tempfile
 import uuid
 from collections.abc import Callable, Sequence
@@ -17,6 +18,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..constants import KNOWN_LABELS
+from ..bootstrap.fsops import rename_directory_noreplace
 from ..preprocess import FeaturePreprocessor, IdentityScaler
 from .quantiles import PriorityRowSketch
 
@@ -283,6 +285,9 @@ class StreamingFeaturePreprocessor:
         quantile_seed: int,
         work_dir: Path | None = None,
     ) -> None:
+        self._audit_root: Path | None = None
+        self._audit_identity: tuple[int, int, int] | None = None
+        self._audit_connection: sqlite3.Connection | None = None
         self.config = config
         self.original_candidate_features = tuple(str(name) for name in candidate_features)
         if not self.original_candidate_features or len(set(self.original_candidate_features)) != len(
@@ -325,38 +330,63 @@ class StreamingFeaturePreprocessor:
 
         # Validate scientific configuration before allocating audit state.
         FeaturePreprocessor(config)
-        if work_dir is None:
-            self._audit_root = Path(
-                tempfile.mkdtemp(prefix="bitguard-preprocess-audit-")
+        try:
+            if work_dir is None:
+                self._audit_root = Path(
+                    tempfile.mkdtemp(prefix="bitguard-preprocess-audit-")
+                )
+            else:
+                audit_parent = Path(work_dir).expanduser().resolve()
+                audit_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if not audit_parent.is_dir() or audit_parent.is_symlink():
+                    raise RuntimeError(
+                        "preprocessing work_dir must be a regular directory: "
+                        f"{audit_parent}"
+                    )
+                for _attempt in range(16):
+                    candidate = audit_parent / (
+                        f"bitguard-preprocess-audit-{uuid.uuid4().hex}"
+                    )
+                    try:
+                        candidate.mkdir(mode=0o700)
+                    except FileExistsError:
+                        continue
+                    self._audit_root = candidate
+                    break
+                else:  # pragma: no cover - UUID collision exhaustion
+                    raise RuntimeError("unable to allocate preprocessing audit directory")
+            assert self._audit_root is not None
+            audit_stat = self._audit_root.lstat()
+            if (
+                stat.S_ISLNK(audit_stat.st_mode)
+                or bool(getattr(audit_stat, "st_reparse_tag", 0))
+                or not stat.S_ISDIR(audit_stat.st_mode)
+            ):
+                raise RuntimeError("preprocessing audit root changed type")
+            self._audit_identity = (
+                int(audit_stat.st_dev),
+                int(audit_stat.st_ino),
+                stat.S_IFMT(audit_stat.st_mode),
             )
-        else:
-            audit_parent = Path(work_dir).expanduser().resolve()
-            audit_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if not audit_parent.is_dir() or audit_parent.is_symlink():
-                raise RuntimeError(
-                    f"preprocessing work_dir must be a regular directory: {audit_parent}"
-                )
-            for _attempt in range(16):
-                candidate = audit_parent / (
-                    f"bitguard-preprocess-audit-{uuid.uuid4().hex}"
-                )
-                try:
-                    candidate.mkdir(mode=0o700)
-                except FileExistsError:
-                    continue
-                self._audit_root = candidate
-                break
-            else:  # pragma: no cover - UUID collision exhaustion
-                raise RuntimeError("unable to allocate preprocessing audit directory")
-        self._audit_connection: sqlite3.Connection | None = sqlite3.connect(
-            self._audit_root / "passes.sqlite3"
-        )
-        self._audit_connection.execute(
-            "CREATE TABLE pass_rows ("
-            "phase INTEGER NOT NULL, row_uid TEXT NOT NULL, label TEXT NOT NULL, "
-            "row_digest TEXT NOT NULL, PRIMARY KEY (phase, row_uid))"
-        )
-        self._audit_connection.commit()
+            self._audit_connection = sqlite3.connect(
+                self._audit_root / "passes.sqlite3"
+            )
+            self._audit_connection.execute(
+                "CREATE TABLE pass_rows ("
+                "phase INTEGER NOT NULL, row_uid TEXT NOT NULL, label TEXT NOT NULL, "
+                "row_digest TEXT NOT NULL, PRIMARY KEY (phase, row_uid))"
+            )
+            self._audit_connection.commit()
+        except BaseException as primary:
+            try:
+                self.close()
+            except BaseException as cleanup:
+                if hasattr(primary, "add_note"):
+                    primary.add_note(
+                        "preprocessing constructor cleanup failed: "
+                        f"{type(cleanup).__name__}: {cleanup}"
+                    )
+            raise
 
     def _require_state(self, expected: str) -> None:
         if self._state != expected:
@@ -992,8 +1022,51 @@ class StreamingFeaturePreprocessor:
         if self._audit_connection is not None:
             self._audit_connection.close()
             self._audit_connection = None
-        if self._audit_root.exists():
-            shutil.rmtree(self._audit_root)
+        if self._audit_root is None:
+            return
+        root = self._audit_root
+        expected = self._audit_identity
+        if expected is None:
+            raise RuntimeError("preprocessing audit root identity is unavailable")
+        try:
+            current = root.lstat()
+        except FileNotFoundError:
+            self._audit_root = None
+            self._audit_identity = None
+            return
+        actual = (
+            int(current.st_dev),
+            int(current.st_ino),
+            stat.S_IFMT(current.st_mode),
+        )
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or bool(getattr(current, "st_reparse_tag", 0))
+            or not stat.S_ISDIR(current.st_mode)
+            or actual != expected
+        ):
+            raise RuntimeError(
+                f"preprocessing audit root identity changed; preserved for recovery: {root}"
+            )
+        if not root.name.endswith(".cleanup"):
+            retired = root.with_name(f".{root.name}.{uuid.uuid4().hex}.cleanup")
+            rename_directory_noreplace(root, retired)
+            self._audit_root = retired
+            root = retired
+            moved = root.lstat()
+            moved_identity = (
+                int(moved.st_dev),
+                int(moved.st_ino),
+                stat.S_IFMT(moved.st_mode),
+            )
+            if moved_identity != expected or not stat.S_ISDIR(moved.st_mode):
+                raise RuntimeError(
+                    "preprocessing audit retirement changed identity; preserved at "
+                    f"{root}"
+                )
+        shutil.rmtree(root)
+        self._audit_root = None
+        self._audit_identity = None
 
     def __enter__(self) -> StreamingFeaturePreprocessor:
         if self._audit_connection is None:

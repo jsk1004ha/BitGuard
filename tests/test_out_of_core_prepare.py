@@ -5,11 +5,14 @@ import json
 import tempfile
 import unittest
 from dataclasses import replace
+from os import chdir, getcwd
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
+import pandas as pd
+import numpy as np
 
 from bitguard_bnn.bootstrap.inspect import inspect_csv_dataset
 from bitguard_bnn.bootstrap.manifest import build_source_manifest, write_source_manifest
@@ -239,6 +242,193 @@ class FullDatasetPreparationTests(unittest.TestCase):
                     work_dir=root / "different-work",
                 )
 
+    def test_generated_config_materializes_template_relative_runtime_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            config_dir = project / "configs" / "full"
+            config_dir.mkdir(parents=True)
+            payload = yaml.safe_load(
+                (
+                    Path(__file__).resolve().parents[1]
+                    / "configs"
+                    / "full"
+                    / "botiot.yaml"
+                ).read_text(encoding="utf-8")
+            )
+            payload["preprocess"]["feature_cost_csv"] = "costs/feature-costs.csv"
+            payload["experiment"]["output_dir"] = "runs/full"
+            template = config_dir / "botiot.yaml"
+            template.write_text(yaml.safe_dump(payload), encoding="utf-8")
+            costs = project / "costs" / "feature-costs.csv"
+            costs.parent.mkdir(parents=True)
+            costs.write_text("feature,cost\nbytes,2\nrate,1\n", encoding="utf-8")
+            raw = root / "raw"
+            _write_botiot(raw)
+            manifest, schema = _source_contract("botiot", raw, root)
+            original_cwd = getcwd()
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            try:
+                chdir(elsewhere)
+                from bitguard_bnn.out_of_core.prepare import prepare_full_dataset
+
+                prepared = prepare_full_dataset(
+                    template,
+                    raw_root=raw,
+                    source_manifest_path=manifest,
+                    schema_report_path=schema,
+                    output_dir=root / "prepared",
+                    descriptor_path=root / "control" / "botiot.json",
+                    work_dir=root / "work",
+                )
+            finally:
+                chdir(original_cwd)
+            resolved = load_config(prepared.resolved_config_path)
+            self.assertEqual(
+                Path(resolved["preprocess"]["feature_cost_csv"]), costs.resolve()
+            )
+            self.assertEqual(
+                Path(resolved["experiment"]["output_dir"]),
+                (project / "runs" / "full").resolve(),
+            )
+
+    def test_supplied_descriptor_link_is_rejected_before_resolution(self) -> None:
+        from bitguard_bnn.out_of_core.prepare import prepare_full_dataset
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw"
+            _write_botiot(raw)
+            manifest, schema = _source_contract("botiot", raw, root)
+            target = root / "foreign.json"
+            target.write_text("{}\n", encoding="utf-8")
+            descriptor = root / "descriptor.json"
+            try:
+                descriptor.symlink_to(target)
+            except OSError as error:
+                self.skipTest(f"file symlinks unavailable: {error}")
+            with self.assertRaisesRegex(RuntimeError, "descriptor.*link|link.*descriptor"):
+                prepare_full_dataset(
+                    Path(__file__).resolve().parents[1]
+                    / "configs"
+                    / "full"
+                    / "botiot.yaml",
+                    raw_root=raw,
+                    source_manifest_path=manifest,
+                    schema_report_path=schema,
+                    output_dir=root / "prepared",
+                    descriptor_path=descriptor,
+                    work_dir=root / "work",
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), "{}\n")
+
+    def test_standalone_fingerprint_binds_local_preparation_contract(self) -> None:
+        import bitguard_bnn.out_of_core.prepare as prepare_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self._prepare("botiot", root)
+            contract = prepare_module.preparation_implementation_contract()
+            changed = {**contract, "algorithm": "injected-new-science"}
+            with (
+                patch.object(
+                    prepare_module,
+                    "preparation_implementation_contract",
+                    return_value=changed,
+                ),
+                self.assertRaisesRegex(RuntimeError, "preparation_fingerprint"),
+            ):
+                self._prepare("botiot", root)
+            self.assertEqual(first, prepare_module.verify_prepared_dataset(first.descriptor_path))
+
+    def test_preparation_contract_invalidates_on_transitive_science_change(self) -> None:
+        import bitguard_bnn.constants as constants_module
+        import bitguard_bnn.out_of_core.prepare as prepare_module
+
+        baseline = prepare_module.preparation_implementation_contract()
+        implementations = baseline["implementations"]
+        self.assertIsInstance(implementations, dict)
+        self.assertTrue(
+            {
+                "bitguard_bnn.constants",
+                "bitguard_bnn.preprocess",
+                "bitguard_bnn.config",
+                "bitguard_bnn.out_of_core.common",
+                "bitguard_bnn.bootstrap.registry",
+                "bitguard_bnn.bootstrap.inspect",
+                "bitguard_bnn.bootstrap.manifest",
+            }.issubset(implementations)
+        )
+        constants_path = Path(str(constants_module.__file__)).resolve()
+        real_digest = prepare_module._sha256_file
+
+        def changed_digest(path: Path) -> str:
+            if path.resolve() == constants_path:
+                return "0" * 64
+            return real_digest(path)
+
+        with patch.object(
+            prepare_module, "_sha256_file", side_effect=changed_digest
+        ):
+            changed = prepare_module.preparation_implementation_contract()
+        self.assertNotEqual(changed, baseline)
+
+    def test_json_publication_never_replaces_concurrent_conflict(self) -> None:
+        import bitguard_bnn.out_of_core.prepare as prepare_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "artifact.json"
+            real_link = prepare_module.os.link
+
+            def collide(source: object, destination: object, *args: object, **kwargs: object) -> None:
+                Path(destination).write_text('{"winner":"other"}\n', encoding="utf-8")
+                raise FileExistsError(str(destination))
+
+            with (
+                patch.object(prepare_module.os, "link", side_effect=collide),
+                self.assertRaisesRegex(RuntimeError, "immutable JSON artifact conflict"),
+            ):
+                prepare_module._publish_json_immutable(target, {"winner": "ours"})
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"winner":"other"}\n')
+            self.assertIsNotNone(real_link)
+
+    def test_preprocessor_publication_reuses_concurrent_equivalent_without_replace(
+        self,
+    ) -> None:
+        import bitguard_bnn.out_of_core.prepare as prepare_module
+        from bitguard_bnn.preprocess import FeaturePreprocessor
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepared = self._prepare("botiot", root)
+            original = Path(prepared.preprocessor_path).read_bytes()
+            processor = FeaturePreprocessor.load(prepared.preprocessor_path)
+            sample = pd.DataFrame(
+                np.zeros((2, len(processor.selected_features))),
+                columns=processor.selected_features,
+            )
+            target = root / "concurrent-preprocessor.joblib"
+
+            def collide(
+                _source: object,
+                destination: object,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                Path(destination).write_bytes(original)
+                raise FileExistsError(str(destination))
+
+            with patch.object(prepare_module.os, "link", side_effect=collide):
+                published, digest = prepare_module._publish_preprocessor(
+                    processor, sample, target
+                )
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(
+                published.feature_manifest(), processor.feature_manifest()
+            )
+            self.assertEqual(digest, hashlib.sha256(original).hexdigest())
+
     def test_disk_layout_groups_work_and_output_bytes_by_actual_device(self) -> None:
         from bitguard_bnn.bootstrap.orchestrator import (
             _group_preparation_disk_requirements,
@@ -383,7 +573,7 @@ class BootstrapPreparationStageTests(unittest.TestCase):
                 side_effect=counting_regular_digest,
             ):
                 first = run_bootstrap(options, dependencies=dependencies)
-            self.assertEqual(template_digest_calls, 1)
+            self.assertEqual(template_digest_calls, 2)
             self.assertEqual(first["status"], "prepared", msg=first.get("error"))
             self.assertEqual(first["last_completed_stage"], "validate")
             self.assertEqual(first["next_stage"], "train")
@@ -407,7 +597,7 @@ class BootstrapPreparationStageTests(unittest.TestCase):
                 ["preflight", "environment", "acquire", "extract", "inspect", "shard"],
             )
             self.assertEqual(second["executed_stages"], ["validate"])
-            self.assertEqual(len(verification_calls), 2)
+            self.assertEqual(len(verification_calls), 3)
             self.assertEqual(len(preparation_calls), 1)
             first_descriptor, first_output, first_work = preparation_calls[0]
             first_bytes = first_descriptor.read_bytes()
@@ -443,6 +633,83 @@ class BootstrapPreparationStageTests(unittest.TestCase):
             )
             self.assertEqual(preparation_calls[-1][0], changed_descriptor)
             self.assertEqual(first_descriptor.read_bytes(), first_bytes)
+
+    def test_shard_stage_rehash_rejects_mid_run_template_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "official-botiot"
+            _write_botiot(source)
+
+            def prepare(_config: Path, **kwargs: object) -> object:
+                descriptor = Path(str(kwargs["descriptor_path"]))
+                descriptor.parent.mkdir(parents=True, exist_ok=True)
+                descriptor.write_text(
+                    json.dumps(
+                        {"dataset": "botiot", "generation": descriptor.stem},
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(descriptor_path=str(descriptor))
+
+            dependencies = BootstrapDependencies(
+                available_bytes=10**12,
+                compute_resolver=lambda requested: {
+                    "requested": requested,
+                    "selected_profile": "cpu",
+                    "device": "cpu",
+                },
+                preparer=prepare,
+                prepared_verifier=lambda descriptor: SimpleNamespace(
+                    descriptor_path=str(descriptor)
+                ),
+            )
+            options = BootstrapOptions(
+                datasets=("botiot",),
+                botiot_source=source.resolve(),
+                data_root=(root / "data").resolve(),
+                runs_root=(root / "runs").resolve(),
+                compute="cpu",
+                prepare_only=True,
+                install_system_tools=False,
+                accepted_botiot_license=True,
+                restart_stage=None,
+            )
+            import bitguard_bnn.bootstrap.orchestrator as orchestrator_module
+
+            template = (
+                Path(__file__).resolve().parents[1]
+                / "configs"
+                / "full"
+                / "botiot.yaml"
+            ).resolve()
+            real_digest = orchestrator_module._regular_digest
+            template_calls = 0
+
+            def drifting_digest(path: Path) -> tuple[str, int]:
+                nonlocal template_calls
+                digest, size = real_digest(path)
+                if path.resolve() == template:
+                    template_calls += 1
+                    if template_calls >= 2:
+                        return "f" * 64, size
+                return digest, size
+
+            with patch.object(
+                orchestrator_module, "_regular_digest", side_effect=drifting_digest
+            ):
+                report = run_bootstrap(options, dependencies=dependencies)
+
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["failed_stage"], "shard")
+            self.assertIn("inputs changed", str(report["error"]))
+            state = json.loads(
+                (root / "data" / ".bitguard" / "bootstrap-state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertNotIn("shard", state["stages"])
 
 
 if __name__ == "__main__":

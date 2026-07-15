@@ -134,6 +134,72 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
         self.assertEqual(persisted, report)
 
+    def test_partial_all_dataset_restart_counts_only_strictly_verified_pending_space(
+        self,
+    ) -> None:
+        calls: list[str] = []
+        descriptors: dict[str, Path] = {}
+        fail_botiot = True
+
+        def prepare(_config: Path, **kwargs: object) -> object:
+            nonlocal fail_botiot
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            dataset = descriptor.parent.name
+            calls.append(dataset)
+            if dataset == "botiot" and fail_botiot:
+                fail_botiot = False
+                raise RuntimeError("injected botiot preparation interruption")
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text(
+                json.dumps({"dataset": dataset, "valid": True}) + "\n",
+                encoding="utf-8",
+            )
+            descriptors[dataset] = descriptor
+            return SimpleNamespace(descriptor_path=str(descriptor))
+
+        def verify(descriptor: Path) -> object:
+            payload = json.loads(descriptor.read_text(encoding="utf-8"))
+            if payload.get("valid") is not True:
+                raise RuntimeError("invalid prepared generation")
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "dataset": payload["dataset"],
+                    "descriptor_path": str(descriptor),
+                }
+            )
+
+        first_dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=verify,
+        )
+        first = run_bootstrap(self.options, dependencies=first_dependencies)
+        self.assertEqual(first["failed_stage"], "shard")
+        self.assertEqual(calls, ["nbaiot", "botiot"])
+
+        nbaiot_descriptor = descriptors["nbaiot"]
+        valid_bytes = nbaiot_descriptor.read_bytes()
+        nbaiot_descriptor.write_text('{"valid":false}\n', encoding="utf-8")
+        finite_dependencies = replace(
+            first_dependencies, preparation_available_bytes=20_000
+        )
+        invalid = run_bootstrap(self.options, dependencies=finite_dependencies)
+        self.assertEqual(invalid["failed_stage"], "shard")
+        self.assertIn("invalid prepared generation", str(invalid["error"]))
+        self.assertEqual(calls, ["nbaiot", "botiot"])
+
+        nbaiot_descriptor.write_bytes(valid_bytes)
+        restarted = run_bootstrap(self.options, dependencies=finite_dependencies)
+        self.assertEqual(restarted["status"], "prepared", msg=restarted.get("error"))
+        self.assertEqual(calls, ["nbaiot", "botiot", "botiot"])
+        disk = json.loads(
+            (self.data_root / ".bitguard" / "preparation.json").read_text(
+                encoding="utf-8"
+            )
+        )["disk"]
+        self.assertEqual(disk["pending_datasets"], ["botiot"])
+        self.assertEqual(disk["excluded_verified_datasets"], ["nbaiot"])
+
     def test_stage_record_has_name_signature_and_run(self) -> None:
         stage = Stage("inspect", lambda: "signature", lambda: ())
         self.assertEqual(stage.name, "inspect")
@@ -1623,6 +1689,33 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
 
 
 class CleanupDebtTest(unittest.TestCase):
+    def test_scan_reports_incomplete_preparation_generation_without_following_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "preparation-work"
+            generation = root / "botiot" / "generation-1"
+            generation.mkdir(parents=True)
+            (generation / "passes.sqlite3").write_bytes(b"audit")
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            (outside / "secret.bin").write_bytes(b"secret")
+            linked = root / "nbaiot"
+            link_created = True
+            try:
+                linked.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                link_created = False
+
+            report = scan_cleanup_debt((root,))
+
+            self.assertEqual(
+                [(Path(item["path"]), item["kind"]) for item in report["artifacts"]],
+                [(generation, "preparation_work_generation")],
+            )
+            self.assertEqual(report["apparent_bytes"], 5)
+            self.assertEqual(report["unique_bytes"], 5)
+            if link_created:
+                self.assertIn(str(linked), json.dumps(report["scan_errors"]))
+
     def test_scan_reports_apparent_and_inode_deduplicated_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

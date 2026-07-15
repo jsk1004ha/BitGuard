@@ -268,6 +268,60 @@ def _builder_for_method(
 
 
 class OutOfCorePreprocessTests(unittest.TestCase):
+    def test_constructor_removes_audit_root_when_sqlite_connect_fails(self) -> None:
+        frame, features = _frame(12)
+        del frame
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "preparation-work"
+            with (
+                patch.object(
+                    out_of_core_preprocess.sqlite3,
+                    "connect",
+                    side_effect=sqlite3.OperationalError("injected connect failure"),
+                ),
+                self.assertRaisesRegex(sqlite3.OperationalError, "connect failure"),
+            ):
+                StreamingFeaturePreprocessor(
+                    _config(),
+                    candidate_features=features,
+                    split_fingerprint="split-v1",
+                    expected_train_rows=12,
+                    quantile_capacity=12,
+                    quantile_seed=1,
+                    work_dir=work,
+                )
+            self.assertEqual(list(work.iterdir()), [])
+
+    def test_constructor_removes_audit_root_when_schema_commit_fails(self) -> None:
+        _frame_value, features = _frame(12)
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "preparation-work"
+            real_connect = sqlite3.connect
+
+            def failing_connect(*args: Any, **kwargs: Any) -> _FailingAuditConnection:
+                return _FailingAuditConnection(
+                    real_connect(*args, **kwargs), "commit"
+                )
+
+            with (
+                patch.object(
+                    out_of_core_preprocess.sqlite3,
+                    "connect",
+                    side_effect=failing_connect,
+                ),
+                self.assertRaisesRegex(sqlite3.OperationalError, "commit failure"),
+            ):
+                StreamingFeaturePreprocessor(
+                    _config(),
+                    candidate_features=features,
+                    split_fingerprint="split-v1",
+                    expected_train_rows=12,
+                    quantile_capacity=12,
+                    quantile_seed=1,
+                    work_dir=work,
+                )
+            self.assertEqual(list(work.iterdir()), [])
+
     def test_supplied_work_dir_owns_public_audit_lifecycle(self) -> None:
         frame, features = _frame(12)
         with tempfile.TemporaryDirectory() as temporary:
@@ -825,11 +879,16 @@ class OutOfCorePreprocessTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(OSError, "cleanup failure"):
                 builder.finalize()
-            self.assertTrue(audit_root.exists())
+            retained_root = builder._audit_root
+            self.assertIsNotNone(retained_root)
+            assert retained_root is not None
+            self.assertNotEqual(retained_root, audit_root)
+            self.assertTrue(retained_root.exists())
             result = builder.finalize()
 
         self.assertTrue(result.fitted)
         self.assertFalse(audit_root.exists())
+        self.assertFalse(retained_root.exists())
         self.assertEqual(attempts, 2)
 
     def test_state_machine_rejects_nontrain_unknown_duplicate_and_wrong_proof(self) -> None:

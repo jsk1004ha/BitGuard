@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import sqlite3
+import stat
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,7 +26,6 @@ from bitguard_bnn.out_of_core.manifest import (
     manifest_path_for_membership,
     read_split_manifest,
     stable_fingerprint,
-    write_json_atomic,
 )
 from bitguard_bnn.out_of_core.preprocess import StreamingFeaturePreprocessor
 from bitguard_bnn.out_of_core.shard import (
@@ -183,15 +184,106 @@ def _fsync_directory(path: Path) -> None:
 
 def _publish_json_immutable(path: Path, payload: Mapping[str, Any]) -> None:
     encoded = canonical_json_bytes(dict(payload)) + b"\n"
-    if path.exists():
-        if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if _link_file_noreplace(temporary, path):
+            _fsync_directory(path.parent)
+            return
+        if _sha256_file(path) != hashlib.sha256(encoded).hexdigest() or (
+            path.read_bytes() != encoded
+        ):
             raise RuntimeError(f"immutable JSON artifact conflict: {path}")
-        return
-    write_json_atomic(path, payload)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _link_file_noreplace(source: Path, destination: Path) -> bool:
+    """Atomically publish a complete same-volume file without replacement."""
+
+    before = source.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"publication candidate is not a regular file: {source}")
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    published = destination.lstat()
+    if (
+        stat.S_ISLNK(published.st_mode)
+        or not stat.S_ISREG(published.st_mode)
+        or (published.st_dev, published.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise RuntimeError(f"published artifact identity changed: {destination}")
+    return True
 
 
 def _clean_config(config: Mapping[str, Any]) -> dict[str, Any]:
     return {name: value for name, value in config.items() if not name.startswith("_")}
+
+
+def _materialize_runtime_paths(config: dict[str, Any]) -> dict[str, Any]:
+    """Freeze every runtime path currently consumed through ``resolve_path``."""
+
+    resolved = _clean_config(config)
+    for section, field in (
+        ("experiment", "output_dir"),
+        ("preprocess", "feature_cost_csv"),
+        ("training", "resume_from"),
+        ("dataset", "cross_path"),
+    ):
+        value = config.get(section, {}).get(field)
+        if value is None:
+            continue
+        absolute = resolve_path(config, value)
+        if absolute is None:  # pragma: no cover - guarded by value above
+            continue
+        section_payload = dict(resolved.get(section, {}))
+        section_payload[field] = str(absolute)
+        resolved[section] = section_payload
+    return resolved
+
+
+def preparation_implementation_contract() -> dict[str, object]:
+    """Fingerprint scientific code used by standalone and bootstrap preparation."""
+
+    module_names = (
+        "bitguard_bnn.constants",
+        "bitguard_bnn.preprocess",
+        "bitguard_bnn.config",
+        "bitguard_bnn.out_of_core.common",
+        "bitguard_bnn.out_of_core.prepare",
+        "bitguard_bnn.out_of_core.source",
+        "bitguard_bnn.out_of_core.split",
+        "bitguard_bnn.out_of_core.quantiles",
+        "bitguard_bnn.out_of_core.preprocess",
+        "bitguard_bnn.out_of_core.shard",
+        "bitguard_bnn.bootstrap.registry",
+        "bitguard_bnn.bootstrap.inspect",
+        "bitguard_bnn.bootstrap.manifest",
+    )
+    implementations: dict[str, str] = {}
+    for name in module_names:
+        module = importlib.import_module(name)
+        module_path = Path(str(module.__file__ or ""))
+        implementations[name] = _sha256_file(module_path)
+    return {
+        "algorithm": PREPARATION_ALGORITHM,
+        "implementations": implementations,
+    }
+
+
+def _reject_supplied_link(path: Path, subject: str) -> None:
+    try:
+        result = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(result.st_mode) or bool(getattr(result, "st_reparse_tag", 0)):
+        raise RuntimeError(f"supplied {subject} must not be a link or reparse point: {path}")
 
 
 def _validate_full_config(config: Mapping[str, Any]) -> None:
@@ -450,7 +542,7 @@ def _publish_preprocessor(
         expected = processor.transform(sample)
         if not np.array_equal(candidate.transform(sample), expected):
             raise RuntimeError("preprocessor joblib reload transform parity failed")
-        if path.exists():
+        if not _link_file_noreplace(temporary, path):
             if path.is_symlink() or not path.is_file():
                 raise RuntimeError("existing preprocessor is not a regular file")
             existing = FeaturePreprocessor.load(path)
@@ -461,9 +553,11 @@ def _publish_preprocessor(
             ):
                 raise RuntimeError("immutable preprocessor artifact conflict")
             return existing, _sha256_file(path)
-        os.replace(temporary, path)
         _fsync_directory(path.parent)
-        return candidate, _sha256_file(path)
+        published = FeaturePreprocessor.load(path)
+        if not np.array_equal(published.transform(sample), expected):
+            raise RuntimeError("published preprocessor transform parity failed")
+        return published, _sha256_file(path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -598,7 +692,9 @@ def _validate_source_contract_against_disk(
 
 
 def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
-    path = Path(descriptor_path).resolve(strict=True)
+    supplied = Path(descriptor_path).expanduser()
+    _reject_supplied_link(supplied, "prepared descriptor")
+    path = supplied.resolve(strict=True)
     prepared = PreparedDataset.from_dict(
         path, _read_json(path, "prepared dataset descriptor")
     )
@@ -724,11 +820,13 @@ def prepare_full_dataset(
         if output_dir is not None
         else configured_manifest.parent.resolve()
     )
-    descriptor = (
-        Path(descriptor_path).expanduser().resolve()
+    supplied_descriptor = (
+        Path(descriptor_path).expanduser()
         if descriptor_path is not None
         else output / "prepared_dataset.json"
     )
+    _reject_supplied_link(supplied_descriptor, "prepared descriptor")
+    descriptor = supplied_descriptor.resolve()
     work = (
         Path(work_dir).expanduser().resolve()
         if work_dir is not None
@@ -750,6 +848,7 @@ def prepare_full_dataset(
             "output_dir": str(output),
             "work_dir": str(work),
             "caller_signature": preparation_signature,
+            "implementation_contract": preparation_implementation_contract(),
         }
     )
     if descriptor.exists():
@@ -780,7 +879,7 @@ def prepare_full_dataset(
         raise RuntimeError("source manifest dataset does not match full config")
 
     resolved_config = output / "resolved_config.yaml"
-    resolved_payload = _clean_config(config)
+    resolved_payload = _materialize_runtime_paths(config)
     resolved_dataset = dict(resolved_payload["dataset"])
     resolved_dataset["path"] = str(source_root)
     resolved_dataset["storage"] = "parquet"

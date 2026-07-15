@@ -151,6 +151,7 @@ class BootstrapDependencies:
     nbaiot_archive: Path | None = None
     nbaiot_download_size: int | None = None
     available_bytes: int | None = None
+    preparation_available_bytes: int | None = None
     downloader: Callable[..., DownloadResult] = download_file
     zip_extractor: Callable[..., ExtractionResult] = extract_zip
     rar_extractor: Callable[..., ExtractionResult] = extract_rar
@@ -1947,9 +1948,9 @@ def run_bootstrap(
                 preparation_signature_cache: dict[str, str] = {}
                 preparation_contract_cache: dict[str, object] | None = None
 
-                def preparation_contract() -> dict[str, object]:
+                def preparation_contract(*, refresh: bool = False) -> dict[str, object]:
                     nonlocal preparation_contract_cache
-                    if preparation_contract_cache is not None:
+                    if preparation_contract_cache is not None and not refresh:
                         return preparation_contract_cache
                     from bitguard_bnn.out_of_core import (
                         prepare as prepare_module,
@@ -1960,20 +1961,8 @@ def run_bootstrap(
                         split as split_module,
                     )
 
-                    implementations = {
-                        name: _regular_digest(Path(module.__file__ or ""))[0]
-                        for name, module in {
-                            "prepare": prepare_module,
-                            "source": source_module,
-                            "split": split_module,
-                            "quantiles": quantiles_module,
-                            "preprocess": preprocess_module,
-                            "shard": shard_module,
-                        }.items()
-                    }
-
-                    preparation_contract_cache = {
-                        "algorithm": prepare_module.PREPARATION_ALGORITHM,
+                    contract = {
+                        **prepare_module.preparation_implementation_contract(),
                         "algorithm_versions": {
                             "source_normalization": "bitguard.normalization-signature.v1",
                             "split": split_module.SPLIT_ALGORITHM,
@@ -1986,15 +1975,21 @@ def run_bootstrap(
                             "shard": shard_module.SHARD_ALGORITHM,
                             "coverage": shard_module.COVERAGE_ALGORITHM,
                         },
-                        "implementations": implementations,
                         "dependency_token": deps.preparation_signature_token,
                         "environment": _regular_digest(environment_path)[0],
                     }
-                    return preparation_contract_cache
+                    if not refresh:
+                        preparation_contract_cache = contract
+                    return contract
 
-                def dataset_preparation_signature(dataset: str) -> str:
+                def dataset_preparation_signature(
+                    dataset: str,
+                    *,
+                    refresh: bool = False,
+                    contract: Mapping[str, object] | None = None,
+                ) -> str:
                     cached = preparation_signature_cache.get(dataset)
-                    if cached is not None:
+                    if cached is not None and not refresh:
                         return cached
                     signature = _json_signature(
                         {
@@ -2007,16 +2002,28 @@ def run_bootstrap(
                                 "schema": _regular_digest(Path(schemas[dataset]))[0],
                                 "config": _regular_digest(full_config_path(dataset))[0],
                             },
-                            "contract": preparation_contract(),
+                            "contract": (
+                                contract
+                                if contract is not None
+                                else preparation_contract(refresh=refresh)
+                            ),
                         }
                     )
-                    preparation_signature_cache[dataset] = signature
+                    if not refresh:
+                        preparation_signature_cache[dataset] = signature
                     return signature
 
-                def preparation_signature() -> str:
+                def preparation_signature(*, refresh: bool = False) -> str:
+                    refreshed_contract = (
+                        preparation_contract(refresh=True) if refresh else None
+                    )
                     return _json_signature(
                         {
-                            dataset: dataset_preparation_signature(dataset)
+                            dataset: dataset_preparation_signature(
+                                dataset,
+                                refresh=refresh,
+                                contract=refreshed_contract,
+                            )
                             for dataset in options.datasets
                         }
                     )
@@ -2027,11 +2034,35 @@ def run_bootstrap(
                 def preparation_disk_requirements() -> dict[str, object]:
                     from bitguard_bnn.out_of_core.prepare import (
                         estimate_preparation_disk,
+                        verify_prepared_dataset,
                     )
+
+                    verifier = deps.prepared_verifier or verify_prepared_dataset
+                    pending: list[str] = []
+                    verified_existing: list[str] = []
+                    for dataset in options.datasets:
+                        descriptor = prepared_descriptor_path(dataset)
+                        try:
+                            descriptor_stat = descriptor.lstat()
+                        except FileNotFoundError:
+                            pending.append(dataset)
+                            continue
+                        if (
+                            stat.S_ISLNK(descriptor_stat.st_mode)
+                            or bool(getattr(descriptor_stat, "st_reparse_tag", 0))
+                            or not stat.S_ISREG(descriptor_stat.st_mode)
+                        ):
+                            raise RuntimeError(
+                                "existing prepared descriptor is not a regular file: "
+                                f"{descriptor}"
+                            )
+                        verifier(descriptor)
+                        prepared_datasets[dataset] = str(descriptor)
+                        verified_existing.append(dataset)
 
                     estimate_objects: dict[str, object] = {}
                     estimates: dict[str, dict[str, int]] = {}
-                    for dataset in options.datasets:
+                    for dataset in pending:
                         estimate = estimate_preparation_disk(
                             Path(manifests[dataset]),
                             Path(schemas[dataset]),
@@ -2057,7 +2088,9 @@ def run_bootstrap(
                         probe = _existing_parent(Path(str(group["path"])))
                         group["path"] = str(probe)
                         available_bytes = (
-                            deps.available_bytes
+                            deps.preparation_available_bytes
+                            if deps.preparation_available_bytes is not None
+                            else deps.available_bytes
                             if deps.available_bytes is not None
                             else shutil.disk_usage(probe).free
                         )
@@ -2074,6 +2107,8 @@ def run_bootstrap(
                         "device_groups": {
                             str(device): value for device, value in sorted(groups.items())
                         },
+                        "pending_datasets": pending,
+                        "excluded_verified_datasets": verified_existing,
                     }
 
                 preparation_disk: dict[str, object] = {}
@@ -2088,8 +2123,15 @@ def run_bootstrap(
                     _ensure_durable_directory(preparation_work_root)
                     preparer = deps.preparer or prepare_full_dataset
                     outputs: list[Path] = []
+                    pending = set(
+                        cast(Sequence[str], preparation_disk["pending_datasets"])
+                    )
                     for dataset in options.datasets:
                         descriptor = prepared_descriptor_path(dataset)
+                        if dataset not in pending:
+                            prepared_datasets[dataset] = str(descriptor)
+                            outputs.append(descriptor)
+                            continue
                         generation = preparation_generation(dataset)
                         preparer(
                             full_config_path(dataset),
@@ -2231,7 +2273,7 @@ def run_bootstrap(
                 )
                 if preparation_enabled:
                     stages += (
-                        Stage("shard", preparation_signature, run_shard),
+                        Stage("shard", lambda: preparation_signature(), run_shard),
                         Stage(
                             "validate",
                             validate_signature,
@@ -2250,7 +2292,15 @@ def run_bootstrap(
                         if not reusable:
                             state.invalidate_from(stage.name, STAGE_ORDER)
                         outputs = tuple(stage.run())
-                        state.complete(stage.name, stage.input_signature(), outputs)
+                        completion_signature = stage.input_signature()
+                        if stage.name == "shard":
+                            completion_signature = preparation_signature(refresh=True)
+                            if completion_signature != signature:
+                                raise RuntimeError(
+                                    "full-data preparation inputs changed while the "
+                                    "shard stage was running"
+                                )
+                        state.complete(stage.name, completion_signature, outputs)
                         executed.append(stage.name)
                     last_completed = stage.name
                     if stage.name == "environment" and compute is None:
