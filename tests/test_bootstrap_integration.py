@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from bitguard_bnn.bootstrap.cleanup import scan_cleanup_debt
-from bitguard_bnn.bootstrap.download import download_file
+from bitguard_bnn.bootstrap.download import DownloadResult, download_file
 from bitguard_bnn.bootstrap.extract import extract_zip
 from bitguard_bnn.bootstrap.inspect import inspect_csv_dataset
 from bitguard_bnn.bootstrap.orchestrator import (
@@ -119,6 +122,8 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
                 "acquisition",
                 "extraction",
                 "schemas",
+                "acquisition_journals",
+                "extraction_journals",
             },
         )
         self.assertEqual(report["reports"]["bootstrap"], report["report_path"])
@@ -164,7 +169,9 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
 
         second_zip = Mock(side_effect=AssertionError("ZIP extraction must be reused"))
         second_inspector = Mock(side_effect=AssertionError("inspection must be reused"))
-        second_download = Mock(side_effect=AssertionError("HTTP download must be reused"))
+        second_download = Mock(
+            side_effect=AssertionError("HTTP download must be reused")
+        )
         second = run_bootstrap(
             self.options,
             dependencies=self.dependencies(
@@ -199,8 +206,323 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertIn("acquire", rerun["executed_stages"])
         self.assertIn("extract", rerun["executed_stages"])
         self.assertIn("inspect", rerun["executed_stages"])
-        schema = json.loads(Path(rerun["schema_reports"]["botiot"]).read_text(encoding="utf-8"))
+        schema = json.loads(
+            Path(rerun["schema_reports"]["botiot"]).read_text(encoding="utf-8")
+        )
         self.assertEqual(schema["accepted_rows"], 2)
+
+    def test_acquisition_journal_reuses_first_dataset_after_later_failure(self) -> None:
+        download_calls: list[Path] = []
+
+        def local_download(url, destination, **_kwargs):
+            destination = Path(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            payload = self.nbaiot_archive.read_bytes()
+            destination.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            download_calls.append(destination)
+            return DownloadResult(
+                destination=str(destination),
+                byte_size=len(payload),
+                sha256=digest,
+                resumed=False,
+                restarted=False,
+                reused=False,
+                source_url=url,
+                final_response_url=url,
+            )
+
+        dependencies = BootstrapDependencies(
+            nbaiot_download_size=self.nbaiot_archive.stat().st_size,
+            available_bytes=10**12,
+            compute_resolver=self.dependencies().compute_resolver,
+            downloader=local_download,
+        )
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        real_copy_tree = orchestrator_module._copy_tree
+
+        def fail_botiot_copy(source, destination, expected_digest):
+            if Path(source) == self.botiot_source.resolve():
+                raise RuntimeError("injected BoT-IoT acquisition failure")
+            return real_copy_tree(source, destination, expected_digest)
+
+        with patch.object(
+            orchestrator_module, "_copy_tree", side_effect=fail_botiot_copy
+        ):
+            first = run_bootstrap(self.options, dependencies=dependencies)
+
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["failed_stage"], "acquire")
+        journal = Path(first["reports"]["acquisition_journals"]["nbaiot"])
+        self.assertTrue(journal.is_file())
+        self.assertEqual(
+            json.loads(journal.read_text(encoding="utf-8"))["status"], "completed"
+        )
+        self.assertEqual(len(download_calls), 1)
+
+        def reject_network(*_args, **_kwargs):
+            raise AssertionError("journaled N-BaIoT acquisition must not redownload")
+
+        recovered = run_bootstrap(
+            self.options,
+            dependencies=BootstrapDependencies(
+                nbaiot_download_size=self.nbaiot_archive.stat().st_size,
+                available_bytes=10**12,
+                compute_resolver=self.dependencies().compute_resolver,
+                downloader=reject_network,
+            ),
+        )
+
+        self.assertEqual(recovered["status"], "sources_verified")
+        self.assertEqual(len(download_calls), 1)
+
+    def test_remote_journal_is_bound_to_the_official_source_identity(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        calls: list[str] = []
+        revision_two = self.root / "nbaiot-revision-two.zip"
+        with zipfile.ZipFile(revision_two, "w") as archive:
+            archive.writestr(
+                "device_a/benign_traffic.csv",
+                "mean,std\n9,10\n11,12\n",
+            )
+            archive.writestr(
+                "device_b/gafgyt_attacks/tcp.csv",
+                "mean,std\n13,14\n15,16\n",
+            )
+
+        def local_download(url, destination, **_kwargs):
+            destination = Path(destination)
+            payload = (
+                revision_two.read_bytes()
+                if url.endswith("revision-two.zip")
+                else self.nbaiot_archive.read_bytes()
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+            calls.append(url)
+            return DownloadResult(
+                destination=str(destination),
+                byte_size=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                resumed=False,
+                restarted=False,
+                reused=False,
+                source_url=url,
+                final_response_url=url,
+            )
+
+        options = BootstrapOptions(
+            **{
+                **self.options.__dict__,
+                "datasets": ("nbaiot",),
+                "botiot_source": None,
+                "accepted_botiot_license": False,
+            }
+        )
+        dependencies = BootstrapDependencies(
+            nbaiot_download_size=self.nbaiot_archive.stat().st_size,
+            available_bytes=10**12,
+            compute_resolver=self.dependencies().compute_resolver,
+            downloader=local_download,
+        )
+        first = run_bootstrap(options, dependencies=dependencies)
+        self.assertEqual(first["status"], "sources_verified")
+        first_url = calls[0]
+
+        registry = dict(orchestrator_module.load_registry())
+        registry["nbaiot"] = replace(
+            registry["nbaiot"],
+            download_url="https://archive.ics.uci.edu/revision-two.zip",
+        )
+        with (
+            patch.object(orchestrator_module, "load_registry", return_value=registry),
+            patch(
+                "bitguard_bnn.bootstrap.manifest.load_registry", return_value=registry
+            ),
+        ):
+            second = run_bootstrap(options, dependencies=dependencies)
+
+        self.assertEqual(second["status"], "sources_verified", msg=second["error"])
+        self.assertEqual(
+            calls,
+            [
+                first_url,
+                "https://archive.ics.uci.edu/revision-two.zip",
+            ],
+        )
+        self.assertNotEqual(first_url, calls[1])
+
+    def test_journal_candidate_cannot_escape_its_private_namespace(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        def local_download(url, destination, **_kwargs):
+            destination = Path(destination)
+            payload = self.nbaiot_archive.read_bytes()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+            return DownloadResult(
+                destination=str(destination),
+                byte_size=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                resumed=False,
+                restarted=False,
+                reused=False,
+                source_url=url,
+                final_response_url=url,
+            )
+
+        options = BootstrapOptions(
+            **{
+                **self.options.__dict__,
+                "datasets": ("nbaiot",),
+                "botiot_source": None,
+                "accepted_botiot_license": False,
+            }
+        )
+        dependencies = BootstrapDependencies(
+            nbaiot_download_size=self.nbaiot_archive.stat().st_size,
+            available_bytes=10**12,
+            compute_resolver=self.dependencies().compute_resolver,
+            downloader=local_download,
+        )
+        first = run_bootstrap(options, dependencies=dependencies)
+        self.assertEqual(first["status"], "sources_verified")
+        journal = Path(first["reports"]["acquisition_journals"]["nbaiot"])
+        record = json.loads(journal.read_text(encoding="utf-8"))
+        final_path = Path(record["final_path"])
+        external = self.root / "external-matching-archive.zip"
+        external.write_bytes(final_path.read_bytes())
+        final_path.unlink()
+        record.update(status="intent", candidate_path=str(external))
+        journal.write_text(json.dumps(record), encoding="utf-8")
+
+        restarted = BootstrapOptions(**{**options.__dict__, "restart_stage": "acquire"})
+        with patch.object(orchestrator_module, "_publish_candidate") as publisher:
+            failed = run_bootstrap(restarted, dependencies=dependencies)
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("private staging namespace", failed["error"])
+        self.assertTrue(external.is_file())
+        publisher.assert_not_called()
+
+    def test_journal_and_publication_directory_entries_are_fsynced(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        journal = self.root / "journal.json"
+        with patch.object(orchestrator_module, "_fsync_parent_directory") as durable:
+            orchestrator_module._write_json(journal, {"status": "intent"})
+        durable.assert_called_once_with(journal)
+
+        candidate = self.root / ".bitguard-acquire-test-candidate"
+        destination = self.root / "published.bin"
+        candidate.write_bytes(b"verified")
+        with patch.object(orchestrator_module, "_fsync_parent_directory") as durable:
+            orchestrator_module._publish_candidate(candidate, destination, "zip")
+        durable.assert_any_call(destination)
+        self.assertEqual(destination.read_bytes(), b"verified")
+
+    def test_journal_and_aggregate_reports_redact_injected_downloader_urls(
+        self,
+    ) -> None:
+        def local_download(_url, destination, **_kwargs):
+            destination = Path(destination)
+            payload = self.nbaiot_archive.read_bytes()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+            return DownloadResult(
+                destination=str(destination),
+                byte_size=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                resumed=False,
+                restarted=False,
+                reused=False,
+                source_url=(
+                    "https://user:password@example.invalid/a path?token=source#fragment"
+                ),
+                final_response_url=(
+                    r"https:\other:secret@example.invalid\b path?token=final"
+                ),
+            )
+
+        options = BootstrapOptions(
+            **{
+                **self.options.__dict__,
+                "datasets": ("nbaiot",),
+                "botiot_source": None,
+                "accepted_botiot_license": False,
+            }
+        )
+        report = run_bootstrap(
+            options,
+            dependencies=BootstrapDependencies(
+                nbaiot_download_size=self.nbaiot_archive.stat().st_size,
+                available_bytes=10**12,
+                compute_resolver=self.dependencies().compute_resolver,
+                downloader=local_download,
+            ),
+        )
+        self.assertEqual(report["status"], "sources_verified")
+        serialized = "\n".join(
+            Path(path).read_text(encoding="utf-8")
+            for path in (
+                report["reports"]["acquisition"],
+                report["reports"]["acquisition_journals"]["nbaiot"],
+            )
+        )
+        for secret in ("password", "secret", "token=source", "token=final", "fragment"):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("<redacted-url>", serialized)
+
+    def test_extraction_journal_reuses_first_tree_after_later_pcap_failure(
+        self,
+    ) -> None:
+        botiot_archive = self.root / "botiot-repairable.zip"
+
+        def write_botiot(*, include_pcap: bool) -> None:
+            with zipfile.ZipFile(botiot_archive, "w") as archive:
+                archive.writestr(
+                    "flows.csv",
+                    "category,subcategory,saddr,stime,bytes,rate\n"
+                    "Normal,Normal,10.0.0.1,1.5,100,2.0\n",
+                )
+                if include_pcap:
+                    archive.writestr("capture.pcap", b"excluded")
+
+        write_botiot(include_pcap=True)
+        options = BootstrapOptions(
+            **{**self.options.__dict__, "botiot_source": botiot_archive.resolve()}
+        )
+        first = run_bootstrap(options, dependencies=self.dependencies())
+
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["failed_stage"], "extract")
+        journal = Path(first["reports"]["extraction_journals"]["nbaiot"])
+        journal_payload = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(journal_payload["status"], "completed")
+        nbaiot_tree = Path(journal_payload["final_path"])
+        original_tree_digest = journal_payload["tree_sha256"]
+
+        write_botiot(include_pcap=False)
+
+        def selective_extract(source, destination, **kwargs):
+            if Path(source).name.startswith("nbaiot-"):
+                raise AssertionError("journaled N-BaIoT tree must not be re-extracted")
+            return extract_zip(source, destination, **kwargs)
+
+        restarted = BootstrapOptions(**{**options.__dict__, "restart_stage": "extract"})
+        recovered = run_bootstrap(
+            restarted,
+            dependencies=self.dependencies(zip_extractor=selective_extract),
+        )
+
+        self.assertEqual(recovered["status"], "sources_verified")
+        self.assertTrue(nbaiot_tree.is_dir())
+        self.assertEqual(
+            json.loads(journal.read_text(encoding="utf-8"))["tree_sha256"],
+            original_tree_digest,
+        )
 
     def test_nbaiot_archive_revision_invalidates_downstream_stages(self) -> None:
         initial = run_bootstrap(self.options, dependencies=self.dependencies())
@@ -252,7 +574,9 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertEqual(failed["failed_stage"], "preflight")
         self.assertIn("Insufficient disk space", failed["error"])
         self.assertFalse((self.data_root / ".bitguard" / "acquired").exists())
-        self.assertTrue((self.data_root / ".bitguard" / "bootstrap-report.json").is_file())
+        self.assertTrue(
+            (self.data_root / ".bitguard" / "bootstrap-report.json").is_file()
+        )
 
     def test_botiot_pcap_directory_fails_closed_before_copy(self) -> None:
         (self.botiot_source / "capture.pcap").write_bytes(b"not-used")
@@ -285,7 +609,9 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         raw_root = self.data_root / "raw"
         self.assertEqual(list(raw_root.glob("botiot-*")), [])
 
-    def test_nested_rar_failure_retains_private_candidate_without_final_tree(self) -> None:
+    def test_nested_rar_failure_retains_private_candidate_without_final_tree(
+        self,
+    ) -> None:
         archive_path = self.root / "botiot-with-nested-rar.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
             archive.writestr("flows.csv", "category,subcategory\nNormal,Normal\n")
@@ -338,10 +664,12 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertNotIn("password", encoded)
         self.assertNotIn("token=abc", encoded)
         self.assertNotIn("token=raw", encoded)
-        self.assertIn("https://example.invalid/data", encoded)
+        self.assertIn("<redacted-url>", encoded)
         report_path = self.data_root / ".bitguard" / "bootstrap-report.json"
         self.assertEqual(json.loads(report_path.read_text(encoding="utf-8")), failed)
-        self.assertEqual(list(report_path.parent.glob("bootstrap-report.json.*.tmp")), [])
+        self.assertEqual(
+            list(report_path.parent.glob("bootstrap-report.json.*.tmp")), []
+        )
 
         restarted_options = BootstrapOptions(
             **{**self.options.__dict__, "restart_stage": "extract"}
@@ -355,7 +683,10 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
 
     def test_writer_lock_identity_depends_only_on_data_root(self) -> None:
         alternate = BootstrapOptions(
-            **{**self.options.__dict__, "runs_root": (self.root / "other-runs").resolve()}
+            **{
+                **self.options.__dict__,
+                "runs_root": (self.root / "other-runs").resolve(),
+            }
         )
 
         self.assertEqual(_lock_path(self.options), _lock_path(alternate))
@@ -377,7 +708,9 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertNotIn("secret", encoded)
         self.assertNotIn("token=lock", encoded)
 
-    def test_lock_path_resolution_failure_uses_comprehensive_fallback_report(self) -> None:
+    def test_lock_path_resolution_failure_uses_comprehensive_fallback_report(
+        self,
+    ) -> None:
         with patch(
             "bitguard_bnn.bootstrap.orchestrator._lock_path",
             side_effect=RuntimeError(
@@ -431,6 +764,56 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         for secret in ("password", "token=resolved", "#fragment"):
             self.assertNotIn(secret, encoded)
         self.assertNotIn("user:", encoded)
+
+    def test_recursive_redaction_sanitizes_urlish_keys_and_space_tails(self) -> None:
+        first_key = (
+            r"prefix https:\user:password@example.invalid\path with spaces"
+            "?token=first#fragment"
+        )
+        second_key = (
+            "prefix https://other:secret@example.invalid/another path "
+            "with spaces?token=second"
+        )
+        error_url = (
+            "failure https://error:password@example.invalid/a path "
+            "with spaces?token=error#fragment"
+        )
+
+        with patch(
+            "bitguard_bnn.bootstrap.orchestrator._lock_path",
+            side_effect=RuntimeError(error_url),
+        ):
+            failed = run_bootstrap(
+                self.options,
+                raw_inputs={
+                    "nested": {
+                        first_key: ["first"],
+                        second_key: ["second"],
+                    }
+                },
+                dependencies=self.dependencies(),
+            )
+
+        self.assert_comprehensive_report(failed)
+        encoded = json.dumps(failed)
+        for secret in (
+            "password",
+            "secret",
+            "token=first",
+            "token=second",
+            "token=error",
+            "#fragment",
+        ):
+            self.assertNotIn(secret, encoded)
+        nested = failed["inputs"]["original"]["nested"]
+        self.assertEqual(len(nested), 2)
+        self.assertEqual(
+            sorted(value[0] for value in nested.values()), ["first", "second"]
+        )
+        self.assertEqual(
+            set(nested),
+            {"prefix <redacted-url>", "prefix <redacted-url>#collision-2"},
+        )
 
     def test_lock_release_failure_uses_same_comprehensive_report_schema(self) -> None:
         original_release = BootstrapWriterLock.release
@@ -493,6 +876,33 @@ class CleanupDebtTest(unittest.TestCase):
             self.assertNotRegex(
                 report["recovery_command"], r"(?i)Remove-Item|del(?:ete)?-Item"
             )
+
+    def test_cleanup_command_is_platform_specific_and_quotes_literal_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            retired = root / ".bitguard-retired-space ' quote"
+            retired.mkdir()
+            (retired / "artifact").write_bytes(b"x")
+
+            with patch(
+                "bitguard_bnn.bootstrap.cleanup.platform.system",
+                return_value="Linux",
+            ):
+                posix = scan_cleanup_debt((root,))
+            self.assertIn("ls -ld --", posix["recovery_command"])
+            self.assertIn(shlex.quote(str(retired)), posix["recovery_command"])
+            self.assertNotRegex(posix["recovery_command"], r"(^|\s)rm(\s|$)")
+
+            with patch(
+                "bitguard_bnn.bootstrap.cleanup.platform.system",
+                return_value="Windows",
+            ):
+                windows = scan_cleanup_debt((root,))
+            self.assertIn("Get-Item -Force -LiteralPath", windows["recovery_command"])
+            self.assertIn(str(retired).replace("'", "''"), windows["recovery_command"])
+            self.assertNotIn("Remove-Item", windows["recovery_command"])
 
 
 class GitIgnoreContractTest(unittest.TestCase):

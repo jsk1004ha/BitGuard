@@ -13,10 +13,10 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from .cleanup import scan_cleanup_debt
-from .download import DownloadResult, download_file, sanitize_url
+from .download import DownloadResult, download_file
 from .extract import ExtractionResult, extract_rar, extract_zip
 from .fsops import rename_directory_noreplace
 from .inspect import SchemaInspectionReport, inspect_csv_dataset
@@ -32,16 +32,21 @@ from .preflight import (
     verify_torch_compute,
 )
 from .registry import load_registry
-from .state import BootstrapStateStore, BootstrapWriterLock, STAGE_ORDER
+from .state import (
+    STAGE_ORDER,
+    BootstrapStateStore,
+    BootstrapWriterLock,
+    _fsync_parent_directory,
+)
 from .types import BootstrapOptions, DatasetSpec
 
 
 REPORT_FORMAT_VERSION = 1
+JOURNAL_FORMAT_VERSION = 1
 UNKNOWN_REMOTE_ARCHIVE_BYTES = 4 * 1024**3
 ARCHIVE_EXPANSION_FACTOR = 12
 REPORT_AND_METADATA_BYTES = 64 * 1024**2
 DEFAULT_DISK_RESERVE_BYTES = 2 * 1024**3
-_URLISH_IN_TEXT = re.compile(r"https?:[\\/]+[^\s\"'<>]+", re.IGNORECASE)
 _URLISH_PATH = re.compile(r"https?:[\\/]+", re.IGNORECASE)
 
 
@@ -67,7 +72,9 @@ def _default_compute_resolver(requested: str) -> dict[str, object]:
         try:
             import torch
         except Exception as error:  # pragma: no cover - installation failure path
-            raise RuntimeError(f"Torch import failed during compute selection: {error}") from error
+            raise RuntimeError(
+                f"Torch import failed during compute selection: {error}"
+            ) from error
         selected = choose_compute(
             requested,
             driver=driver,
@@ -112,7 +119,9 @@ def _json_signature(value: object) -> str:
 def _regular_digest(path: Path) -> tuple[str, int]:
     first = path.lstat()
     if stat.S_ISLNK(first.st_mode) or not stat.S_ISREG(first.st_mode):
-        raise RuntimeError(f"Bootstrap source must be a regular non-symlink file: {path}")
+        raise RuntimeError(
+            f"Bootstrap source must be a regular non-symlink file: {path}"
+        )
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as stream:
@@ -133,9 +142,15 @@ def _regular_digest(path: Path) -> tuple[str, int]:
 
 
 def _tree_digest(path: Path) -> tuple[str, int, tuple[Path, ...]]:
-    root = path.resolve(strict=True)
-    if root.is_symlink() or not root.is_dir():
+    supplied = path.lstat()
+    if stat.S_ISLNK(supplied.st_mode) or not stat.S_ISDIR(supplied.st_mode):
         raise RuntimeError(f"Bootstrap source must be a non-symlink directory: {path}")
+    root = path.resolve(strict=True)
+    resolved = root.lstat()
+    supplied_identity = (supplied.st_dev, supplied.st_ino, supplied.st_mode)
+    resolved_identity = (resolved.st_dev, resolved.st_ino, resolved.st_mode)
+    if supplied_identity != resolved_identity:
+        raise RuntimeError(f"Bootstrap source changed while it was resolved: {path}")
     records: list[tuple[str, int, str]] = []
     files: list[Path] = []
     for candidate in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
@@ -150,7 +165,9 @@ def _tree_digest(path: Path) -> tuple[str, int, tuple[Path, ...]]:
         records.append((candidate.relative_to(root).as_posix(), size, digest))
         files.append(candidate)
     if not records:
-        raise RuntimeError(f"Bootstrap source directory contains no regular files: {root}")
+        raise RuntimeError(
+            f"Bootstrap source directory contains no regular files: {root}"
+        )
     return _json_signature(records), sum(item[1] for item in records), tuple(files)
 
 
@@ -180,26 +197,20 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
     finally:
         os.close(descriptor)
     temporary.replace(path)
+    _fsync_parent_directory(path)
 
 
 def _redact_text(value: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        matched = match.group(0)
-        candidate = matched.rstrip(".,;:)]}")
-        suffix = matched[len(candidate) :]
-        normalized = re.sub(
-            r"^(https?):[\\/]+",
-            lambda item: f"{item.group(1)}://",
-            candidate,
-            count=1,
-            flags=re.IGNORECASE,
-        ).replace("\\", "/")
-        try:
-            return sanitize_url(normalized) + suffix
-        except Exception:
-            return "<redacted-url>" + suffix
+    match = _URLISH_PATH.search(value)
+    if match is None:
+        return value
+    return value[: match.start()] + "<redacted-url>"
 
-    return _URLISH_IN_TEXT.sub(replace, value)
+
+def _redact_mapping_key(value: object) -> object:
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    return _redact_text(value) if isinstance(value, str) else value
 
 
 def _redact_report_value(value: object) -> object:
@@ -210,7 +221,18 @@ def _redact_report_value(value: object) -> object:
     if isinstance(value, str):
         return _redact_text(value)
     if isinstance(value, Mapping):
-        return {key: _redact_report_value(item) for key, item in value.items()}
+        redacted: dict[object, object] = {}
+        for key, item in value.items():
+            safe_key = _redact_mapping_key(key)
+            if safe_key in redacted:
+                suffix = 2
+                candidate = f"{safe_key}#collision-{suffix}"
+                while candidate in redacted:
+                    suffix += 1
+                    candidate = f"{safe_key}#collision-{suffix}"
+                safe_key = candidate
+            redacted[safe_key] = _redact_report_value(item)
+        return redacted
     if isinstance(value, (list, tuple)):
         return [_redact_report_value(item) for item in value]
     return value
@@ -218,6 +240,15 @@ def _redact_report_value(value: object) -> object:
 
 def _safe_error(error: BaseException) -> str:
     return _redact_text(f"{type(error).__name__}: {error}")
+
+
+def _sanitized_report_mapping(value: object, subject: str) -> dict[str, object]:
+    sanitized = _redact_report_value(value)
+    if not isinstance(sanitized, dict):
+        raise RuntimeError(f"{subject} report payload must be a mapping")
+    if not all(isinstance(key, str) for key in sanitized):
+        raise RuntimeError(f"{subject} report payload keys must be strings")
+    return cast(dict[str, object], sanitized)
 
 
 def _resolved_local_path(path: Path, label: str) -> Path:
@@ -233,10 +264,14 @@ def _existing_parent(path: Path) -> Path:
     candidate = path.resolve(strict=False)
     while not candidate.exists():
         if candidate.parent == candidate:
-            raise RuntimeError(f"No existing parent is available for bootstrap path {path}")
+            raise RuntimeError(
+                f"No existing parent is available for bootstrap path {path}"
+            )
         candidate = candidate.parent
     if candidate.is_symlink() or not candidate.is_dir():
-        raise RuntimeError(f"Bootstrap parent must be an existing trusted directory: {candidate}")
+        raise RuntimeError(
+            f"Bootstrap parent must be an existing trusted directory: {candidate}"
+        )
     return candidate.resolve(strict=True)
 
 
@@ -247,6 +282,138 @@ def _lock_path(options: BootstrapOptions) -> Path:
     return parent / f".bitguard-bootstrap-{identity}.lock"
 
 
+def _load_journal(path: Path, subject: str) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        result = path.lstat()
+        if stat.S_ISLNK(result.st_mode) or not stat.S_ISREG(result.st_mode):
+            raise RuntimeError(
+                f"{subject} journal must be a regular non-symlink file: {path}"
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Cannot read {subject} journal {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{subject} journal must contain a JSON object: {path}")
+    return payload
+
+
+def _require_journal_shape(
+    record: Mapping[str, object],
+    *,
+    subject: str,
+    fields: set[str],
+) -> None:
+    if set(record) != fields:
+        raise RuntimeError(f"{subject} journal has an invalid field set")
+    if record["version"] != JOURNAL_FORMAT_VERSION:
+        raise RuntimeError(f"{subject} journal uses an unsupported version")
+    if record["status"] not in {"intent", "completed"}:
+        raise RuntimeError(f"{subject} journal has an invalid status")
+    for field in ("dataset", "final_path", "content_sha256"):
+        value = record[field]
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(f"{subject} journal has an invalid {field}")
+    candidate_path = record["candidate_path"]
+    if candidate_path is not None and (
+        not isinstance(candidate_path, str) or not candidate_path
+    ):
+        raise RuntimeError(f"{subject} journal has an invalid candidate_path")
+    if not isinstance(record["report"], dict):
+        raise RuntimeError(f"{subject} journal has an invalid report payload")
+
+
+def _content_fingerprint(path: Path, kind: str) -> tuple[str, int]:
+    if kind == "directory":
+        digest, size, _files = _tree_digest(path)
+        return digest, size
+    return _regular_digest(path)
+
+
+def _published_outputs(path: Path, kind: str) -> tuple[Path, ...]:
+    if kind == "directory":
+        _digest, _size, files = _tree_digest(path)
+        return files
+    _regular_digest(path)
+    return (path,)
+
+
+def _retained_candidate(
+    value: str,
+    *,
+    destination: Path,
+    prefix: str,
+) -> Path | None:
+    supplied = Path(value)
+    try:
+        first = supplied.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot inspect retained journal candidate {supplied}: {error}"
+        ) from error
+    if stat.S_ISLNK(first.st_mode):
+        raise RuntimeError(
+            f"Retained journal candidate is outside the private staging namespace: {supplied}"
+        )
+    expected_parent = destination.parent.resolve(strict=True)
+    try:
+        supplied_parent = supplied.parent.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot resolve retained journal candidate parent {supplied.parent}: {error}"
+        ) from error
+    if (
+        supplied_parent != expected_parent
+        or re.fullmatch(
+            rf"{re.escape(prefix)}[0-9a-f]{{32}}",
+            supplied.name,
+        )
+        is None
+    ):
+        raise RuntimeError(
+            f"Retained journal candidate is outside the private staging namespace: {supplied}"
+        )
+    candidate = expected_parent / supplied.name
+    current = candidate.lstat()
+    identity = lambda item: (item.st_dev, item.st_ino, item.st_mode)
+    if identity(first) != identity(current):
+        raise RuntimeError(
+            f"Retained journal candidate changed during validation: {candidate}"
+        )
+    return candidate
+
+
+def _publish_candidate(candidate: Path, destination: Path, kind: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    initial = candidate.lstat()
+    if stat.S_ISLNK(initial.st_mode):
+        raise RuntimeError(f"Publication candidate must not be a symlink: {candidate}")
+    expected_mode = stat.S_IFDIR if kind == "directory" else stat.S_IFREG
+    if stat.S_IFMT(initial.st_mode) != expected_mode:
+        raise RuntimeError(f"Publication candidate has an invalid type: {candidate}")
+    identity = lambda item: (item.st_dev, item.st_ino, stat.S_IFMT(item.st_mode))
+    if kind == "directory":
+        rename_directory_noreplace(candidate, destination)
+        published = destination.lstat()
+        if identity(published) != identity(initial):
+            raise RuntimeError(
+                f"Published directory has a foreign identity: {destination}"
+            )
+        _fsync_parent_directory(destination)
+        return
+    try:
+        os.link(candidate, destination, follow_symlinks=False)
+    except TypeError:  # pragma: no cover - legacy platform fallback
+        os.link(candidate, destination)
+    published = destination.lstat()
+    if identity(published) != identity(initial):
+        raise RuntimeError(f"Published file has a foreign identity: {destination}")
+    _fsync_parent_directory(destination)
+
+
 def _fallback_report_paths(options: BootstrapOptions) -> tuple[Path, ...]:
     raw_data_root = str(options.data_root)
     identity = _json_signature({"data_root": raw_data_root})[:20]
@@ -254,7 +421,9 @@ def _fallback_report_paths(options: BootstrapOptions) -> tuple[Path, ...]:
     parents: list[Path] = []
     if not _URLISH_PATH.search(raw_data_root):
         try:
-            resolved_parent = options.data_root.expanduser().resolve(strict=False).parent
+            resolved_parent = (
+                options.data_root.expanduser().resolve(strict=False).parent
+            )
             parents.append(_existing_parent(resolved_parent))
         except BaseException:
             pass
@@ -293,7 +462,9 @@ def _copy_file(source: Path, destination: Path, expected_digest: str) -> Path:
     return destination
 
 
-def _copy_tree(source: Path, destination: Path, expected_digest: str) -> tuple[Path, ...]:
+def _copy_tree(
+    source: Path, destination: Path, expected_digest: str
+) -> tuple[Path, ...]:
     if destination.exists():
         actual, _size, files = _tree_digest(destination)
         if actual == expected_digest:
@@ -414,6 +585,8 @@ def run_bootstrap(
     environment_path = metadata_root / "environment.json"
     acquisition_report_path = metadata_root / "acquisition.json"
     extraction_report_path = metadata_root / "extraction.json"
+    acquisition_journal_root = metadata_root / "acquisition-journal"
+    extraction_journal_root = metadata_root / "extraction-journal"
     acquisition_root = metadata_root / "acquired"
     extraction_root = options.data_root / "raw"
     manifest_root = metadata_root / "manifests"
@@ -431,11 +604,15 @@ def run_bootstrap(
     compute: dict[str, object] | None = None
     manifests: dict[str, str] = {}
     schemas: dict[str, str] = {}
+    acquisition_journals: dict[str, str] = {}
+    extraction_journals: dict[str, str] = {}
     cleanup_roots: set[Path] = {
         metadata_root,
         options.data_root,
         acquisition_root,
+        acquisition_journal_root,
         extraction_root,
+        extraction_journal_root,
         manifest_root,
         schema_root,
     }
@@ -494,6 +671,8 @@ def run_bootstrap(
                 "acquisition": existing_locator(acquisition_report_path),
                 "extraction": existing_locator(extraction_report_path),
                 "schemas": dict(schemas),
+                "acquisition_journals": dict(acquisition_journals),
+                "extraction_journals": dict(extraction_journals),
             },
         }
         redacted = _redact_report_value(result)
@@ -563,7 +742,9 @@ def run_bootstrap(
                 source_context: dict[str, SourceContext] = {}
                 if "nbaiot" in options.datasets:
                     if deps.nbaiot_archive is None:
-                        remote_bytes = deps.nbaiot_download_size or UNKNOWN_REMOTE_ARCHIVE_BYTES
+                        remote_bytes = (
+                            deps.nbaiot_download_size or UNKNOWN_REMOTE_ARCHIVE_BYTES
+                        )
                         source_context["nbaiot"] = {
                             "kind": "zip",
                             "digest": None,
@@ -573,7 +754,9 @@ def run_bootstrap(
                     else:
                         source = deps.nbaiot_archive.expanduser().resolve(strict=True)
                         if source.suffix.casefold() != ".zip":
-                            raise RuntimeError("Injected N-BaIoT source must be a ZIP archive")
+                            raise RuntimeError(
+                                "Injected N-BaIoT source must be a ZIP archive"
+                            )
                         digest, size = _regular_digest(source)
                         source_context["nbaiot"] = {
                             "kind": "zip",
@@ -582,7 +765,10 @@ def run_bootstrap(
                             "source": source,
                         }
                 if "botiot" in options.datasets:
-                    if not options.accepted_botiot_license or options.botiot_source is None:
+                    if (
+                        not options.accepted_botiot_license
+                        or options.botiot_source is None
+                    ):
                         raise RuntimeError(
                             "BoT-IoT requires a local source and explicit "
                             "academic-license acknowledgement"
@@ -594,13 +780,17 @@ def run_bootstrap(
                     except ValueError:
                         pass
                     else:
-                        raise RuntimeError("BoT-IoT source must be outside the bootstrap data root")
+                        raise RuntimeError(
+                            "BoT-IoT source must be outside the bootstrap data root"
+                        )
                     try:
                         source.relative_to(options.runs_root)
                     except ValueError:
                         pass
                     else:
-                        raise RuntimeError("BoT-IoT source must be outside the bootstrap runs root")
+                        raise RuntimeError(
+                            "BoT-IoT source must be outside the bootstrap runs root"
+                        )
                     kind = _source_kind(source)
                     if kind == "directory":
                         _reject_excluded_capture_files(source)
@@ -613,6 +803,20 @@ def run_bootstrap(
                         "bytes": size,
                         "source": source,
                     }
+
+                source_fingerprints: dict[str, str] = {}
+                for dataset, context in source_context.items():
+                    source_digest = context["digest"]
+                    source_fingerprints[dataset] = (
+                        source_digest
+                        if isinstance(source_digest, str)
+                        else _json_signature(
+                            {
+                                "dataset": dataset,
+                                "registry": registry[dataset].to_dict(),
+                            }
+                        )
+                    )
 
                 download_bytes = sum(item["bytes"] for item in source_context.values())
                 archive_bytes = sum(
@@ -629,14 +833,17 @@ def run_bootstrap(
                         if deps.nbaiot_archive is None and "nbaiot" in source_context
                         else 0
                     ),
-                    extracted_bytes=archive_bytes * ARCHIVE_EXPANSION_FACTOR + directory_bytes,
+                    extracted_bytes=archive_bytes * ARCHIVE_EXPANSION_FACTOR
+                    + directory_bytes,
                     shards_bytes=0,
                     evaluation_bytes=0,
                     temporary_bytes=REPORT_AND_METADATA_BYTES,
                     reserve_bytes=DEFAULT_DISK_RESERVE_BYTES,
                 )
                 if deps.available_bytes is None:
-                    available = shutil.disk_usage(_existing_parent(options.data_root)).free
+                    available = shutil.disk_usage(
+                        _existing_parent(options.data_root)
+                    ).free
                 else:
                     available = deps.available_bytes
                 disk = require_disk(estimate.request, available_bytes=available)
@@ -650,8 +857,7 @@ def run_bootstrap(
                 acquired: dict[str, Path] = {}
                 raw_roots: dict[str, Path] = {}
                 for dataset, context in source_context.items():
-                    source_digest = context["digest"]
-                    token = str(source_digest or "official")
+                    token = source_fingerprints[dataset]
                     kind = str(context["kind"])
                     acquired[dataset] = (
                         acquisition_root / f"{dataset}-{token}"
@@ -690,37 +896,163 @@ def run_bootstrap(
 
                 def run_acquire() -> Sequence[Path]:
                     acquisition_root.mkdir(parents=True, exist_ok=True)
+                    acquisition_journal_root.mkdir(parents=True, exist_ok=True)
                     outputs: list[Path] = []
                     acquisition_report: dict[str, object] = {}
+                    journal_fields = {
+                        "version",
+                        "dataset",
+                        "status",
+                        "kind",
+                        "source_sha256",
+                        "final_path",
+                        "candidate_path",
+                        "content_sha256",
+                        "content_bytes",
+                        "report",
+                    }
                     for dataset, context in source_context.items():
                         destination = acquired[dataset]
                         source = context["source"]
                         digest = context["digest"]
+                        source_fingerprint = source_fingerprints[dataset]
                         kind = str(context["kind"])
+                        journal_path = acquisition_journal_root / f"{dataset}.json"
+                        record = _load_journal(journal_path, f"{dataset} acquisition")
+                        current_record = False
+                        if record is not None:
+                            _require_journal_shape(
+                                record,
+                                subject=f"{dataset} acquisition",
+                                fields=journal_fields,
+                            )
+                            if not isinstance(record["kind"], str):
+                                raise RuntimeError(
+                                    f"{dataset} acquisition journal has an invalid kind"
+                                )
+                            source_sha256 = record["source_sha256"]
+                            if source_sha256 is not None and not isinstance(
+                                source_sha256, str
+                            ):
+                                raise RuntimeError(
+                                    f"{dataset} acquisition journal has an invalid "
+                                    "source_sha256"
+                                )
+                            if not isinstance(
+                                record["content_bytes"], int
+                            ) or isinstance(record["content_bytes"], bool):
+                                raise RuntimeError(
+                                    f"{dataset} acquisition journal has invalid content_bytes"
+                                )
+                            safe_report = _sanitized_report_mapping(
+                                record["report"],
+                                f"{dataset} acquisition journal",
+                            )
+                            if safe_report != record["report"]:
+                                record = {**record, "report": safe_report}
+                                _write_json(journal_path, record)
+                            current_record = (
+                                record["dataset"] == dataset
+                                and record["kind"] == kind
+                                and record["source_sha256"] == source_fingerprint
+                                and record["final_path"] == str(destination)
+                            )
+
+                        if current_record:
+                            assert record is not None
+                            expected_fingerprint = (
+                                str(record["content_sha256"]),
+                                cast(int, record["content_bytes"]),
+                            )
+                            candidate_value = record["candidate_path"]
+                            retained = (
+                                _retained_candidate(
+                                    candidate_value,
+                                    destination=destination,
+                                    prefix=f".bitguard-acquire-{dataset}-",
+                                )
+                                if isinstance(candidate_value, str)
+                                else None
+                            )
+                            if destination.exists():
+                                actual = _content_fingerprint(destination, kind)
+                                if actual != expected_fingerprint:
+                                    raise RuntimeError(
+                                        "Existing acquisition output does not match its "
+                                        f"dataset journal: {destination}. Preserve it for "
+                                        "inspection and use a new data root."
+                                    )
+                                if record["status"] == "intent":
+                                    record = {
+                                        **record,
+                                        "status": "completed",
+                                        "candidate_path": (
+                                            str(retained)
+                                            if kind != "directory"
+                                            and retained is not None
+                                            else None
+                                        ),
+                                    }
+                                    _write_json(journal_path, record)
+                                acquisition_journals[dataset] = str(journal_path)
+                                acquisition_report[dataset] = dict(
+                                    cast(dict[str, object], record["report"])
+                                )
+                                outputs.extend(_published_outputs(destination, kind))
+                                continue
+
+                            if retained is not None:
+                                actual = _content_fingerprint(retained, kind)
+                                if actual != expected_fingerprint:
+                                    raise RuntimeError(
+                                        "Retained acquisition candidate does not match "
+                                        f"its dataset journal: {retained}."
+                                    )
+                                _publish_candidate(retained, destination, kind)
+                                record = {
+                                    **record,
+                                    "status": "completed",
+                                    "candidate_path": (
+                                        str(retained) if kind != "directory" else None
+                                    ),
+                                }
+                                _write_json(journal_path, record)
+                                acquisition_journals[dataset] = str(journal_path)
+                                acquisition_report[dataset] = dict(
+                                    cast(dict[str, object], record["report"])
+                                )
+                                outputs.extend(_published_outputs(destination, kind))
+                                continue
+
+                        if destination.exists():
+                            raise RuntimeError(
+                                "Existing acquisition output has no matching verified "
+                                f"dataset journal: {destination}. Preserve it for inspection "
+                                "and use a new data root."
+                            )
+
+                        candidate = destination.parent / (
+                            f".bitguard-acquire-{dataset}-{uuid.uuid4().hex}"
+                        )
                         if dataset == "nbaiot" and source is None:
                             spec = registry[dataset]
                             assert spec.download_url is not None
-                            prior_hash: str | None = None
-                            prior = metadata_root / "acquisition.json"
-                            if prior.is_file():
-                                try:
-                                    prior_payload = json.loads(prior.read_text(encoding="utf-8"))
-                                    value = prior_payload["datasets"]["nbaiot"]["sha256"]
-                                    if isinstance(value, str):
-                                        prior_hash = value
-                                except (OSError, KeyError, TypeError, json.JSONDecodeError):
-                                    prior_hash = None
+                            prior_hash = (
+                                str(record["content_sha256"])
+                                if current_record and record is not None
+                                else None
+                            )
                             result = deps.downloader(
                                 spec.download_url,
-                                destination,
+                                candidate,
                                 expected_sha256=prior_hash,
                             )
-                            acquisition_report[dataset] = result.to_dict()
-                            outputs.append(destination)
+                            dataset_report = result.to_dict()
+                            dataset_report["destination"] = str(destination)
                         elif kind == "directory":
                             assert isinstance(source, Path) and isinstance(digest, str)
-                            outputs.extend(_copy_tree(source, destination, digest))
-                            acquisition_report[dataset] = {
+                            _copy_tree(source, candidate, digest)
+                            dataset_report = {
                                 "method": "manual-local-source",
                                 "source": str(source),
                                 "destination": str(destination),
@@ -728,8 +1060,8 @@ def run_bootstrap(
                             }
                         else:
                             assert isinstance(source, Path) and isinstance(digest, str)
-                            outputs.append(_copy_file(source, destination, digest))
-                            acquisition_report[dataset] = {
+                            _copy_file(source, candidate, digest)
+                            dataset_report = {
                                 "method": (
                                     "official-download-fixture"
                                     if dataset == "nbaiot"
@@ -739,60 +1071,197 @@ def run_bootstrap(
                                 "destination": str(destination),
                                 "sha256": digest,
                             }
-                    _write_json(acquisition_report_path, {"datasets": acquisition_report})
+                        dataset_report = _sanitized_report_mapping(
+                            dataset_report,
+                            f"{dataset} acquisition",
+                        )
+                        fingerprint, content_bytes = _content_fingerprint(
+                            candidate, kind
+                        )
+                        intent: dict[str, object] = {
+                            "version": JOURNAL_FORMAT_VERSION,
+                            "dataset": dataset,
+                            "status": "intent",
+                            "kind": kind,
+                            "source_sha256": source_fingerprint,
+                            "final_path": str(destination),
+                            "candidate_path": str(candidate),
+                            "content_sha256": fingerprint,
+                            "content_bytes": content_bytes,
+                            "report": dataset_report,
+                        }
+                        _write_json(journal_path, intent)
+                        acquisition_journals[dataset] = str(journal_path)
+                        _publish_candidate(candidate, destination, kind)
+                        if _content_fingerprint(destination, kind) != (
+                            fingerprint,
+                            content_bytes,
+                        ):
+                            raise RuntimeError(
+                                f"Published acquisition output failed journal validation: "
+                                f"{destination}"
+                            )
+                        completed = {
+                            **intent,
+                            "status": "completed",
+                            "candidate_path": (
+                                str(candidate) if kind != "directory" else None
+                            ),
+                        }
+                        _write_json(journal_path, completed)
+                        acquisition_report[dataset] = dataset_report
+                        outputs.extend(_published_outputs(destination, kind))
+                    _write_json(
+                        acquisition_report_path, {"datasets": acquisition_report}
+                    )
                     outputs.append(acquisition_report_path)
                     return tuple(outputs)
 
                 def run_extract() -> Sequence[Path]:
                     extraction_root.mkdir(parents=True, exist_ok=True)
+                    extraction_journal_root.mkdir(parents=True, exist_ok=True)
                     outputs: list[Path] = []
                     extraction_report: dict[str, object] = {}
-                    prior_trees: dict[str, str] = {}
-                    if extraction_report_path.is_file():
-                        try:
-                            prior_payload = json.loads(
-                                extraction_report_path.read_text(encoding="utf-8")
-                            )
-                            prior_datasets = prior_payload["datasets"]
-                            if isinstance(prior_datasets, dict):
-                                for name, value in prior_datasets.items():
-                                    if isinstance(value, dict) and isinstance(
-                                        value.get("tree_sha256"), str
-                                    ):
-                                        prior_trees[str(name)] = value["tree_sha256"]
-                        except (OSError, KeyError, TypeError, json.JSONDecodeError):
-                            prior_trees = {}
+                    journal_fields = {
+                        "version",
+                        "dataset",
+                        "status",
+                        "source_sha256",
+                        "final_path",
+                        "candidate_path",
+                        "content_sha256",
+                        "tree_sha256",
+                        "report",
+                    }
                     for dataset, context in source_context.items():
                         source = acquired[dataset]
                         destination = raw_roots[dataset]
                         kind = str(context["kind"])
-                        if destination.is_dir():
-                            existing_digest, _size, existing_files = _tree_digest(destination)
-                            if prior_trees.get(dataset) != existing_digest:
+                        source_sha256 = _content_fingerprint(source, kind)[0]
+                        journal_path = extraction_journal_root / f"{dataset}.json"
+                        record = _load_journal(journal_path, f"{dataset} extraction")
+                        current_record = False
+                        if record is not None:
+                            _require_journal_shape(
+                                record,
+                                subject=f"{dataset} extraction",
+                                fields=journal_fields,
+                            )
+                            if not isinstance(record["source_sha256"], str):
                                 raise RuntimeError(
-                                    "Existing extracted source does not match its prior "
-                                    f"verified tree: {destination}. Preserve it for "
+                                    f"{dataset} extraction journal has an invalid "
+                                    "source_sha256"
+                                )
+                            if (
+                                not isinstance(record["tree_sha256"], str)
+                                or not record["tree_sha256"]
+                            ):
+                                raise RuntimeError(
+                                    f"{dataset} extraction journal has an invalid "
+                                    "tree_sha256"
+                                )
+                            if record["tree_sha256"] != record["content_sha256"]:
+                                raise RuntimeError(
+                                    f"{dataset} extraction journal has inconsistent "
+                                    "tree digests"
+                                )
+                            safe_report = _sanitized_report_mapping(
+                                record["report"],
+                                f"{dataset} extraction journal",
+                            )
+                            if safe_report != record["report"]:
+                                record = {**record, "report": safe_report}
+                                _write_json(journal_path, record)
+                            current_record = (
+                                record["dataset"] == dataset
+                                and record["source_sha256"] == source_sha256
+                                and record["final_path"] == str(destination)
+                            )
+
+                        if current_record:
+                            assert record is not None
+                            expected_tree = str(record["tree_sha256"])
+                            candidate_value = record["candidate_path"]
+                            retained = (
+                                _retained_candidate(
+                                    candidate_value,
+                                    destination=destination,
+                                    prefix=f".bitguard-extract-{dataset}-",
+                                )
+                                if isinstance(candidate_value, str)
+                                else None
+                            )
+                            if destination.exists():
+                                actual_tree = _tree_digest(destination)[0]
+                                if actual_tree != expected_tree:
+                                    raise RuntimeError(
+                                        "Existing extracted source does not match its "
+                                        "prior verified tree recorded in its dataset "
+                                        f"journal: {destination}. Preserve it for inspection "
+                                        "and use a new data root."
+                                    )
+                                _reject_excluded_capture_files(destination)
+                                if record["status"] == "intent":
+                                    record = {
+                                        **record,
+                                        "status": "completed",
+                                        "candidate_path": None,
+                                    }
+                                    _write_json(journal_path, record)
+                                extraction_journals[dataset] = str(journal_path)
+                                extraction_report[dataset] = dict(
+                                    cast(dict[str, object], record["report"])
+                                )
+                                continue
+
+                            if retained is not None:
+                                actual_tree = _tree_digest(retained)[0]
+                                if actual_tree != expected_tree:
+                                    raise RuntimeError(
+                                        "Retained extraction candidate does not match "
+                                        f"its dataset journal: {retained}."
+                                    )
+                                _reject_excluded_capture_files(retained)
+                                _publish_candidate(
+                                    retained,
+                                    destination,
+                                    "directory",
+                                )
+                                record = {
+                                    **record,
+                                    "status": "completed",
+                                    "candidate_path": None,
+                                }
+                                _write_json(journal_path, record)
+                                extraction_journals[dataset] = str(journal_path)
+                                extraction_report[dataset] = dict(
+                                    cast(dict[str, object], record["report"])
+                                )
+                                continue
+
+                        if destination.exists():
+                            if destination.is_dir():
+                                _reject_excluded_capture_files(destination)
+                                raise RuntimeError(
+                                    "Existing extracted source has no matching verified "
+                                    f"dataset journal: {destination}. Preserve it for "
                                     "inspection and use a new data root."
                                 )
-                            extraction_report[dataset] = {
-                                "extractor": "verified-existing-tree",
-                                "destination": str(destination),
-                                "files": len(existing_files),
-                                "tree_sha256": existing_digest,
-                            }
-                        elif kind == "directory":
-                            digest = str(context["digest"])
-                            copied = _copy_tree(source, destination, digest)
-                            extraction_report[dataset] = {
+                            raise RuntimeError(
+                                f"Extraction destination is not a directory: {destination}"
+                            )
+
+                        candidate = destination.with_name(
+                            f".bitguard-extract-{dataset}-{uuid.uuid4().hex}"
+                        )
+                        if kind == "directory":
+                            copied = _copy_tree(source, candidate, source_sha256)
+                            dataset_report: dict[str, object] = {
                                 "extractor": "verified-directory-copy",
                                 "destination": str(destination),
                                 "files": len(copied),
-                                "tree_sha256": _tree_digest(destination)[0],
                             }
                         else:
-                            candidate = destination.with_name(
-                                f".bitguard-extract-{dataset}-{uuid.uuid4().hex}"
-                            )
                             result = _extract_archive(
                                 source,
                                 candidate,
@@ -810,20 +1279,6 @@ def run_bootstrap(
                                 )
                                 nested_results.append(nested_result)
                             _reject_excluded_capture_files(candidate)
-                            try:
-                                rename_directory_noreplace(candidate, destination)
-                            except FileExistsError as error:
-                                raise RuntimeError(
-                                    "Final extraction destination appeared before "
-                                    f"publication: {destination}; private candidate "
-                                    f"is retained at {candidate}."
-                                ) from error
-                            except OSError as error:
-                                raise RuntimeError(
-                                    "Could not publish verified extraction candidate "
-                                    f"{candidate} to {destination}: {error}. The "
-                                    "private candidate is retained for inspection."
-                                ) from error
 
                             def relocated(value: ExtractionResult) -> dict[str, object]:
                                 payload = value.as_dict()
@@ -836,14 +1291,59 @@ def run_bootstrap(
                                     payload[field] = str(destination / relative)
                                 return payload
 
-                            extraction_report[dataset] = {
+                            dataset_report = {
                                 **relocated(result),
                                 "nested_rar": [
                                     relocated(nested_result)
                                     for nested_result in nested_results
                                 ],
-                                "tree_sha256": _tree_digest(destination)[0],
                             }
+                        dataset_report = _sanitized_report_mapping(
+                            dataset_report,
+                            f"{dataset} extraction",
+                        )
+                        _reject_excluded_capture_files(candidate)
+                        tree_sha256 = _tree_digest(candidate)[0]
+                        dataset_report["tree_sha256"] = tree_sha256
+                        intent: dict[str, object] = {
+                            "version": JOURNAL_FORMAT_VERSION,
+                            "dataset": dataset,
+                            "status": "intent",
+                            "source_sha256": source_sha256,
+                            "final_path": str(destination),
+                            "candidate_path": str(candidate),
+                            "content_sha256": tree_sha256,
+                            "tree_sha256": tree_sha256,
+                            "report": dataset_report,
+                        }
+                        _write_json(journal_path, intent)
+                        extraction_journals[dataset] = str(journal_path)
+                        try:
+                            _publish_candidate(candidate, destination, "directory")
+                        except FileExistsError as error:
+                            raise RuntimeError(
+                                "Final extraction destination appeared before "
+                                f"publication: {destination}; private candidate "
+                                f"is retained at {candidate}."
+                            ) from error
+                        except OSError as error:
+                            raise RuntimeError(
+                                "Could not publish verified extraction candidate "
+                                f"{candidate} to {destination}: {error}. The "
+                                "private candidate is retained for inspection."
+                            ) from error
+                        if _tree_digest(destination)[0] != tree_sha256:
+                            raise RuntimeError(
+                                "Published extraction output failed journal validation: "
+                                f"{destination}"
+                            )
+                        completed = {
+                            **intent,
+                            "status": "completed",
+                            "candidate_path": None,
+                        }
+                        _write_json(journal_path, completed)
+                        extraction_report[dataset] = dataset_report
                         _reject_excluded_capture_files(destination)
                     _write_json(extraction_report_path, {"datasets": extraction_report})
                     outputs.append(extraction_report_path)
@@ -865,7 +1365,9 @@ def run_bootstrap(
                                 if dataset == "nbaiot"
                                 else "manual-local-source"
                             ),
-                            acquisition_url=(spec.download_url if dataset == "nbaiot" else None),
+                            acquisition_url=(
+                                spec.download_url if dataset == "nbaiot" else None
+                            ),
                         )
                         manifest_path = manifest_root / f"{dataset}-{source_token}.json"
                         write_source_manifest(manifest_path, manifest)
@@ -928,9 +1430,11 @@ def run_bootstrap(
                         lambda: _json_signature(
                             {
                                 "acquired": {
-                                    name: _regular_digest(path)[0]
-                                    if path.is_file()
-                                    else _tree_digest(path)[0]
+                                    name: (
+                                        _regular_digest(path)[0]
+                                        if path.is_file()
+                                        else _tree_digest(path)[0]
+                                    )
                                     for name, path in acquired.items()
                                 },
                                 "raw_outputs": {
@@ -972,7 +1476,9 @@ def run_bootstrap(
                         executed.append(stage.name)
                     last_completed = stage.name
                     if stage.name == "environment" and compute is None:
-                        compute = json.loads(environment_path.read_text(encoding="utf-8"))
+                        compute = json.loads(
+                            environment_path.read_text(encoding="utf-8")
+                        )
                     if stage.name == "inspect":
                         for dataset in options.datasets:
                             source_token = _tree_digest(raw_roots[dataset])[0]

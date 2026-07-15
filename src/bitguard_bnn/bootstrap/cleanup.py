@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import os
+import platform
+import shlex
 import stat
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 
-_DEBT_PREFIXES = (".bitguard-retired-", ".bitguard-extract-")
+_DEBT_PREFIXES = (
+    ".bitguard-retired-",
+    ".bitguard-extract-",
+    ".bitguard-acquire-",
+)
 
 
 def _powershell_literal(value: str) -> str:
@@ -22,14 +28,23 @@ def _inspection_command(paths: Iterable[str]) -> str:
         "Do not delete automatically. Inspect identity, link type, and size before "
         "any manual cleanup."
     )
+    if platform.system().casefold().startswith("win"):
+        if not supplied:
+            return (
+                f"Write-Output "
+                f"{_powershell_literal(warning + ' No retained artifacts found.')}"
+            )
+        literals = ", ".join(_powershell_literal(path) for path in supplied)
+        return (
+            f"$paths = @({literals}); Write-Output {_powershell_literal(warning)}; "
+            "Get-Item -Force -LiteralPath $paths | "
+            "Select-Object FullName,Attributes,LinkType,Length"
+        )
+    quoted_warning = shlex.quote(warning)
     if not supplied:
-        return f"Write-Output {_powershell_literal(warning + ' No retained artifacts found.')}"
-    literals = ", ".join(_powershell_literal(path) for path in supplied)
-    return (
-        f"$paths = @({literals}); Write-Output {_powershell_literal(warning)}; "
-        "Get-Item -Force -LiteralPath $paths | "
-        "Select-Object FullName,Attributes,LinkType,Length"
-    )
+        return f"printf '%s\\n' {quoted_warning}"
+    quoted_paths = " ".join(shlex.quote(path) for path in supplied)
+    return f"printf '%s\\n' {quoted_warning} && ls -ld -- {quoted_paths}"
 
 
 def _artifact_sizes(path: Path) -> tuple[int, int]:
@@ -96,7 +111,11 @@ def scan_cleanup_debt(roots: Iterable[Path | str]) -> dict[str, Any]:
                     "kind": (
                         "retired"
                         if candidate.name.startswith(".bitguard-retired-")
-                        else "extraction_staging"
+                        else (
+                            "acquisition_staging"
+                            if candidate.name.startswith(".bitguard-acquire-")
+                            else "extraction_staging"
+                        )
                     ),
                     "apparent_bytes": apparent,
                     "unique_bytes": unique,
