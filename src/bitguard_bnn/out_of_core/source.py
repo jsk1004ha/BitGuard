@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import ctypes
+import functools
 import heapq
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import warnings
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable, Iterator, Sequence
@@ -76,6 +81,7 @@ class _FilePlan:
     relative_path: str
     logical_identity: str
     fingerprint: FileFingerprint
+    snapshot: _VerifiedSnapshot
     row_count: int
     selected_row_count: int
     raw_columns: tuple[str, ...]
@@ -89,6 +95,7 @@ class _IterationPlan:
     source: _SourceSpec
     files: tuple[_FilePlan, ...]
     selection: _SelectionIndex | None
+    snapshots: _SnapshotStore
     class_limited: bool
     feature_columns: tuple[str, ...]
 
@@ -119,14 +126,31 @@ class _PinnedStat:
     ctime_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedSnapshot:
+    path: Path
+    pinned: _PinnedStat
+    sha256: str
+
+
 class _HashingReader:
-    def __init__(self, handle: BinaryIO) -> None:
+    def __init__(
+        self,
+        handle: BinaryIO,
+        *,
+        mirror: BinaryIO | None = None,
+        origin: str = "source",
+    ) -> None:
         self._handle = handle
+        self._mirror = mirror
         self._digest = hashlib.sha256()
         self.bytes_read = 0
+        self.origin = origin
 
     def read(self, size: int = -1) -> bytes:
         block = self._handle.read(size)
+        if self._mirror is not None:
+            self._mirror.write(block)
         self._digest.update(block)
         self.bytes_read += len(block)
         return block
@@ -146,8 +170,66 @@ def _pinned_stat(path: Path) -> _PinnedStat:
         int(path_stat.st_mode),
         int(path_stat.st_size),
         int(path_stat.st_mtime_ns),
-        int(path_stat.st_ctime_ns),
+        _change_time_ns(path, path_stat),
     )
+
+
+class _WindowsFileBasicInfo(ctypes.Structure):
+    _fields_ = [
+        ("creation_time", ctypes.c_longlong),
+        ("last_access_time", ctypes.c_longlong),
+        ("last_write_time", ctypes.c_longlong),
+        ("change_time", ctypes.c_longlong),
+        ("file_attributes", wintypes.DWORD),
+    ]
+
+
+def _change_time_ns(path: Path, path_stat: os.stat_result) -> int:
+    if os.name != "nt":
+        return int(path_stat.st_ctime_ns)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = create_file(
+        str(path.resolve()),
+        0x80,
+        0x1 | 0x2 | 0x4,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise RuntimeError("could not pin dataset source change time")
+    try:
+        information = _WindowsFileBasicInfo()
+        if not get_information(
+            handle, 0, ctypes.byref(information), ctypes.sizeof(information)
+        ):
+            raise RuntimeError("could not pin dataset source change time")
+        return int(information.change_time) * 100
+    finally:
+        close_handle(handle)
 
 
 def _assert_source_stat(
@@ -155,23 +237,196 @@ def _assert_source_stat(
     expected: _PinnedStat | FileFingerprint,
     actual: os.stat_result,
     phase: str,
+    *,
+    check_ctime: bool = True,
 ) -> None:
-    identity = (
+    identity = [
         int(actual.st_dev),
         int(actual.st_ino),
         int(actual.st_mode),
         int(actual.st_size),
         int(actual.st_mtime_ns),
-    )
-    pinned = (
+    ]
+    pinned = [
         expected.device,
         expected.inode,
         expected.mode,
         expected.byte_size,
         expected.mtime_ns,
-    )
+    ]
+    if check_ctime:
+        identity.append(_change_time_ns(path, actual))
+        pinned.append(expected.ctime_ns)
     if identity != pinned:
         raise RuntimeError(f"dataset source changed during {phase}: {path}")
+
+
+def _new_snapshot_root() -> Path:
+    return Path(tempfile.mkdtemp(prefix="bitguard-verified-source-"))
+
+
+@functools.lru_cache(maxsize=1)
+def _windows_current_sid() -> str:
+    identity = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    sid_match = re.search(rb"S-\d+(?:-\d+)+", identity.stdout)
+    if sid_match is None:
+        raise RuntimeError
+    return sid_match.group(0).decode("ascii")
+
+
+def _secure_snapshot_root(root: Path) -> None:
+    if os.name != "nt":
+        os.chmod(root, 0o700)
+        if stat.S_IMODE(root.stat().st_mode) != 0o700:
+            raise RuntimeError("could not enforce private snapshot permissions")
+        return
+    acl_path = root / ".acl-verification"
+    try:
+        sid = _windows_current_sid()
+        subprocess.run(
+            [
+                "icacls",
+                str(root),
+                "/inheritance:r",
+                "/remove:g",
+                "*S-1-5-18",
+                "*S-1-5-32-544",
+                "*S-1-3-4",
+                "/grant:r",
+                f"*{sid}:(OI)(CI)F",
+                "/q",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["icacls", str(root), "/save", str(acl_path), "/q"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        acl = acl_path.read_bytes().decode("utf-16le").lstrip("\ufeff")
+        descriptor = re.search(r"D:([^\r\n]+)", acl)
+        aces = re.findall(r"\(([^()]*)\)", descriptor.group(1) if descriptor else "")
+        if descriptor is None or not descriptor.group(1).startswith("P"):
+            raise RuntimeError
+        if aces != [f"A;OICI;FA;;;{sid}"]:
+            raise RuntimeError
+    except (OSError, subprocess.SubprocessError, UnicodeError, RuntimeError) as exc:
+        raise RuntimeError("could not enforce private snapshot permissions") from exc
+    finally:
+        acl_path.unlink(missing_ok=True)
+
+
+class _SnapshotBuilder:
+    def __init__(self, store: _SnapshotStore, file_id: int) -> None:
+        self._store = store
+        self.partial_path = store.root / f"{file_id:08d}.partial"
+        self.final_path = store.root / f"{file_id:08d}.verified.csv"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        descriptor = os.open(self.partial_path, flags, 0o600)
+        self.handle: BinaryIO = os.fdopen(descriptor, "wb", buffering=0)
+        self._finished = False
+        if os.name != "nt" and stat.S_IMODE(self.partial_path.stat().st_mode) != 0o600:
+            self.abort()
+            raise RuntimeError("could not enforce private snapshot permissions")
+
+    def commit(self, sha256: str, byte_size: int) -> _VerifiedSnapshot:
+        if self._finished:
+            raise RuntimeError("snapshot builder is already closed")
+        try:
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+            if os.fstat(self.handle.fileno()).st_size != byte_size:
+                raise RuntimeError("verified snapshot size mismatch")
+            self.handle.close()
+            os.replace(self.partial_path, self.final_path)
+            os.chmod(self.final_path, 0o400)
+            pinned = _pinned_stat(self.final_path)
+            if pinned.byte_size != byte_size:
+                raise RuntimeError("verified snapshot size mismatch")
+            snapshot = _VerifiedSnapshot(self.final_path, pinned, sha256)
+            self._store._publish(self, snapshot)
+            self._finished = True
+            if os.name != "nt":
+                directory = os.open(self._store.root, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            return snapshot
+        except BaseException:
+            self.abort()
+            raise
+
+    def abort(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if not self.handle.closed:
+            self.handle.close()
+        for path in (self.partial_path, self.final_path):
+            if path.exists():
+                os.chmod(path, 0o600)
+                path.unlink()
+        self._store._discard(self)
+
+
+class _SnapshotStore:
+    def __init__(self) -> None:
+        self.root = _new_snapshot_root()
+        self._builders: set[_SnapshotBuilder] = set()
+        self._snapshots: list[_VerifiedSnapshot] = []
+        self._closed = False
+        try:
+            if self.root.exists():
+                root_stat = self.root.lstat()
+                if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(
+                    root_stat.st_mode
+                ):
+                    raise RuntimeError("invalid snapshot storage")
+            else:
+                self.root.mkdir(mode=0o700)
+            _secure_snapshot_root(self.root)
+        except BaseException:
+            if self.root.is_dir():
+                self.root.rmdir()
+            raise
+
+    def begin(self, file_id: int) -> _SnapshotBuilder:
+        builder = _SnapshotBuilder(self, file_id)
+        self._builders.add(builder)
+        return builder
+
+    def _publish(
+        self, builder: _SnapshotBuilder, snapshot: _VerifiedSnapshot
+    ) -> None:
+        self._builders.discard(builder)
+        self._snapshots.append(snapshot)
+
+    def _discard(self, builder: _SnapshotBuilder) -> None:
+        self._builders.discard(builder)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for builder in tuple(self._builders):
+            builder.abort()
+        for snapshot in self._snapshots:
+            if snapshot.path.exists():
+                os.chmod(snapshot.path, 0o600)
+                snapshot.path.unlink()
+        self._snapshots.clear()
+        self.root.rmdir()
 
 
 class _VerifiedCsvPass:
@@ -183,32 +438,63 @@ class _VerifiedCsvPass:
         chunk_size: int,
         phase: str,
         expected_sha256: str | None,
+        snapshot_builder: _SnapshotBuilder | None = None,
+        source_guard: tuple[Path, FileFingerprint] | None = None,
+        origin: str = "source",
     ) -> None:
         self.path = path
         self.pinned = pinned
         self.chunk_size = chunk_size
         self.phase = phase
         self.expected_sha256 = expected_sha256
+        self.snapshot_builder = snapshot_builder
+        self.source_guard = source_guard
+        self.origin = origin
         self.fingerprint: FileFingerprint | None = None
+        self.snapshot: _VerifiedSnapshot | None = None
+
+    def _assert_guard(self) -> None:
+        if self.source_guard is None:
+            return
+        path, fingerprint = self.source_guard
+        _assert_source_stat(path, fingerprint, path.lstat(), self.phase)
 
     def __iter__(self) -> Iterator[pd.DataFrame]:
         completed = False
+        self._assert_guard()
         with self.path.open("rb", buffering=0) as handle:
-            _assert_source_stat(self.path, self.pinned, os.fstat(handle.fileno()), self.phase)
-            _assert_source_stat(self.path, self.pinned, self.path.lstat(), self.phase)
-            hashing_reader = _HashingReader(handle)
-            reader = pd.read_csv(
-                hashing_reader,
-                chunksize=self.chunk_size,
-                low_memory=False,
+            _assert_source_stat(
+                self.path,
+                self.pinned,
+                os.fstat(handle.fileno()),
+                self.phase,
+                check_ctime=False,
             )
+            _assert_source_stat(self.path, self.pinned, self.path.lstat(), self.phase)
+            hashing_reader = _HashingReader(
+                handle,
+                mirror=(
+                    self.snapshot_builder.handle
+                    if self.snapshot_builder is not None
+                    else None
+                ),
+                origin=self.origin,
+            )
+            reader: Any = None
             try:
+                reader = pd.read_csv(
+                    hashing_reader,
+                    chunksize=self.chunk_size,
+                    low_memory=False,
+                )
                 for chunk in reader:
+                    self._assert_guard()
                     _assert_source_stat(
                         self.path,
                         self.pinned,
                         os.fstat(handle.fileno()),
                         self.phase,
+                        check_ctime=False,
                     )
                     _assert_source_stat(
                         self.path,
@@ -219,41 +505,58 @@ class _VerifiedCsvPass:
                     yield chunk
                 completed = True
             finally:
-                _close_reader(reader)
-                if completed:
-                    _assert_source_stat(
-                        self.path,
-                        self.pinned,
-                        os.fstat(handle.fileno()),
-                        self.phase,
-                    )
-                    _assert_source_stat(
-                        self.path,
-                        self.pinned,
-                        self.path.lstat(),
-                        self.phase,
-                    )
-                    if hashing_reader.bytes_read != self.pinned.byte_size:
-                        raise RuntimeError(
-                            f"dataset source changed during {self.phase}: {self.path}"
+                if reader is not None:
+                    _close_reader(reader)
+                if not completed:
+                    if self.snapshot_builder is not None:
+                        self.snapshot_builder.abort()
+                else:
+                    try:
+                        self._assert_guard()
+                        _assert_source_stat(
+                            self.path,
+                            self.pinned,
+                            os.fstat(handle.fileno()),
+                            self.phase,
+                            check_ctime=False,
                         )
-                    digest = hashing_reader.sha256
-                    if (
-                        self.expected_sha256 is not None
-                        and digest != self.expected_sha256
-                    ):
-                        raise RuntimeError(
-                            f"dataset source changed during {self.phase}: {self.path}"
+                        _assert_source_stat(
+                            self.path,
+                            self.pinned,
+                            self.path.lstat(),
+                            self.phase,
                         )
-                    self.fingerprint = FileFingerprint(
-                        self.pinned.device,
-                        self.pinned.inode,
-                        self.pinned.mode,
-                        self.pinned.byte_size,
-                        self.pinned.mtime_ns,
-                        self.pinned.ctime_ns,
-                        digest,
-                    )
+                        if hashing_reader.bytes_read != self.pinned.byte_size:
+                            raise RuntimeError(
+                                "dataset source changed during "
+                                f"{self.phase}: {self.path}"
+                            )
+                        digest = hashing_reader.sha256
+                        if (
+                            self.expected_sha256 is not None
+                            and digest != self.expected_sha256
+                        ):
+                            raise RuntimeError(
+                                "dataset source changed during "
+                                f"{self.phase}: {self.path}"
+                            )
+                        self.fingerprint = FileFingerprint(
+                            self.pinned.device,
+                            self.pinned.inode,
+                            self.pinned.mode,
+                            self.pinned.byte_size,
+                            self.pinned.mtime_ns,
+                            self.pinned.ctime_ns,
+                            digest,
+                        )
+                        if self.snapshot_builder is not None:
+                            self.snapshot = self.snapshot_builder.commit(
+                                digest, hashing_reader.bytes_read
+                            )
+                    except BaseException:
+                        if self.snapshot_builder is not None:
+                            self.snapshot_builder.abort()
+                        raise
 
 
 def _glob_anchor(path: Path) -> Path:
@@ -552,11 +855,13 @@ def _iter_selected_raw(
 ) -> Iterator[tuple[int, pd.DataFrame]]:
     offset = 0
     csv_pass = _VerifiedCsvPass(
-        plan.path,
-        plan.fingerprint,
+        plan.snapshot.path,
+        plan.snapshot.pinned,
         chunk_size=chunk_size,
         phase="CSV normalization pass",
-        expected_sha256=plan.fingerprint.sha256,
+        expected_sha256=plan.snapshot.sha256,
+        source_guard=(plan.path, plan.fingerprint),
+        origin="snapshot",
     )
     for chunk in csv_pass:
         source_row_start = offset
@@ -686,6 +991,7 @@ def _plan_file(
     seed: int,
     budget: _SourceRowBudget,
     selection: _SelectionIndex | None,
+    snapshots: _SnapshotStore,
     drop_columns: set[str],
 ) -> _FilePlan:
     pinned = _pinned_stat(path)
@@ -698,12 +1004,14 @@ def _plan_file(
     timestamp_numeric = 0
     first_timestamp: str | None = None
     offset = 0
+    snapshot_builder = snapshots.begin(file_id)
     csv_pass = _VerifiedCsvPass(
         path,
         pinned,
         chunk_size=chunk_size,
         phase="source planning",
         expected_sha256=None,
+        snapshot_builder=snapshot_builder,
     )
     for chunk in csv_pass:
         if schema is None:
@@ -761,7 +1069,9 @@ def _plan_file(
                 for row_offset, row_index in enumerate(positions)
             )
     fingerprint = csv_pass.fingerprint
+    snapshot = csv_pass.snapshot
     assert fingerprint is not None
+    assert snapshot is not None
     assert schema is not None
     identity = logical_source_id(source.kind, relative_path, fingerprint.sha256)
     selected_count = offset
@@ -810,6 +1120,7 @@ def _plan_file(
         relative_path=relative_path,
         logical_identity=identity,
         fingerprint=fingerprint,
+        snapshot=snapshot,
         row_count=offset,
         selected_row_count=selected_count,
         raw_columns=raw_columns,
@@ -1117,14 +1428,16 @@ def _build_iteration_plan(
     class_limit = int(class_limit) if class_limit is not None else None
     if max_rows is not None and max_rows <= 0:
         raise ValueError("max_rows must be positive or null")
-    selection = (
-        _SelectionIndex()
-        if max_rows is not None or class_limit is not None
-        else None
-    )
+    snapshots = _SnapshotStore()
+    selection: _SelectionIndex | None = None
     file_plans: list[_FilePlan] = []
     drop_columns = set(cfg.get("drop_columns", []))
     try:
+        selection = (
+            _SelectionIndex()
+            if max_rows is not None or class_limit is not None
+            else None
+        )
         for file_id, (path, relative_path) in enumerate(
             zip(source.files, source.relative_paths)
         ):
@@ -1140,6 +1453,7 @@ def _build_iteration_plan(
                     seed=int(config["experiment"]["seed"]),
                     budget=budget,
                     selection=selection,
+                    snapshots=snapshots,
                     drop_columns=drop_columns,
                 )
             )
@@ -1177,13 +1491,25 @@ def _build_iteration_plan(
             source=source,
             files=files,
             selection=selection,
+            snapshots=snapshots,
             class_limited=class_limit is not None,
             feature_columns=features,
         )
     except BaseException:
-        if selection is not None:
-            selection.close()
+        try:
+            if selection is not None:
+                selection.close()
+        finally:
+            snapshots.close()
         raise
+
+
+def _close_iteration_plan(plan: _IterationPlan) -> None:
+    try:
+        if plan.selection is not None:
+            plan.selection.close()
+    finally:
+        plan.snapshots.close()
 
 
 def _iter_planned_file_chunks(
@@ -1233,8 +1559,7 @@ def iter_normalized_chunks(
     try:
         yield from _iter_planned_chunks(config, plan)
     finally:
-        if plan.selection is not None:
-            plan.selection.close()
+        _close_iteration_plan(plan)
 
 
 def load_normalized_dataset(
@@ -1319,5 +1644,4 @@ def load_normalized_dataset(
             provenance["label_overrides"] = source.label_overrides
         return LoadedDataset(combined, features, provenance)
     finally:
-        if plan.selection is not None:
-            plan.selection.close()
+        _close_iteration_plan(plan)

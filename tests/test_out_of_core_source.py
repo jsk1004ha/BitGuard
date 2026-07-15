@@ -4,6 +4,7 @@ import copy
 import inspect
 import os
 import re
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -286,6 +287,45 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
             self.assertEqual(csv_calls, 2)
             self.assertEqual(hashed_bytes, path.stat().st_size * 2)
 
+    def test_source_and_snapshot_byte_reads_are_measured_separately(self) -> None:
+        for class_cap, snapshot_passes in ((None, 1), (2, 2)):
+            with (
+                self.subTest(class_cap=class_cap),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                path = root / "rows.csv"
+                pd.DataFrame(
+                    {
+                        "behavior_label": ["benign", "scan_like"] * 4,
+                        "x": list(range(8)),
+                    }
+                ).to_csv(path, index=False)
+                config = _base_config(root, "csv", "rows.csv")
+                config["dataset"]["max_rows_per_class"] = class_cap
+                source_bytes = 0
+                snapshot_bytes = 0
+                original_read = source_module._HashingReader.read
+
+                def count_bytes(reader, size: int = -1):
+                    nonlocal source_bytes, snapshot_bytes
+                    block = original_read(reader, size)
+                    if getattr(reader, "origin", "source") == "source":
+                        source_bytes += len(block)
+                    else:
+                        snapshot_bytes += len(block)
+                    return block
+
+                with patch.object(
+                    source_module._HashingReader, "read", count_bytes
+                ):
+                    list(iter_normalized_chunks(config))
+
+                self.assertEqual(source_bytes, path.stat().st_size)
+                self.assertEqual(
+                    snapshot_bytes, path.stat().st_size * snapshot_passes
+                )
+
     def test_selection_state_is_not_duplicated_in_plan_dataclasses(self) -> None:
         self.assertNotIn(
             "selected_rows", source_module._FilePlan.__dataclass_fields__
@@ -442,6 +482,168 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "source changed"),
             ):
                 list(iter_normalized_chunks(config))
+
+    def test_rewrite_cannot_escape_a_changed_chunk_before_sha_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            header = b"behavior_label,x\n"
+            original = header + b"benign," + b"1" * 82 + b"\n"
+            original += b"benign," + b"2" * 82 + b"\n"
+            rewritten = header + b"benign,1\n" * 20
+            self.assertEqual(len(rewritten), len(original))
+            path.write_bytes(original)
+            initial_stat = path.stat()
+            config = _base_config(root, "csv", "rows.csv")
+            config["dataset"]["max_loaded_rows"] = 2
+            original_iter = source_module._iter_planned_chunks
+
+            def rewrite_before_emit(config: dict, plan: object):
+                path.write_bytes(rewritten)
+                os.utime(
+                    path,
+                    ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns),
+                )
+                yield from original_iter(config, plan)
+
+            iterator = iter_normalized_chunks(config)
+            try:
+                with (
+                    patch.object(
+                        source_module,
+                        "_iter_planned_chunks",
+                        rewrite_before_emit,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "source changed"),
+                ):
+                    next(iterator)
+            finally:
+                iterator.close()
+
+    def test_verified_snapshot_is_removed_on_normal_and_early_close(self) -> None:
+        for close_early in (False, True):
+            with (
+                self.subTest(close_early=close_early),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                snapshot_root = root / "private-snapshots"
+                pd.DataFrame(
+                    {
+                        "behavior_label": ["benign"] * 5,
+                        "x": list(range(5)),
+                    }
+                ).to_csv(root / "rows.csv", index=False)
+                config = _base_config(root, "csv", "rows.csv")
+                iterator = iter_normalized_chunks(config)
+
+                with patch.object(
+                    source_module,
+                    "_new_snapshot_root",
+                    return_value=snapshot_root,
+                    create=True,
+                ) as root_factory:
+                    if close_early:
+                        try:
+                            next(iterator)
+                            self.assertTrue(snapshot_root.is_dir())
+                            snapshots = list(
+                                snapshot_root.glob("*.verified.csv")
+                            )
+                            self.assertEqual(len(snapshots), 1)
+                            self.assertFalse(
+                                snapshots[0].stat().st_mode & stat.S_IWRITE
+                            )
+                        finally:
+                            iterator.close()
+                    else:
+                        list(iterator)
+
+                root_factory.assert_called_once_with()
+                self.assertFalse(snapshot_root.exists())
+
+    def test_snapshot_and_absolute_source_paths_do_not_escape_provenance(
+        self,
+    ) -> None:
+        def contains_path(value: object, path: str) -> bool:
+            if isinstance(value, str):
+                return path in value
+            if isinstance(value, dict):
+                return any(
+                    contains_path(key, path) or contains_path(item, path)
+                    for key, item in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                return any(contains_path(item, path) for item in value)
+            return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            snapshot_root = root / "private-snapshots"
+            pd.DataFrame(
+                {"behavior_label": ["benign"], "x": [1]}
+            ).to_csv(path, index=False)
+            config = _base_config(root, "csv", "rows.csv")
+
+            with patch.object(
+                source_module,
+                "_new_snapshot_root",
+                return_value=snapshot_root,
+            ):
+                loaded = load_dataset(config)
+
+            self.assertFalse(
+                contains_path(loaded.provenance, str(snapshot_root))
+            )
+            self.assertFalse(
+                contains_path(loaded.provenance, str(path.resolve()))
+            )
+
+    def test_verified_snapshot_is_removed_on_parse_and_emit_errors(self) -> None:
+        for parse_error in (False, True):
+            with (
+                self.subTest(parse_error=parse_error),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                snapshot_root = root / "private-snapshots"
+                path = root / "rows.csv"
+                if parse_error:
+                    path.write_text(
+                        'behavior_label,x\n"unterminated,1\n',
+                        encoding="utf-8",
+                    )
+                else:
+                    pd.DataFrame(
+                        {"behavior_label": ["benign"], "x": [1]}
+                    ).to_csv(path, index=False)
+                config = _base_config(root, "csv", "rows.csv")
+
+                with patch.object(
+                    source_module,
+                    "_new_snapshot_root",
+                    return_value=snapshot_root,
+                    create=True,
+                ) as root_factory:
+                    if parse_error:
+                        with self.assertRaises(pd.errors.ParserError):
+                            list(iter_normalized_chunks(config))
+                    else:
+                        with (
+                            patch.object(
+                                source_module,
+                                "_iter_planned_chunks",
+                                side_effect=RuntimeError("emit failed"),
+                            ),
+                            self.assertRaisesRegex(RuntimeError, "emit failed"),
+                        ):
+                            list(iter_normalized_chunks(config))
+
+                root_factory.assert_called_once_with()
+                self.assertFalse(snapshot_root.exists())
 
     def test_iterator_rejects_same_path_replacement_before_emit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
