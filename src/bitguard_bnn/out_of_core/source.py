@@ -643,34 +643,68 @@ class _PrivateWorkGuard:
             os.rmdir(matching_name, dir_fd=self._parent_descriptor)
 
     def _close_child_handles(self) -> None:
+        cleanups: list[BaseException] = []
         if self._child_descriptor is not None:
-            os.close(self._child_descriptor)
-            self._child_descriptor = None
+            try:
+                os.close(self._child_descriptor)
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+            else:
+                self._child_descriptor = None
         if self._child_windows_handles:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             close_handle = kernel32.CloseHandle
             close_handle.argtypes = [wintypes.HANDLE]
             close_handle.restype = wintypes.BOOL
-            for handle in reversed(self._child_windows_handles):
-                close_handle(handle)
-            self._child_windows_handles.clear()
+            for handle in tuple(reversed(self._child_windows_handles)):
+                if close_handle(handle):
+                    self._child_windows_handles.remove(handle)
+                else:
+                    cleanups.append(
+                        OSError(
+                            ctypes.get_last_error(),
+                            "could not close private work child handle",
+                        )
+                    )
+        _raise_cleanup_errors(cleanups)
 
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        self._close_child_handles()
+        cleanups: list[BaseException] = []
+        try:
+            self._close_child_handles()
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
         if self._windows_handles:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             close_handle = kernel32.CloseHandle
             close_handle.argtypes = [wintypes.HANDLE]
             close_handle.restype = wintypes.BOOL
-            for handle in reversed(self._windows_handles):
-                close_handle(handle)
-            self._windows_handles.clear()
+            for handle in tuple(reversed(self._windows_handles)):
+                if close_handle(handle):
+                    self._windows_handles.remove(handle)
+                else:
+                    cleanups.append(
+                        OSError(
+                            ctypes.get_last_error(),
+                            "could not close normalized source work_dir handle",
+                        )
+                    )
         if self._parent_descriptor is not None:
-            os.close(self._parent_descriptor)
-            self._parent_descriptor = None
+            try:
+                os.close(self._parent_descriptor)
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+            else:
+                self._parent_descriptor = None
+        self._closed = not cleanups and not (
+            self._child_windows_handles
+            or self._windows_handles
+            or self._child_descriptor is not None
+            or self._parent_descriptor is not None
+        )
+        _raise_cleanup_errors(cleanups)
 
 
 def _create_private_work_child(guard: _PrivateWorkGuard) -> Path:
@@ -798,14 +832,23 @@ class _SnapshotBuilder:
     def abort(self) -> None:
         if self._finished:
             return
-        self._finished = True
-        if not self.handle.closed:
-            self.handle.close()
+        cleanups: list[BaseException] = []
+        try:
+            if not self.handle.closed:
+                self.handle.close()
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
         for name in (self.partial_name, self.final_name):
-            if self._store.member_exists(name):
-                self._store.chmod_member(name, 0o600)
-                self._store.unlink_member(name)
-        self._store._discard(self)
+            try:
+                if self._store.member_exists(name):
+                    self._store.chmod_member(name, 0o600)
+                    self._store.unlink_member(name)
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+        if not cleanups and self.handle.closed:
+            self._finished = True
+            self._store._discard(self)
+        _raise_cleanup_errors(cleanups)
 
 
 class _SnapshotStore:
@@ -826,6 +869,7 @@ class _SnapshotStore:
             self._work_guard = guard
         self._builders: set[_SnapshotBuilder] = set()
         self._snapshots: list[_VerifiedSnapshot] = []
+        self._root_removed = False
         self._closed = False
         try:
             if self.directory_descriptor is not None:
@@ -978,30 +1022,36 @@ class _SnapshotStore:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         cleanups: list[BaseException] = []
         for builder in tuple(self._builders):
             try:
                 builder.abort()
             except BaseException as cleanup_error:
                 cleanups.append(cleanup_error)
-        for snapshot in self._snapshots:
+        for snapshot in tuple(self._snapshots):
             try:
                 if self.member_exists(snapshot.relative_name):
                     self.chmod_member(snapshot.relative_name, 0o600)
                     self.unlink_member(snapshot.relative_name)
             except BaseException as cleanup_error:
                 cleanups.append(cleanup_error)
-        self._snapshots.clear()
-        try:
-            self._remove_root()
-        except BaseException as cleanup_error:
-            cleanups.append(cleanup_error)
-        try:
-            if self._work_guard is not None:
+            else:
+                self._snapshots.remove(snapshot)
+        if not self._builders and not self._snapshots and not self._root_removed:
+            try:
+                self._remove_root()
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+            else:
+                self._root_removed = True
+        if self._root_removed and self._work_guard is not None:
+            try:
                 self._work_guard.close()
-        except BaseException as cleanup_error:
-            cleanups.append(cleanup_error)
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+            else:
+                self._work_guard = None
+        self._closed = self._root_removed and self._work_guard is None
         _raise_cleanup_errors(cleanups)
 
 
@@ -1267,6 +1317,7 @@ class _SelectionIndex:
         work_dir: Path | None = None,
         directory_descriptor: int | None = None,
     ) -> None:
+        self._connection_lock = threading.RLock()
         self._directory_descriptor = directory_descriptor
         self._relative_name: str | None = None
         if directory_descriptor is None:
@@ -1302,7 +1353,21 @@ class _SelectionIndex:
                     "platform does not support descriptor-relative SQLite storage"
                 )
             connection_path = fd_root / self._relative_name
-        self._connection = sqlite3.connect(connection_path)
+        base_name = (
+            self._relative_name
+            if self._relative_name is not None
+            else str(self.path)
+        )
+        self._pending_artifacts = [
+            base_name,
+            f"{base_name}-journal",
+            f"{base_name}-wal",
+            f"{base_name}-shm",
+        ]
+        self._connection = sqlite3.connect(
+            connection_path, check_same_thread=False
+        )
+        self._connection_closed = False
         self._closed = False
         self._connection.executescript(
             """
@@ -1346,46 +1411,50 @@ class _SelectionIndex:
         self,
         facts: Iterable[tuple[int, int, str, int, int, str | None]],
     ) -> None:
-        self._connection.executemany(
-            "INSERT INTO file_row VALUES (?, ?, ?, ?, ?, ?)", facts
-        )
+        with self._connection_lock:
+            self._connection.executemany(
+                "INSERT INTO file_row VALUES (?, ?, ?, ?, ?, ?)", facts
+            )
 
     def select_all_file_rows(self, file_id: int) -> None:
-        self._connection.execute(
-            "INSERT INTO file_mode(file_id, all_rows) VALUES (?, 1)",
-            (file_id,),
-        )
-        self._connection.commit()
+        with self._connection_lock:
+            self._connection.execute(
+                "INSERT INTO file_mode(file_id, all_rows) VALUES (?, 1)",
+                (file_id,),
+            )
+            self._connection.commit()
 
     def select_file_rows(self, file_id: int, rows: Iterable[int]) -> None:
-        self._connection.execute(
-            "INSERT INTO file_mode(file_id, all_rows) VALUES (?, 0)",
-            (file_id,),
-        )
-        self._connection.executemany(
-            "INSERT INTO selected_file_row VALUES (?, ?)",
-            ((file_id, int(row)) for row in rows),
-        )
-        self._connection.commit()
+        with self._connection_lock:
+            self._connection.execute(
+                "INSERT INTO file_mode(file_id, all_rows) VALUES (?, 0)",
+                (file_id,),
+            )
+            self._connection.executemany(
+                "INSERT INTO selected_file_row VALUES (?, ?)",
+                ((file_id, int(row)) for row in rows),
+            )
+            self._connection.commit()
 
     def selected_file_mask(
         self, file_id: int, positions: Sequence[int]
     ) -> np.ndarray:
         if not positions:
             return np.zeros(0, dtype=bool)
-        mode = self._connection.execute(
-            "SELECT all_rows FROM file_mode WHERE file_id = ?", (file_id,)
-        ).fetchone()
-        if mode is None or bool(mode[0]):
-            return np.ones(len(positions), dtype=bool)
-        selected = {
-            int(row[0])
-            for row in self._connection.execute(
-                "SELECT row_index FROM selected_file_row "
-                "WHERE file_id = ? AND row_index BETWEEN ? AND ?",
-                (file_id, int(positions[0]), int(positions[-1])),
-            )
-        }
+        with self._connection_lock:
+            mode = self._connection.execute(
+                "SELECT all_rows FROM file_mode WHERE file_id = ?", (file_id,)
+            ).fetchone()
+            if mode is None or bool(mode[0]):
+                return np.ones(len(positions), dtype=bool)
+            selected = {
+                int(row[0])
+                for row in self._connection.execute(
+                    "SELECT row_index FROM selected_file_row "
+                    "WHERE file_id = ? AND row_index BETWEEN ? AND ?",
+                    (file_id, int(positions[0]), int(positions[-1])),
+                )
+            }
         return np.fromiter(
             (int(position) in selected for position in positions),
             dtype=bool,
@@ -1395,66 +1464,73 @@ class _SelectionIndex:
     def selected_facts(
         self, file_id: int
     ) -> Iterator[tuple[str, int, int, str | None]]:
-        mode = self._connection.execute(
-            "SELECT all_rows FROM file_mode WHERE file_id = ?", (file_id,)
-        ).fetchone()
-        if mode is None or bool(mode[0]):
-            query = (
-                "SELECT numeric_columns, timestamp_present, "
-                "timestamp_numeric, timestamp_value FROM file_row "
-                "WHERE file_id = ? ORDER BY row_index"
-            )
-        else:
-            query = (
-                "SELECT f.numeric_columns, f.timestamp_present, "
-                "f.timestamp_numeric, f.timestamp_value FROM file_row AS f "
-                "JOIN selected_file_row AS s USING(file_id, row_index) "
-                "WHERE f.file_id = ? ORDER BY f.row_index"
-            )
-        yield from self._connection.execute(query, (file_id,))
+        with self._connection_lock:
+            mode = self._connection.execute(
+                "SELECT all_rows FROM file_mode WHERE file_id = ?", (file_id,)
+            ).fetchone()
+            if mode is None or bool(mode[0]):
+                query = (
+                    "SELECT numeric_columns, timestamp_present, "
+                    "timestamp_numeric, timestamp_value FROM file_row "
+                    "WHERE file_id = ? ORDER BY row_index"
+                )
+            else:
+                query = (
+                    "SELECT f.numeric_columns, f.timestamp_present, "
+                    "f.timestamp_numeric, f.timestamp_value FROM file_row AS f "
+                    "JOIN selected_file_row AS s USING(file_id, row_index) "
+                    "WHERE f.file_id = ? ORDER BY f.row_index"
+                )
+            yield from self._connection.execute(query, (file_id,))
 
     def discard_file_facts(self, file_id: int) -> None:
-        self._connection.execute(
-            "DELETE FROM file_row WHERE file_id = ?", (file_id,)
-        )
-        self._connection.commit()
+        with self._connection_lock:
+            self._connection.execute(
+                "DELETE FROM file_row WHERE file_id = ?", (file_id,)
+            )
+            self._connection.commit()
 
     def add_class_candidates(
         self, rows: Iterable[tuple[str, int, int, str, str]]
     ) -> None:
-        self._connection.executemany(
-            "INSERT INTO class_candidate VALUES (?, ?, ?, ?, ?)", rows
-        )
-        self._connection.commit()
+        with self._connection_lock:
+            self._connection.executemany(
+                "INSERT INTO class_candidate VALUES (?, ?, ?, ?, ?)", rows
+            )
+            self._connection.commit()
 
     def iter_class_candidates(
         self, file_id: int, label: str
     ) -> Iterator[tuple[str, str]]:
-        yield from self._connection.execute(
-            "SELECT uid, numeric_columns FROM class_candidate "
-            "WHERE file_id = ? AND label = ? ORDER BY row_index",
-            (file_id, label),
-        )
+        with self._connection_lock:
+            yield from self._connection.execute(
+                "SELECT uid, numeric_columns FROM class_candidate "
+                "WHERE file_id = ? AND label = ? ORDER BY row_index",
+                (file_id, label),
+            )
 
     def set_selected_class_rows(self, ordered_uids: Iterable[str]) -> None:
-        self._connection.executemany(
-            "INSERT INTO selected_class_row VALUES (?, ?)",
-            ((uid, ordinal) for ordinal, uid in enumerate(ordered_uids)),
-        )
-        self._connection.commit()
+        with self._connection_lock:
+            self._connection.executemany(
+                "INSERT INTO selected_class_row VALUES (?, ?)",
+                ((uid, ordinal) for ordinal, uid in enumerate(ordered_uids)),
+            )
+            self._connection.commit()
 
     def selected_class_mask(self, uids: Sequence[str]) -> np.ndarray:
         selected: set[str] = set()
-        for start in range(0, len(uids), 500):
-            batch = list(uids[start : start + 500])
-            placeholders = ",".join("?" for _ in batch)
-            selected.update(
-                str(row[0])
-                for row in self._connection.execute(
-                    f"SELECT uid FROM selected_class_row WHERE uid IN ({placeholders})",
-                    batch,
+        with self._connection_lock:
+            for start in range(0, len(uids), 500):
+                batch = list(uids[start : start + 500])
+                placeholders = ",".join("?" for _ in batch)
+                selected.update(
+                    str(row[0])
+                    for row in self._connection.execute(
+                        "SELECT uid FROM selected_class_row "
+                        f"WHERE uid IN ({placeholders})",
+                        batch,
+                    )
                 )
-            )
         return np.fromiter(
             (str(uid) in selected for uid in uids),
             dtype=bool,
@@ -1462,80 +1538,93 @@ class _SelectionIndex:
         )
 
     def selected_class_facts(self) -> Iterator[tuple[int, str]]:
-        yield from self._connection.execute(
-            "SELECT c.file_id, c.numeric_columns FROM class_candidate AS c "
-            "JOIN selected_class_row AS s USING(uid) "
-            "ORDER BY c.file_id, c.row_index"
-        )
+        with self._connection_lock:
+            yield from self._connection.execute(
+                "SELECT c.file_id, c.numeric_columns FROM class_candidate AS c "
+                "JOIN selected_class_row AS s USING(uid) "
+                "ORDER BY c.file_id, c.row_index"
+            )
 
     def selected_class_counts(self) -> dict[int, int]:
-        return {
-            int(file_id): int(count)
-            for file_id, count in self._connection.execute(
-                "SELECT c.file_id, COUNT(*) FROM class_candidate AS c "
-                "JOIN selected_class_row AS s USING(uid) GROUP BY c.file_id"
-            )
-        }
+        with self._connection_lock:
+            return {
+                int(file_id): int(count)
+                for file_id, count in self._connection.execute(
+                    "SELECT c.file_id, COUNT(*) FROM class_candidate AS c "
+                    "JOIN selected_class_row AS s USING(uid) GROUP BY c.file_id"
+                )
+            }
 
     def proof_membership_tokens(self, *, class_limited: bool) -> Iterator[str]:
-        if class_limited:
-            for (uid,) in self._connection.execute(
-                "SELECT uid FROM selected_class_row ORDER BY uid"
+        with self._connection_lock:
+            if class_limited:
+                for (uid,) in self._connection.execute(
+                    "SELECT uid FROM selected_class_row ORDER BY uid"
+                ):
+                    yield f"uid:{uid}"
+                return
+            for file_id, all_rows in self._connection.execute(
+                "SELECT file_id, all_rows FROM file_mode ORDER BY file_id"
             ):
-                yield f"uid:{uid}"
-            return
-        for file_id, all_rows in self._connection.execute(
-            "SELECT file_id, all_rows FROM file_mode ORDER BY file_id"
-        ):
-            if bool(all_rows):
-                yield f"file:{int(file_id)}:all"
-                continue
-            for (row_index,) in self._connection.execute(
-                "SELECT row_index FROM selected_file_row "
-                "WHERE file_id = ? ORDER BY row_index",
-                (file_id,),
-            ):
-                yield f"file:{int(file_id)}:row:{int(row_index)}"
+                if bool(all_rows):
+                    yield f"file:{int(file_id)}:all"
+                    continue
+                for (row_index,) in self._connection.execute(
+                    "SELECT row_index FROM selected_file_row "
+                    "WHERE file_id = ? ORDER BY row_index",
+                    (file_id,),
+                ):
+                    yield f"file:{int(file_id)}:row:{int(row_index)}"
 
     def materialization_order(self, uids: Sequence[str]) -> dict[str, int]:
         order: dict[str, int] = {}
-        for start in range(0, len(uids), 500):
-            batch = list(uids[start : start + 500])
-            placeholders = ",".join("?" for _ in batch)
-            order.update(
-                (str(uid), int(position))
-                for uid, position in self._connection.execute(
-                    "SELECT uid, materialization_order FROM selected_class_row "
-                    f"WHERE uid IN ({placeholders})",
-                    batch,
+        with self._connection_lock:
+            for start in range(0, len(uids), 500):
+                batch = list(uids[start : start + 500])
+                placeholders = ",".join("?" for _ in batch)
+                order.update(
+                    (str(uid), int(position))
+                    for uid, position in self._connection.execute(
+                        "SELECT uid, materialization_order "
+                        "FROM selected_class_row "
+                        f"WHERE uid IN ({placeholders})",
+                        batch,
+                    )
                 )
-            )
         return order
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._connection.close()
-        names = (
-            self._relative_name,
-            f"{self._relative_name}-journal" if self._relative_name else None,
-            f"{self._relative_name}-wal" if self._relative_name else None,
-            f"{self._relative_name}-shm" if self._relative_name else None,
-        )
-        if self._directory_descriptor is not None:
-            for name in names:
-                if name is None:
-                    continue
+        with self._connection_lock:
+            if self._closed:
+                return
+            cleanups: list[BaseException] = []
+            if not self._connection_closed:
                 try:
-                    os.unlink(name, dir_fd=self._directory_descriptor)
-                except FileNotFoundError:
-                    pass
-        else:
-            self.path.unlink(missing_ok=True)
-            Path(f"{self.path}-journal").unlink(missing_ok=True)
-            Path(f"{self.path}-wal").unlink(missing_ok=True)
-            Path(f"{self.path}-shm").unlink(missing_ok=True)
+                    self._connection.close()
+                except BaseException as cleanup_error:
+                    cleanups.append(cleanup_error)
+                else:
+                    self._connection_closed = True
+            if self._connection_closed:
+                for artifact in tuple(self._pending_artifacts):
+                    try:
+                        if self._directory_descriptor is None:
+                            Path(artifact).unlink(missing_ok=True)
+                        else:
+                            os.unlink(
+                                artifact,
+                                dir_fd=self._directory_descriptor,
+                            )
+                    except FileNotFoundError:
+                        self._pending_artifacts.remove(artifact)
+                    except BaseException as cleanup_error:
+                        cleanups.append(cleanup_error)
+                    else:
+                        self._pending_artifacts.remove(artifact)
+            self._closed = (
+                self._connection_closed and not self._pending_artifacts
+            )
+            _raise_cleanup_errors(cleanups)
 
 
 def _iter_selected_raw(
@@ -2529,7 +2618,7 @@ class NormalizedSource:
 
     def iter_chunks(self) -> _NormalizedSourceIterator:
         with self._state_condition:
-            if self._state == "closing":
+            if self._state in {"closing", "cleanup_pending"}:
                 raise RuntimeError("normalized source is closing")
             if self._state == "closed":
                 raise RuntimeError("normalized source is closed")
@@ -2558,7 +2647,12 @@ class NormalizedSource:
                 self._state_condition.wait()
             if self._state == "closed":
                 return False, None
-            if self._active_token is not None and not allow_active:
+            retrying_cleanup = self._state == "cleanup_pending"
+            if (
+                self._active_token is not None
+                and not allow_active
+                and not retrying_cleanup
+            ):
                 raise RuntimeError(
                     "cannot close normalized source while a pass is active"
                 )
@@ -2581,16 +2675,19 @@ class NormalizedSource:
                 active.close()
             except BaseException as cleanup_error:
                 cleanups.append(cleanup_error)
-        try:
-            _close_iteration_plan(self._plan)
-        except BaseException as cleanup_error:
-            cleanups.append(cleanup_error)
-        finally:
-            with self._state_condition:
+        if not cleanups:
+            try:
+                _close_iteration_plan(self._plan)
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+        with self._state_condition:
+            if not cleanups:
                 self._active_token = None
                 self._active_iterator = None
                 self._state = "closed"
-                self._state_condition.notify_all()
+            else:
+                self._state = "cleanup_pending"
+            self._state_condition.notify_all()
         if primary is not None:
             _attach_cleanup_notes(primary, cleanups)
         else:
@@ -2603,7 +2700,7 @@ class NormalizedSource:
 
     def __enter__(self) -> NormalizedSource:
         with self._state_condition:
-            if self._state == "closing":
+            if self._state in {"closing", "cleanup_pending"}:
                 raise RuntimeError("normalized source is closing")
             if self._state == "closed":
                 raise RuntimeError("normalized source is closed")

@@ -358,6 +358,271 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "closed"):
                 source.iter_chunks()
 
+    def test_sampling_source_context_exit_can_close_from_another_thread(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "work"
+            work_dir.mkdir(mode=0o700)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 5, "x": range(5)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            config["dataset"]["max_rows_per_file"] = 4
+            source = open_normalized_source(config, work_dir=work_dir)
+            iterator = source.iter_chunks()
+            next(iterator)
+            close_started = threading.Event()
+            allow_close = threading.Event()
+            failures: list[BaseException] = []
+            original_close = iterator.close
+
+            def blocked_close() -> None:
+                close_started.set()
+                if not allow_close.wait(timeout=10):
+                    raise RuntimeError("close barrier timed out")
+                original_close()
+
+            iterator.close = blocked_close  # type: ignore[method-assign]
+
+            def close_context() -> None:
+                try:
+                    source.__exit__(None, None, None)
+                except BaseException as exc:
+                    failures.append(exc)
+
+            closer = threading.Thread(target=close_context)
+            closer.start()
+            self.assertTrue(close_started.wait(timeout=10))
+            try:
+                with self.assertRaisesRegex(RuntimeError, "closing"):
+                    source.iter_chunks()
+            finally:
+                allow_close.set()
+                closer.join(timeout=10)
+            try:
+                self.assertFalse(closer.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(list(work_dir.iterdir()), [])
+                with self.assertRaisesRegex(RuntimeError, "closed"):
+                    source.iter_chunks()
+            finally:
+                selection = source._plan.selection
+                if selection is not None and selection.path.exists():
+                    selection._connection.close()
+                    selection.path.unlink(missing_ok=True)
+                snapshot_root = source._plan.snapshots.root
+                if snapshot_root.exists():
+                    snapshot_root.rmdir()
+
+    def test_selection_close_retries_connection_and_unlink_failures(self) -> None:
+        class CloseFailsOnce:
+            def __init__(self, connection) -> None:
+                self.connection = connection
+                self.failed = False
+
+            def __getattr__(self, name: str):
+                return getattr(self.connection, name)
+
+            def close(self) -> None:
+                if not self.failed:
+                    self.failed = True
+                    raise OSError("injected connection close failure")
+                self.connection.close()
+
+        for failure in ("connection", "unlink"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                selection = source_module._SelectionIndex(root)
+                selection_path = selection.path
+                original_connection = selection._connection
+                try:
+                    if failure == "connection":
+                        selection._connection = CloseFailsOnce(
+                            original_connection
+                        )
+                        with self.assertRaisesRegex(
+                            OSError, "connection close failure"
+                        ):
+                            selection.close()
+                        selection.close()
+                    else:
+                        original_unlink = Path.unlink
+                        failed = False
+
+                        def unlink_once(path: Path, *args, **kwargs) -> None:
+                            nonlocal failed
+                            if Path(path) == selection_path and not failed:
+                                failed = True
+                                raise OSError("injected selection unlink failure")
+                            original_unlink(path, *args, **kwargs)
+
+                        with patch.object(Path, "unlink", unlink_once):
+                            with self.assertRaisesRegex(
+                                OSError, "selection unlink failure"
+                            ):
+                                selection.close()
+                            selection.close()
+                    self.assertFalse(selection_path.exists())
+                finally:
+                    original_connection.close()
+                    selection_path.unlink(missing_ok=True)
+
+    def test_normalized_source_retries_failed_cleanup_and_preserves_primary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "work"
+            work_dir.mkdir(mode=0o700)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 5, "x": range(5)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            config["dataset"]["max_rows_per_file"] = 4
+            source = open_normalized_source(config, work_dir=work_dir)
+            selection = source._plan.selection
+            self.assertIsNotNone(selection)
+            assert selection is not None
+            original_close = selection.close
+            attempts = 0
+
+            def fail_once() -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("injected plan cleanup failure")
+                original_close()
+
+            primary = ValueError("body primary")
+            try:
+                with patch.object(selection, "close", side_effect=fail_once):
+                    source.__exit__(ValueError, primary, None)
+                    self.assertTrue(
+                        any(
+                            "plan cleanup failure" in note
+                            for note in getattr(primary, "__notes__", ())
+                        )
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "closing"):
+                        source.iter_chunks()
+                    source.close()
+                self.assertEqual(attempts, 2)
+                self.assertEqual(list(work_dir.iterdir()), [])
+                with self.assertRaisesRegex(RuntimeError, "closed"):
+                    source.iter_chunks()
+            finally:
+                original_close()
+                snapshot_root = source._plan.snapshots.root
+                if snapshot_root.exists():
+                    snapshot_root.rmdir()
+
+    def test_snapshot_store_close_retries_unlink_and_guard_failures(self) -> None:
+        for failure in ("unlink", "guard"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                work_dir = Path(directory) / "work"
+                work_dir.mkdir(mode=0o700)
+                store = source_module._SnapshotStore(work_dir)
+                guard = store._work_guard
+                self.assertIsNotNone(guard)
+                assert guard is not None
+                builder = store.begin(0)
+                builder.handle.write(b"x")
+                snapshot = builder.commit("digest", 1)
+                original_guard_close = guard.close
+                try:
+                    if failure == "unlink":
+                        original_unlink = store.unlink_member
+                        failed = False
+
+                        def unlink_once(name: str) -> None:
+                            nonlocal failed
+                            if name == snapshot.relative_name and not failed:
+                                failed = True
+                                raise OSError("injected snapshot unlink failure")
+                            original_unlink(name)
+
+                        with patch.object(
+                            store, "unlink_member", side_effect=unlink_once
+                        ):
+                            with self.assertRaisesRegex(
+                                OSError, "snapshot unlink failure"
+                            ):
+                                store.close()
+                            store.close()
+                    else:
+                        attempts = 0
+
+                        def close_guard_once() -> None:
+                            nonlocal attempts
+                            attempts += 1
+                            if attempts == 1:
+                                raise OSError("injected guard close failure")
+                            original_guard_close()
+
+                        with patch.object(
+                            guard, "close", side_effect=close_guard_once
+                        ):
+                            with self.assertRaisesRegex(
+                                OSError, "guard close failure"
+                            ):
+                                store.close()
+                            store.close()
+                        self.assertEqual(attempts, 2)
+                    self.assertEqual(list(work_dir.iterdir()), [])
+                    self.assertTrue(guard._closed)
+                finally:
+                    original_guard_close()
+                    if store.root.exists():
+                        if snapshot.path.exists():
+                            os.chmod(snapshot.path, 0o600)
+                            snapshot.path.unlink()
+                        store.root.rmdir()
+
+    def test_private_work_guard_close_retries_handle_owner_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory) / "work"
+            work_dir.mkdir(mode=0o700)
+            guard = source_module._PrivateWorkGuard(work_dir)
+            child = guard.create_child()
+            guard.remove_child(child)
+            original_close_children = guard._close_child_handles
+            attempts = 0
+
+            def close_children_once() -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("injected handle owner close failure")
+                original_close_children()
+
+            try:
+                with patch.object(
+                    guard,
+                    "_close_child_handles",
+                    side_effect=close_children_once,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "handle owner close failure"
+                    ):
+                        guard.close()
+                    guard.close()
+                self.assertEqual(attempts, 2)
+                self.assertTrue(guard._closed)
+                self.assertEqual(guard._windows_handles, [])
+                self.assertIsNone(guard._parent_descriptor)
+            finally:
+                guard._closed = False
+                original_close_children()
+                guard.close()
+
     def test_abandoned_iterator_releases_session_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
