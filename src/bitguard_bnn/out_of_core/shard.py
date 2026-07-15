@@ -41,8 +41,8 @@ from bitguard_bnn.out_of_core.manifest import (
 from bitguard_bnn.out_of_core.source import NormalizedChunk
 
 
-SHARD_MANIFEST_SCHEMA = "bitguard.shard-manifest.v1"
-SHARD_ALGORITHM = "bitguard.immutable-parquet-shards.v1"
+SHARD_MANIFEST_SCHEMA = "bitguard.shard-manifest.v2"
+SHARD_ALGORITHM = "bitguard.immutable-parquet-shards.v2"
 COVERAGE_ALGORITHM = "bitguard.external-uid-coverage.v1"
 
 _PARTITIONS = ("train", "validation", "test")
@@ -222,7 +222,7 @@ def _schema_descriptor(schema: pa.Schema) -> list[dict[str, Any]]:
     ]
 
 
-def _shard_schema(selected_features: Sequence[str]) -> pa.Schema:
+def _shard_schema(materialized_features: Sequence[str]) -> pa.Schema:
     fields = [
         pa.field("row_uid", pa.string(), nullable=False),
         pa.field("source_file", pa.string(), nullable=False),
@@ -232,28 +232,84 @@ def _shard_schema(selected_features: Sequence[str]) -> pa.Schema:
         pa.field("behavior_label", pa.string(), nullable=False),
         pa.field("timestamp", pa.float64(), nullable=True),
     ]
-    fields.extend(pa.field(name, pa.float32(), nullable=True) for name in selected_features)
+    fields.extend(
+        pa.field(name, pa.float32(), nullable=True) for name in materialized_features
+    )
     return pa.schema(fields)
 
 
-def _working_schema(selected_features: Sequence[str]) -> pa.Schema:
-    fields = list(_shard_schema(selected_features))
+def _working_schema(materialized_features: Sequence[str]) -> pa.Schema:
+    fields = list(_shard_schema(materialized_features))
     fields.insert(7, pa.field("split", pa.string(), nullable=False))
     return pa.schema(fields)
 
 
-def _validate_features(selected_features: Sequence[str]) -> tuple[str, ...]:
+def _validate_features(
+    selected_features: Sequence[str], *, subject: str = "selected_features"
+) -> tuple[str, ...]:
     features = tuple(str(name) for name in selected_features)
     if not features:
-        raise ValueError("selected_features must not be empty")
+        raise ValueError(f"{subject} must not be empty")
     if any(not name for name in features):
-        raise ValueError("selected_features must contain non-empty names")
+        raise ValueError(f"{subject} must contain non-empty names")
     if len(set(features)) != len(features):
-        raise ValueError("selected_features must not contain duplicates")
+        raise ValueError(f"{subject} must not contain duplicates")
     collision = sorted(set(features) & _RESERVED_COLUMNS)
     if collision:
-        raise ValueError(f"selected_features collide with metadata: {collision}")
+        raise ValueError(f"{subject} collide with metadata: {collision}")
     return features
+
+
+def _validate_optional_features(
+    values: Sequence[str], *, subject: str
+) -> tuple[str, ...]:
+    features = tuple(str(name) for name in values)
+    if any(not name for name in features):
+        raise ValueError(f"{subject} must contain non-empty names")
+    if len(set(features)) != len(features):
+        raise ValueError(f"{subject} must not contain duplicates")
+    collision = sorted(set(features) & _RESERVED_COLUMNS)
+    if collision:
+        raise ValueError(f"{subject} collide with metadata: {collision}")
+    return features
+
+
+def _validate_materialization_contract(
+    selected_features: Sequence[str],
+    materialized_features: Sequence[str] | None,
+    boolean_fast_path_features: Sequence[str],
+    missing_boolean_fast_path_features: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, list[str]]]:
+    selected = _validate_features(selected_features)
+    configured = _validate_optional_features(
+        boolean_fast_path_features,
+        subject="boolean_fast_path_features",
+    )
+    missing = _validate_optional_features(
+        missing_boolean_fast_path_features,
+        subject="missing_boolean_fast_path_features",
+    )
+    if not set(missing).issubset(configured):
+        raise ValueError(
+            "missing_boolean_fast_path_features must be configured features"
+        )
+    available = tuple(name for name in configured if name not in set(missing))
+    expected = selected + tuple(name for name in available if name not in selected)
+    materialized = (
+        expected
+        if materialized_features is None
+        else _validate_features(materialized_features, subject="materialized_features")
+    )
+    if materialized != expected:
+        raise ValueError(
+            "materialized_features must be selected_features followed by available "
+            "Boolean fast-path features in configured order"
+        )
+    return selected, materialized, {
+        "configured_features": list(configured),
+        "available_features": list(available),
+        "missing_features": list(missing),
+    }
 
 
 def _validate_positive(name: str, value: int, *, minimum: int = 1) -> int:
@@ -911,6 +967,8 @@ def _manifest_semantics(payload: Mapping[str, Any]) -> dict[str, Any]:
         "preprocessing_fingerprint",
         "split_fingerprint",
         "selected_features",
+        "materialized_features",
+        "boolean_fast_path",
         "counts",
         "class_counts",
         "source_coverage",
@@ -934,6 +992,8 @@ def _build_manifest(
     preprocessing_fingerprint: str,
     split_plan: SplitPlan,
     selected_features: tuple[str, ...],
+    materialized_features: tuple[str, ...],
+    boolean_fast_path: Mapping[str, Sequence[str]],
     schema: pa.Schema,
     entries: list[dict[str, Any]],
     row_count: int,
@@ -967,6 +1027,12 @@ def _build_manifest(
         "preprocessing_fingerprint": preprocessing_fingerprint,
         "split_fingerprint": split_plan.fingerprint,
         "selected_features": list(selected_features),
+        "materialized_features": list(materialized_features),
+        "boolean_fast_path": {
+            "configured_features": list(boolean_fast_path["configured_features"]),
+            "available_features": list(boolean_fast_path["available_features"]),
+            "missing_features": list(boolean_fast_path["missing_features"]),
+        },
         "counts": {name: int(counts[name]) for name in _PARTITIONS},
         "class_counts": {
             name: dict(sorted(class_counts[name].items())) for name in _PARTITIONS
@@ -1490,8 +1556,24 @@ def verify_shard_manifest(
             raise RuntimeError("split fingerprint mismatch")
         split_manifest = _validate_split_plan(split_plan)
     try:
-        selected_features = _validate_features(manifest["selected_features"])
-        schema = _shard_schema(selected_features)
+        boolean_contract = manifest["boolean_fast_path"]
+        if not isinstance(boolean_contract, Mapping) or set(boolean_contract) != {
+            "configured_features",
+            "available_features",
+            "missing_features",
+        }:
+            raise ValueError("invalid Boolean fast-path contract")
+        selected_features, materialized_features, expected_boolean = (
+            _validate_materialization_contract(
+                manifest["selected_features"],
+                manifest["materialized_features"],
+                boolean_contract["configured_features"],
+                boolean_contract["missing_features"],
+            )
+        )
+        if expected_boolean != dict(boolean_contract):
+            raise ValueError("Boolean fast-path availability contract mismatch")
+        schema = _shard_schema(materialized_features)
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("invalid shard feature contract") from exc
     descriptor = _schema_descriptor(schema)
@@ -1676,15 +1758,23 @@ def write_parquet_shards(
     *,
     dataset_name: str,
     preprocessing_fingerprint: str,
+    materialized_features: Sequence[str] | None = None,
+    boolean_fast_path_features: Sequence[str] = (),
+    missing_boolean_fast_path_features: Sequence[str] = (),
     shard_target_rows: int = 1_000_000,
     record_batch_rows: int = 65_536,
     max_rows_per_run: int = 65_536,
     merge_fan_in: int = 32,
     merge_read_rows: int = 1_024,
 ) -> ShardPlan:
-    """Build immutable selected-feature shards through bounded external merges."""
+    """Build immutable training/Boolean shards through bounded external merges."""
 
-    features = _validate_features(selected_features)
+    selected, materialized, boolean_contract = _validate_materialization_contract(
+        selected_features,
+        materialized_features,
+        boolean_fast_path_features,
+        missing_boolean_fast_path_features,
+    )
     shard_target_rows = _validate_positive("shard_target_rows", shard_target_rows)
     record_batch_rows = _validate_positive("record_batch_rows", record_batch_rows)
     max_rows_per_run = _validate_positive("max_rows_per_run", max_rows_per_run)
@@ -1710,8 +1800,8 @@ def write_parquet_shards(
     work = output / f".shards-{uuid.uuid4().hex}.partial"
     work.mkdir()
     tracker = _ResourceTracker(work, max_rows_per_run, merge_read_rows)
-    shard_schema = _shard_schema(features)
-    working_schema = _working_schema(features)
+    shard_schema = _shard_schema(materialized)
+    working_schema = _working_schema(materialized)
     manifest_path = output / "shard_manifest.json"
     published: list[tuple[Path, FileIdentity]] = []
     created_directories: list[tuple[Path, FileIdentity]] = []
@@ -1726,7 +1816,7 @@ def write_parquet_shards(
         source_runs = _write_source_runs(
             chunks,
             work,
-            selected_features=features,
+            selected_features=materialized,
             schema=working_schema,
             max_rows_per_run=max_rows_per_run,
             merge_read_rows=merge_read_rows,
@@ -1779,7 +1869,9 @@ def write_parquet_shards(
             dataset=dataset,
             preprocessing_fingerprint=preprocessing_fingerprint,
             split_plan=split_plan,
-            selected_features=features,
+            selected_features=selected,
+            materialized_features=materialized,
+            boolean_fast_path=boolean_contract,
             schema=shard_schema,
             entries=entries,
             row_count=row_count,

@@ -127,6 +127,45 @@ class OutOfCoreShardTests(unittest.TestCase):
         )
         return split, plan
 
+    def test_manifest_distinguishes_selected_and_boolean_materialized_features(self) -> None:
+        from bitguard_bnn.out_of_core.shard import (
+            verify_shard_manifest,
+            write_parquet_shards,
+        )
+
+        rows = _rows()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split = _split(rows, root)
+            plan = write_parquet_shards(
+                _chunks(rows),
+                split,
+                ("f1",),
+                root / "prepared",
+                dataset_name="fixture",
+                preprocessing_fingerprint="preprocess-v2",
+                materialized_features=("f1", "f2"),
+                boolean_fast_path_features=("f2", "not_in_source"),
+                missing_boolean_fast_path_features=("not_in_source",),
+                shard_target_rows=5,
+                max_rows_per_run=6,
+                merge_fan_in=2,
+                merge_read_rows=3,
+            )
+            manifest = verify_shard_manifest(plan.manifest_path, split_plan=split)
+            self.assertEqual(manifest["selected_features"], ["f1"])
+            self.assertEqual(manifest["materialized_features"], ["f1", "f2"])
+            self.assertEqual(
+                manifest["boolean_fast_path"],
+                {
+                    "configured_features": ["f2", "not_in_source"],
+                    "available_features": ["f2"],
+                    "missing_features": ["not_in_source"],
+                },
+            )
+            first = plan.manifest_path.parent / manifest["entries"][0]["path"]
+            self.assertEqual(pq.ParquetFile(first).schema_arrow.names[-2:], ["f1", "f2"])
+
     def test_writes_exact_partitioned_coverage_and_semantic_manifest(self) -> None:
         from bitguard_bnn.out_of_core.shard import verify_shard_manifest
 

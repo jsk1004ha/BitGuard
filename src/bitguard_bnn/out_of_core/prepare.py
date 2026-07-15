@@ -41,9 +41,9 @@ from bitguard_bnn.out_of_core.source import (
 from bitguard_bnn.preprocess import FeaturePreprocessor
 
 
-PREPARED_DATASET_SCHEMA = "bitguard.prepared-dataset.v2"
-FEATURE_ARTIFACT_SCHEMA = "bitguard.streaming-feature-artifact.v1"
-PREPARATION_ALGORITHM = "bitguard.full-dataset-preparation.v2"
+PREPARED_DATASET_SCHEMA = "bitguard.prepared-dataset.v3"
+FEATURE_ARTIFACT_SCHEMA = "bitguard.streaming-feature-artifact.v2"
+PREPARATION_ALGORITHM = "bitguard.full-dataset-preparation.v3"
 
 _PARTITIONS = ("train", "validation", "test")
 _MEMBERSHIP_COLUMNS = ("row_uid", "split", "behavior_label")
@@ -568,6 +568,7 @@ def _feature_artifact(
     source_proof_fingerprint: str,
     split_fingerprint: str,
     preprocessor_sha256: str,
+    materialization: Mapping[str, Sequence[str]],
 ) -> dict[str, Any]:
     def array_state(value: object, name: str) -> dict[str, Any]:
         array = np.asarray(value)
@@ -622,10 +623,41 @@ def _feature_artifact(
         "split_fingerprint": split_fingerprint,
         "preprocessor_sha256": preprocessor_sha256,
         "feature_manifest": processor.feature_manifest(),
+        "materialized_features": list(materialization["materialized_features"]),
+        "boolean_fast_path": {
+            "configured_features": list(materialization["configured_features"]),
+            "available_features": list(materialization["available_features"]),
+            "missing_features": list(materialization["missing_features"]),
+        },
         "scientific_fingerprint": stable_fingerprint(science),
     }
     payload["fingerprint"] = stable_fingerprint(payload)
     return payload
+
+
+def _materialization_contract(
+    processor: FeaturePreprocessor, config: Mapping[str, Any]
+) -> dict[str, list[str]]:
+    configured = (
+        [str(name) for name in config["cascade"].get("boolean_fast_path_features", ())]
+        if bool(config["cascade"].get("boolean_fast_path_enabled", True))
+        else []
+    )
+    if any(not name for name in configured) or len(set(configured)) != len(configured):
+        raise ValueError(
+            "cascade.boolean_fast_path_features must contain unique non-empty names"
+        )
+    candidates = set(processor.candidate_features)
+    available = [name for name in configured if name in candidates]
+    missing = [name for name in configured if name not in candidates]
+    materialized = list(processor.selected_features)
+    materialized.extend(name for name in available if name not in materialized)
+    return {
+        "materialized_features": materialized,
+        "configured_features": configured,
+        "available_features": available,
+        "missing_features": missing,
+    }
 
 
 def estimate_preparation_disk(
@@ -743,6 +775,7 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
     if _sha256_file(preprocessor_path) != prepared.preprocessor_sha256:
         raise RuntimeError("prepared preprocessor checksum mismatch")
     processor = FeaturePreprocessor.load(preprocessor_path)
+    materialization = _materialization_contract(processor, config)
     feature_payload = _read_json(
         Path(prepared.feature_manifest_path), "feature manifest"
     )
@@ -764,7 +797,16 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
             source_proof_fingerprint=prepared.normalized_source_fingerprint,
             split_fingerprint=prepared.split_fingerprint,
             preprocessor_sha256=prepared.preprocessor_sha256,
+            materialization=materialization,
         ).get("scientific_fingerprint")
+        or feature_payload.get("materialized_features")
+        != materialization["materialized_features"]
+        or feature_payload.get("boolean_fast_path")
+        != {
+            "configured_features": materialization["configured_features"],
+            "available_features": materialization["available_features"],
+            "missing_features": materialization["missing_features"],
+        }
     ):
         raise RuntimeError("prepared feature artifact fingerprint mismatch")
 
@@ -777,6 +819,15 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
     counts = shard["counts"]
     if (
         shard.get("fingerprint") != prepared.shard_fingerprint
+        or shard.get("selected_features") != list(processor.selected_features)
+        or shard.get("materialized_features")
+        != materialization["materialized_features"]
+        or shard.get("boolean_fast_path")
+        != {
+            "configured_features": materialization["configured_features"],
+            "available_features": materialization["available_features"],
+            "missing_features": materialization["missing_features"],
+        }
         or counts
         != {
             "train": prepared.train_count,
@@ -931,9 +982,11 @@ def prepare_full_dataset(
                 source_proof_fingerprint=source.proof.fingerprint,
                 split_fingerprint=split.fingerprint,
                 preprocessor_sha256=preprocessor_sha,
+                materialization=_materialization_contract(processor, config),
             )
             _publish_json_immutable(feature_manifest_path, feature_payload)
             preprocessing_fingerprint = str(feature_payload["fingerprint"])
+            materialization = _materialization_contract(processor, config)
             shards = write_parquet_shards(
                 source.iter_chunks(),
                 split,
@@ -941,6 +994,9 @@ def prepare_full_dataset(
                 output,
                 dataset_name=dataset,
                 preprocessing_fingerprint=preprocessing_fingerprint,
+                materialized_features=materialization["materialized_features"],
+                boolean_fast_path_features=materialization["configured_features"],
+                missing_boolean_fast_path_features=materialization["missing_features"],
                 shard_target_rows=int(config["dataset"]["shard_target_rows"]),
                 record_batch_rows=int(config["dataset"]["record_batch_rows"]),
                 max_rows_per_run=int(config["dataset"]["record_batch_rows"]),
