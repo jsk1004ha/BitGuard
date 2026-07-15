@@ -1,8 +1,8 @@
 """Crash-safe disk-backed calibration state for complete validation splits.
 
-Only the contiguous prefix named by ``journal.json`` is committed.  Range bytes
-are flushed and synced before the journal is atomically replaced, so an
-interrupted writer can safely overwrite an uncommitted suffix on resume.
+Raw inference and calibrated routing use independent contiguous-prefix journals.
+Range bytes are flushed and synced before their journal is atomically replaced,
+so an interrupted writer can safely overwrite only an uncommitted suffix.
 """
 
 from __future__ import annotations
@@ -20,11 +20,13 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
-CACHE_ALGORITHM = "bitguard.calibration-cache.v1"
-_LAYOUT_SCHEMA = "bitguard.calibration-cache-layout.v1"
-_JOURNAL_SCHEMA = "bitguard.calibration-cache-journal.v1"
+CACHE_ALGORITHM = "bitguard.calibration-cache.v2"
+_LAYOUT_SCHEMA = "bitguard.calibration-cache-layout.v2"
+_INFERENCE_JOURNAL_SCHEMA = "bitguard.calibration-cache-inference-journal.v1"
+_ROUTING_JOURNAL_SCHEMA = "bitguard.calibration-cache-routing-journal.v1"
 _LAYOUT_FILE = "layout.json"
-_JOURNAL_FILE = "journal.json"
+_INFERENCE_JOURNAL_FILE = "inference_journal.json"
+_ROUTING_JOURNAL_FILE = "routing_journal.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +37,9 @@ class CacheLayout:
     shard_fingerprint: str
     preprocessor_fingerprint: str
     source_fingerprint: str
+    main_checkpoint_fingerprint: str
+    tiny_checkpoint_fingerprint: str | None
+    inference_contract_fingerprint: str
     split: str
     row_count: int
     main_class_labels: tuple[str, ...]
@@ -52,12 +57,24 @@ class CacheLayout:
             "shard_fingerprint",
             "preprocessor_fingerprint",
             "source_fingerprint",
+            "main_checkpoint_fingerprint",
+            "inference_contract_fingerprint",
             "split",
             "algorithm",
         ):
             value = getattr(self, field)
             if not isinstance(value, str) or not value or "\x00" in value:
                 raise ValueError(f"CacheLayout.{field} must be a non-empty string")
+        if self.tiny_checkpoint_fingerprint is not None and (
+            not isinstance(self.tiny_checkpoint_fingerprint, str)
+            or not self.tiny_checkpoint_fingerprint
+            or "\x00" in self.tiny_checkpoint_fingerprint
+        ):
+            raise ValueError(
+                "CacheLayout.tiny_checkpoint_fingerprint must be None or a non-empty string"
+            )
+        if self.algorithm != CACHE_ALGORITHM:
+            raise ValueError("CacheLayout.algorithm is not supported by this implementation")
         for field in ("row_count", "device_id_width", "source_id_width"):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -144,13 +161,12 @@ class _ArraySpec:
         return int(np.prod(self.shape, dtype=np.int64)) * self.numpy_dtype.itemsize
 
 
-def _array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
+def _inference_array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
     rows = layout.row_count
     main_classes = len(layout.main_class_labels)
-    routed_classes = len(layout.routed_class_labels)
     selected = len(layout.selected_features)
     boolean = len(layout.boolean_features)
-    specs = {
+    return {
         "cache_position": _ArraySpec("<i8", (rows,)),
         "uid_digest": _ArraySpec("|u1", (rows, 32)),
         "true_label": _ArraySpec("<i4", (rows,)),
@@ -163,11 +179,21 @@ def _array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
         "device_id_length": _ArraySpec("<u4", (rows,)),
         "source_id_bytes": _ArraySpec("|u1", (rows, layout.source_id_width)),
         "source_id_length": _ArraySpec("<u4", (rows,)),
-        "routed_probabilities": _ArraySpec("<f4", (rows, routed_classes)),
-        "exit_stage": _ArraySpec("<i2", (rows,)),
         "boolean_flags": _ArraySpec("|u1", (rows, boolean)),
     }
-    return specs
+
+
+def _routing_array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
+    return {
+        "routed_probabilities": _ArraySpec(
+            "<f4", (layout.row_count, len(layout.routed_class_labels))
+        ),
+        "exit_stage": _ArraySpec("<i2", (layout.row_count,)),
+    }
+
+
+def _array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
+    return {**_inference_array_specs(layout), **_routing_array_specs(layout)}
 
 
 class CalibrationCache:
@@ -179,7 +205,11 @@ class CalibrationCache:
         layout: CacheLayout,
         arrays: dict[str, np.ndarray[Any, Any]],
         committed_rows: int,
-        commits: list[dict[str, Any]],
+        inference_commits: list[dict[str, Any]],
+        routed_committed_rows: int,
+        routing_commits: list[dict[str, Any]],
+        routing_contract_fingerprint: str | None,
+        expected_routing_contract_fingerprint: str | None,
         *,
         readonly: bool,
     ) -> None:
@@ -188,7 +218,13 @@ class CalibrationCache:
         self._arrays = arrays
         self._array_view: Mapping[str, np.ndarray[Any, Any]] = MappingProxyType(arrays)
         self._committed_rows = committed_rows
-        self._commits = commits
+        self._inference_commits = inference_commits
+        self._routed_committed_rows = routed_committed_rows
+        self._routing_commits = routing_commits
+        self._routing_contract_fingerprint = routing_contract_fingerprint
+        self._expected_routing_contract_fingerprint = (
+            expected_routing_contract_fingerprint
+        )
         self._readonly = readonly
         self._closed = False
         self._poisoned = False
@@ -205,10 +241,19 @@ class CalibrationCache:
             _write_exclusive(path / _LAYOUT_FILE, _json_bytes(layout.to_dict()))
             for name, spec in _array_specs(layout).items():
                 _preallocate(path / f"{name}.bin", spec.byte_size)
-            journal = _journal_payload(layout.fingerprint, 0, [])
-            _write_exclusive(path / _JOURNAL_FILE, _json_bytes(journal))
+            inference_journal = _inference_journal_payload(layout.fingerprint, 0, [])
+            routing_journal = _routing_journal_payload(layout.fingerprint, None, 0, [])
+            _write_exclusive(
+                path / _INFERENCE_JOURNAL_FILE, _json_bytes(inference_journal)
+            )
+            _write_exclusive(path / _ROUTING_JOURNAL_FILE, _json_bytes(routing_journal))
             _fsync_directory(path)
-            return cls._open(path, layout, readonly=False)
+            return cls._open(
+                path,
+                layout,
+                readonly=False,
+                expected_routing_contract_fingerprint=None,
+            )
         except BaseException:
             # A failed first creation is intentionally not accepted as resumable.
             # Leave evidence in place for explicit operator cleanup.
@@ -216,26 +261,79 @@ class CalibrationCache:
 
     @classmethod
     def open_readonly(
-        cls, root: Path | str, expected_layout: CacheLayout
+        cls,
+        root: Path | str,
+        expected_layout: CacheLayout,
+        *,
+        expected_routing_contract_fingerprint: str | None = None,
     ) -> CalibrationCache:
-        return cls._open(Path(root).expanduser(), expected_layout, readonly=True)
+        return cls._open(
+            Path(root).expanduser(),
+            expected_layout,
+            readonly=True,
+            expected_routing_contract_fingerprint=expected_routing_contract_fingerprint,
+        )
 
     @classmethod
     def open_resume(
-        cls, root: Path | str, expected_layout: CacheLayout
+        cls,
+        root: Path | str,
+        expected_layout: CacheLayout,
+        *,
+        expected_routing_contract_fingerprint: str | None = None,
     ) -> CalibrationCache:
-        return cls._open(Path(root).expanduser(), expected_layout, readonly=False)
+        return cls._open(
+            Path(root).expanduser(),
+            expected_layout,
+            readonly=False,
+            expected_routing_contract_fingerprint=expected_routing_contract_fingerprint,
+        )
 
     @classmethod
     def _open(
-        cls, root: Path, expected_layout: CacheLayout, *, readonly: bool
+        cls,
+        root: Path,
+        expected_layout: CacheLayout,
+        *,
+        readonly: bool,
+        expected_routing_contract_fingerprint: str | None,
     ) -> CalibrationCache:
+        _validate_optional_fingerprint(
+            expected_routing_contract_fingerprint,
+            "expected_routing_contract_fingerprint",
+        )
         _validate_directory(root)
         stored = CacheLayout.from_dict(_read_json(root / _LAYOUT_FILE, "layout"))
         if stored.fingerprint != expected_layout.fingerprint:
             raise RuntimeError("calibration cache layout does not match expected layout")
-        journal = _read_json(root / _JOURNAL_FILE, "journal")
-        committed_rows, commits = _validate_journal(journal, stored)
+        inference_journal = _read_json(
+            root / _INFERENCE_JOURNAL_FILE, "inference journal"
+        )
+        routing_journal = _read_json(root / _ROUTING_JOURNAL_FILE, "routing journal")
+        committed_rows, inference_commits = _validate_inference_journal(
+            inference_journal, stored
+        )
+        (
+            routed_committed_rows,
+            routing_commits,
+            routing_contract_fingerprint,
+        ) = _validate_routing_journal(routing_journal, stored)
+        if routed_committed_rows and committed_rows != stored.row_count:
+            raise RuntimeError("routed cache rows require complete inference")
+        if (
+            expected_routing_contract_fingerprint is not None
+            and routing_contract_fingerprint is not None
+            and expected_routing_contract_fingerprint
+            != routing_contract_fingerprint
+        ):
+            raise RuntimeError("calibration cache routing contract mismatch")
+        if (
+            routing_contract_fingerprint is not None
+            and expected_routing_contract_fingerprint is None
+        ):
+            raise RuntimeError(
+                "expected routing contract fingerprint is required for routed cache rows"
+            )
         specs = _array_specs(stored)
         arrays: dict[str, np.ndarray[Any, Any]] = {}
         try:
@@ -254,12 +352,24 @@ class CalibrationCache:
                         shape=spec.shape,
                         order="C",
                     )
-            _verify_committed_ranges(root, specs, commits)
+            _verify_committed_ranges(
+                root, _inference_array_specs(stored), inference_commits
+            )
+            _verify_committed_ranges(root, _routing_array_specs(stored), routing_commits)
         except BaseException:
             _close_memmaps(arrays.values())
             raise
         return cls(
-            root.resolve(), stored, arrays, committed_rows, commits, readonly=readonly
+            root.resolve(),
+            stored,
+            arrays,
+            committed_rows,
+            inference_commits,
+            routed_committed_rows,
+            routing_commits,
+            routing_contract_fingerprint,
+            expected_routing_contract_fingerprint,
+            readonly=readonly,
         )
 
     @property
@@ -273,49 +383,119 @@ class CalibrationCache:
         return self._committed_rows
 
     @property
+    def routed_committed_rows(self) -> int:
+        self._ensure_open()
+        return self._routed_committed_rows
+
+    @property
+    def routing_contract_fingerprint(self) -> str | None:
+        self._ensure_open()
+        return self._routing_contract_fingerprint
+
+    @property
     def readonly(self) -> bool:
         self._ensure_open()
         return self._readonly
 
-    def commit_range(self, start: int, values: Mapping[str, object]) -> None:
-        """Durably append one fully populated contiguous cache range."""
+    def commit_inference_range(
+        self, start: int, values: Mapping[str, object]
+    ) -> None:
+        """Durably append raw inference inputs without routed placeholders."""
 
-        self._ensure_open()
-        if self._readonly:
-            raise RuntimeError("read-only calibration cache cannot be committed")
-        if isinstance(start, bool) or not isinstance(start, int) or start != self._committed_rows:
-            raise ValueError("cache commit must start at the committed prefix")
-        prepared, rows = _prepare_batch(self.layout, start, values)
+        self._ensure_writable()
+        if type(start) is not int or start != self._committed_rows:
+            raise ValueError("inference commit must start at the committed prefix")
+        if self._routed_committed_rows:
+            raise ValueError("inference cannot advance after routing has begun")
+        prepared, rows = _prepare_inference_batch(self.layout, start, values)
         end = start + rows
         if end > self.layout.row_count:
-            raise ValueError("cache commit exceeds the declared row count")
-
-        for name, array in prepared.items():
-            self._arrays[name][start:end] = array
-        specs = _array_specs(self.layout)
-        for array in self._arrays.values():
-            if isinstance(array, np.memmap):
-                array.flush()
-        for name in specs:
-            _fsync_file(self.root / f"{name}.bin")
-
+            raise ValueError("inference commit exceeds the declared row count")
+        specs = _inference_array_specs(self.layout)
+        self._write_phase_range(start, end, prepared, specs)
         commit = {
             "start": start,
             "end": end,
             "sha256": _range_digest(self.root, specs, start, end),
         }
-        commits = [*self._commits, commit]
-        journal = _journal_payload(self.layout.fingerprint, end, commits)
+        commits = [*self._inference_commits, commit]
+        journal = _inference_journal_payload(self.layout.fingerprint, end, commits)
+        self._publish_journal(_INFERENCE_JOURNAL_FILE, journal)
+        self._inference_commits = commits
+        self._committed_rows = end
+
+    def commit_routing_range(
+        self,
+        start: int,
+        values: Mapping[str, object],
+        *,
+        routing_contract_fingerprint: str,
+    ) -> None:
+        """Durably append calibrated routing outputs under one contract identity."""
+
+        self._ensure_writable()
+        _validate_required_fingerprint(
+            routing_contract_fingerprint, "routing_contract_fingerprint"
+        )
+        if self._committed_rows != self.layout.row_count:
+            raise ValueError("routing requires complete inference")
+        if type(start) is not int or start != self._routed_committed_rows:
+            raise ValueError("routing commit must start at the routed committed prefix")
+        expected = (
+            self._routing_contract_fingerprint
+            or self._expected_routing_contract_fingerprint
+        )
+        if expected is not None and routing_contract_fingerprint != expected:
+            raise ValueError("routing contract fingerprint mismatch")
+        prepared, rows = _prepare_routing_batch(self.layout, values)
+        end = start + rows
+        if end > self.layout.row_count:
+            raise ValueError("routing commit exceeds the declared row count")
+        specs = _routing_array_specs(self.layout)
+        self._write_phase_range(start, end, prepared, specs)
+        commit = {
+            "start": start,
+            "end": end,
+            "sha256": _range_digest(self.root, specs, start, end),
+        }
+        commits = [*self._routing_commits, commit]
+        journal = _routing_journal_payload(
+            self.layout.fingerprint,
+            routing_contract_fingerprint,
+            end,
+            commits,
+        )
+        self._publish_journal(_ROUTING_JOURNAL_FILE, journal)
+        self._routing_commits = commits
+        self._routed_committed_rows = end
+        self._routing_contract_fingerprint = routing_contract_fingerprint
+
+    def _ensure_writable(self) -> None:
+        self._ensure_open()
+        if self._readonly:
+            raise RuntimeError("read-only calibration cache cannot be committed")
+
+    def _write_phase_range(
+        self,
+        start: int,
+        end: int,
+        prepared: Mapping[str, np.ndarray[Any, Any]],
+        specs: Mapping[str, _ArraySpec],
+    ) -> None:
+        for name, array in prepared.items():
+            self._arrays[name][start:end] = array
+        for name in specs:
+            array = self._arrays[name]
+            if isinstance(array, np.memmap):
+                array.flush()
+            _fsync_file(self.root / f"{name}.bin")
+
+    def _publish_journal(self, filename: str, journal: Mapping[str, Any]) -> None:
         try:
-            _write_journal(self.root, journal)
+            _write_journal(self.root, filename, journal)
         except BaseException:
-            # Publication may have failed before or after os.replace.  The live
-            # object cannot know which prefix is authoritative, so only a fresh
-            # open that validates the on-disk journal may continue.
             self._poison()
             raise
-        self._commits = commits
-        self._committed_rows = end
 
     def read_identifiers(self, field: str, start: int, end: int) -> tuple[str, ...]:
         """Decode a bounded committed range of losslessly stored UTF-8 identifiers."""
@@ -442,7 +622,7 @@ def _encode_identifiers(
     return encoded, lengths
 
 
-def _prepare_batch(
+def _prepare_inference_batch(
     layout: CacheLayout, start: int, values: Mapping[str, object]
 ) -> tuple[dict[str, np.ndarray[Any, Any]], int]:
     required = {
@@ -457,8 +637,6 @@ def _prepare_batch(
         "sequence",
         "device_id",
         "source_id",
-        "routed_probabilities",
-        "exit_stage",
     }
     if not isinstance(values, Mapping) or set(values) != required:
         raise ValueError("cache range fields do not match the cache schema")
@@ -469,7 +647,6 @@ def _prepare_batch(
     if rows <= 0:
         raise ValueError("cache commit range must not be empty")
     main_classes = len(layout.main_class_labels)
-    routed_classes = len(layout.routed_class_labels)
     true_classes = len(layout.true_class_labels)
     selected = len(layout.selected_features)
     booleans = len(layout.boolean_features)
@@ -491,10 +668,6 @@ def _prepare_batch(
         ),
         "timestamp": _require_array(values, "timestamp", np.dtype("<f8"), (rows,)),
         "sequence": _require_array(values, "sequence", np.dtype("<i8"), (rows,)),
-        "routed_probabilities": _require_array(
-            values, "routed_probabilities", np.dtype("<f4"), (rows, routed_classes)
-        ),
-        "exit_stage": _require_array(values, "exit_stage", np.dtype("<i2"), (rows,)),
     }
     boolean_flags = _require_array(
         values, "boolean_flags", np.dtype("bool"), (rows, booleans)
@@ -508,22 +681,16 @@ def _prepare_batch(
         "selected_values",
         "tiny_benign_probability",
         "timestamp",
-        "routed_probabilities",
     ):
         if not np.all(np.isfinite(prepared[name])):
             raise ValueError(f"{name} must contain only finite values")
     for name in (
         "known_probabilities",
         "tiny_benign_probability",
-        "routed_probabilities",
     ):
         if np.any(prepared[name] < 0.0) or np.any(prepared[name] > 1.0):
             raise ValueError(f"{name} must contain probabilities in [0, 1]")
-    for name in ("known_probabilities", "routed_probabilities"):
-        if not np.allclose(
-            prepared[name].sum(axis=1, dtype=np.float64), 1.0, rtol=0.0, atol=1e-5
-        ):
-            raise ValueError(f"{name} rows must sum to one")
+    _validate_probability_rows(prepared["known_probabilities"], "known_probabilities")
     device_bytes, device_lengths = _encode_identifiers(
         values["device_id"], name="device_id", rows=rows, width=layout.device_id_width
     )
@@ -539,6 +706,48 @@ def _prepare_batch(
         }
     )
     return prepared, rows
+
+
+def _prepare_routing_batch(
+    layout: CacheLayout, values: Mapping[str, object]
+) -> tuple[dict[str, np.ndarray[Any, Any]], int]:
+    if not isinstance(values, Mapping) or set(values) != {
+        "routed_probabilities",
+        "exit_stage",
+    }:
+        raise ValueError("routing range fields do not match the routing schema")
+    probabilities = values["routed_probabilities"]
+    if not isinstance(probabilities, np.ndarray) or probabilities.ndim != 2:
+        raise ValueError("routed_probabilities must be a two-dimensional NumPy array")
+    rows = len(probabilities)
+    if rows <= 0:
+        raise ValueError("routing commit range must not be empty")
+    prepared = {
+        "routed_probabilities": _require_array(
+            values,
+            "routed_probabilities",
+            np.dtype("<f4"),
+            (rows, len(layout.routed_class_labels)),
+        ),
+        "exit_stage": _require_array(values, "exit_stage", np.dtype("<i2"), (rows,)),
+    }
+    _validate_probability_rows(
+        prepared["routed_probabilities"], "routed_probabilities"
+    )
+    return prepared, rows
+
+
+def _validate_probability_rows(
+    probabilities: np.ndarray[Any, Any], name: str
+) -> None:
+    if not np.all(np.isfinite(probabilities)):
+        raise ValueError(f"{name} must contain only finite values")
+    if np.any(probabilities < 0.0) or np.any(probabilities > 1.0):
+        raise ValueError(f"{name} must contain probabilities in [0, 1]")
+    if not np.allclose(
+        probabilities.sum(axis=1, dtype=np.float64), 1.0, rtol=0.0, atol=1e-5
+    ):
+        raise ValueError(f"{name} rows must sum to one")
 
 
 def _fingerprint(value: Mapping[str, Any]) -> str:
@@ -618,11 +827,11 @@ def _read_json(path: Path, subject: str) -> dict[str, Any]:
     return value
 
 
-def _journal_payload(
+def _inference_journal_payload(
     layout_fingerprint: str, committed_rows: int, commits: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "schema_version": _JOURNAL_SCHEMA,
+        "schema_version": _INFERENCE_JOURNAL_SCHEMA,
         "layout_fingerprint": layout_fingerprint,
         "committed_rows": committed_rows,
         "commits": [dict(item) for item in commits],
@@ -631,7 +840,24 @@ def _journal_payload(
     return payload
 
 
-def _validate_journal(
+def _routing_journal_payload(
+    layout_fingerprint: str,
+    routing_contract_fingerprint: str | None,
+    committed_rows: int,
+    commits: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": _ROUTING_JOURNAL_SCHEMA,
+        "layout_fingerprint": layout_fingerprint,
+        "routing_contract_fingerprint": routing_contract_fingerprint,
+        "committed_rows": committed_rows,
+        "commits": [dict(item) for item in commits],
+    }
+    payload["fingerprint"] = _fingerprint(payload)
+    return payload
+
+
+def _validate_inference_journal(
     journal: Mapping[str, Any], layout: CacheLayout
 ) -> tuple[int, list[dict[str, Any]]]:
     value = dict(journal)
@@ -639,13 +865,51 @@ def _validate_journal(
     if (
         set(value)
         != {"schema_version", "layout_fingerprint", "committed_rows", "commits"}
-        or value.get("schema_version") != _JOURNAL_SCHEMA
+        or value.get("schema_version") != _INFERENCE_JOURNAL_SCHEMA
         or value.get("layout_fingerprint") != layout.fingerprint
         or fingerprint != _fingerprint(value)
     ):
         raise RuntimeError("calibration cache journal fingerprint mismatch")
-    committed = value["committed_rows"]
-    commits = value["commits"]
+    return _validate_commit_prefix(value["committed_rows"], value["commits"], layout)
+
+
+def _validate_routing_journal(
+    journal: Mapping[str, Any], layout: CacheLayout
+) -> tuple[int, list[dict[str, Any]], str | None]:
+    value = dict(journal)
+    fingerprint = value.pop("fingerprint", None)
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "layout_fingerprint",
+            "routing_contract_fingerprint",
+            "committed_rows",
+            "commits",
+        }
+        or value.get("schema_version") != _ROUTING_JOURNAL_SCHEMA
+        or value.get("layout_fingerprint") != layout.fingerprint
+        or fingerprint != _fingerprint(value)
+    ):
+        raise RuntimeError("calibration cache routing journal fingerprint mismatch")
+    committed, commits = _validate_commit_prefix(
+        value["committed_rows"], value["commits"], layout
+    )
+    contract = value["routing_contract_fingerprint"]
+    if committed == 0:
+        if contract is not None:
+            raise RuntimeError("empty routing journal must not bind a routing contract")
+    else:
+        try:
+            _validate_required_fingerprint(contract, "routing_contract_fingerprint")
+        except ValueError as error:
+            raise RuntimeError("routing journal contract fingerprint is invalid") from error
+    return committed, commits, contract
+
+
+def _validate_commit_prefix(
+    committed: object, commits: object, layout: CacheLayout
+) -> tuple[int, list[dict[str, Any]]]:
     if (
         isinstance(committed, bool)
         or not isinstance(committed, int)
@@ -676,6 +940,16 @@ def _validate_journal(
     if expected_start != committed:
         raise RuntimeError("calibration cache journal committed prefix mismatch")
     return committed, normalized
+
+
+def _validate_required_fingerprint(value: object, name: str) -> None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError(f"{name} must be a non-empty string")
+
+
+def _validate_optional_fingerprint(value: object, name: str) -> None:
+    if value is not None:
+        _validate_required_fingerprint(value, name)
 
 
 def _range_digest(
@@ -749,11 +1023,13 @@ def _fsync_file(path: Path) -> None:
         os.close(descriptor)
 
 
-def _write_journal(root: Path, payload: Mapping[str, Any]) -> None:
-    temporary = root / f".{_JOURNAL_FILE}.{uuid.uuid4().hex}.tmp"
+def _write_journal(root: Path, filename: str, payload: Mapping[str, Any]) -> None:
+    if filename not in {_INFERENCE_JOURNAL_FILE, _ROUTING_JOURNAL_FILE}:
+        raise ValueError("unknown calibration cache journal")
+    temporary = root / f".{filename}.{uuid.uuid4().hex}.tmp"
     try:
         _write_exclusive(temporary, _json_bytes(payload))
-        os.replace(temporary, root / _JOURNAL_FILE)
+        os.replace(temporary, root / filename)
         _fsync_directory(root)
     finally:
         try:
