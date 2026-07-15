@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -78,6 +79,32 @@ def _split(
         max_rows_per_run=3,
         merge_fan_in=2,
     )
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt":
+            raise unittest.SkipTest(f"directory symlinks unavailable: {exc}") from exc
+        created = subprocess.run(
+            ["cmd", "/d", "/c", f"mklink /J {link} {target}"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if created.returncode != 0:
+            raise unittest.SkipTest(
+                "directory links unavailable: "
+                f"{created.stdout} {created.stderr}"
+            ) from exc
+
+
+def _remove_directory_link(link: Path) -> None:
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        link.rmdir()
 
 
 class OutOfCoreShardTests(unittest.TestCase):
@@ -347,27 +374,7 @@ class OutOfCoreShardTests(unittest.TestCase):
             shard.parent.mkdir(parents=True)
             shard.write_bytes(b"fixture")
             linked = root / "linked"
-            try:
-                linked.symlink_to(outside, target_is_directory=True)
-            except OSError as exc:
-                if os.name != "nt":
-                    self.skipTest(f"directory symlinks unavailable: {exc}")
-                created = subprocess.run(
-                    [
-                        "cmd",
-                        "/d",
-                        "/c",
-                        f"mklink /J {linked} {outside}",
-                    ],
-                    capture_output=True,
-                    check=False,
-                    text=True,
-                )
-                if created.returncode != 0:
-                    self.skipTest(
-                        "directory links unavailable: "
-                        f"{created.stdout} {created.stderr}"
-                    )
+            _make_directory_link(linked, outside)
             relative = (
                 "linked/split=train/label=benign/part-00000000.parquet"
             )
@@ -386,7 +393,136 @@ class OutOfCoreShardTests(unittest.TestCase):
             ):
                 shard_module._safe_entry_path(root, relative)
             self.assertEqual(shard.read_bytes(), b"fixture")
-            linked.rmdir()
+            _remove_directory_link(linked)
+
+    @unittest.skipUnless(os.name == "nt", "Windows native separator regression")
+    def test_safe_entry_path_rejects_hidden_native_separator_junction(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            root = parent / "prepared"
+            canonical_relative = (
+                "dataset=fixture/split=train/label=benign/part-00000000.parquet"
+            )
+            canonical = root.joinpath(*canonical_relative.split("/"))
+            canonical.parent.mkdir(parents=True)
+            canonical.write_bytes(b"canonical")
+            outside = parent / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_bytes(b"outside")
+            target = root / "target"
+            hidden_shard = (
+                target
+                / "child"
+                / "split=train"
+                / "label=benign"
+                / "part-00000000.parquet"
+            )
+            hidden_shard.parent.mkdir(parents=True)
+            hidden_shard.write_bytes(b"hidden")
+            links = root / "links"
+            links.mkdir()
+            alias = links / "alias"
+            _make_directory_link(alias, target)
+            hidden = (
+                "dataset=fixture\\..\\links\\alias\\child/"
+                "split=train/label=benign/part-00000000.parquet"
+            )
+            try:
+                self.assertEqual(
+                    shard_module._safe_entry_path(root, canonical_relative),
+                    canonical.resolve(strict=True),
+                )
+                with self.assertRaisesRegex(RuntimeError, "canonical"):
+                    shard_module._safe_entry_path(root, hidden)
+                self.assertEqual(sentinel.read_bytes(), b"outside")
+            finally:
+                _remove_directory_link(alias)
+
+    def test_safe_entry_path_rejects_noncanonical_drive_and_control_forms(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            canonical_relative = (
+                "dataset=fixture/split=train/label=benign/part-00000000.parquet"
+            )
+            canonical = root.joinpath(*canonical_relative.split("/"))
+            canonical.parent.mkdir(parents=True)
+            canonical.write_bytes(b"canonical")
+            self.assertEqual(
+                shard_module._safe_entry_path(root, canonical_relative),
+                canonical.resolve(strict=True),
+            )
+            invalid = (
+                canonical_relative.replace("/", "//", 1),
+                canonical_relative.replace("/split=", "/./split=", 1),
+                canonical_relative + "/",
+                "C:/outside/part-00000000.parquet",
+                "dataset=fixture/\x1f/split=train/part-00000000.parquet",
+                canonical_relative.replace("/", "\\", 1),
+            )
+            for value in invalid:
+                with self.subTest(value=repr(value)), self.assertRaisesRegex(
+                    RuntimeError, "canonical"
+                ):
+                    shard_module._safe_entry_path(root, value)
+
+    @unittest.skipUnless(os.name == "nt", "Windows native separator regression")
+    def test_manifest_rejects_recomputed_dataset_with_hidden_native_traversal(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core import shard as shard_module
+
+        rows = _rows()
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            split, plan = self._write(rows, parent)
+            shard_module.verify_shard_manifest(plan.manifest_path, split_plan=split)
+            prepared = plan.manifest_path.parent
+            outside = parent / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_bytes(b"outside")
+            payload = json.loads(plan.manifest_path.read_text(encoding="utf-8"))
+            original_dataset = str(payload["dataset"])
+            target = prepared / "target"
+            shutil.copytree(
+                prepared / f"dataset={original_dataset}", target / "child"
+            )
+            links = prepared / "links"
+            links.mkdir()
+            alias = links / "alias"
+            _make_directory_link(alias, target)
+            hidden_dataset = f"{original_dataset}\\..\\links\\alias\\child"
+            payload["dataset"] = hidden_dataset
+            original_prefix = f"dataset={original_dataset}/"
+            hidden_prefix = f"dataset={hidden_dataset}/"
+            for entry in payload["entries"]:
+                entry["path"] = str(entry["path"]).replace(
+                    original_prefix, hidden_prefix, 1
+                )
+            payload["fingerprint"] = shard_module.stable_fingerprint(
+                shard_module._manifest_semantics(payload)
+            )
+            plan.manifest_path.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "dataset"):
+                    shard_module.verify_shard_manifest(
+                        plan.manifest_path, split_plan=split
+                    )
+                self.assertEqual(sentinel.read_bytes(), b"outside")
+            finally:
+                _remove_directory_link(alias)
 
     def test_large_row_group_is_read_in_bounded_batches_and_closes_on_close(self) -> None:
         from bitguard_bnn.out_of_core import shard as shard_module

@@ -967,20 +967,44 @@ def _is_link_like(path: Path) -> bool:
     return bool(callable(is_junction) and is_junction())
 
 
-def _safe_entry_path(root: Path, relative: object) -> Path:
-    value = str(relative)
+def _canonical_entry_parts(relative: object) -> tuple[str, ...]:
+    if not isinstance(relative, str):
+        raise RuntimeError("non-canonical shard manifest path")
+    value = relative
+    if (
+        not value
+        or "\\" in value
+        or ":" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise RuntimeError(f"non-canonical shard manifest path: {value!r}")
     pure = PurePosixPath(value)
-    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
-        raise RuntimeError(f"unsafe shard manifest path: {value!r}")
+    native = Path(value)
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or pure.as_posix() != value
+        or any(part in {"", ".", ".."} for part in pure.parts)
+        or native.is_absolute()
+        or native.drive
+        or tuple(native.parts) != pure.parts
+    ):
+        raise RuntimeError(f"non-canonical shard manifest path: {value!r}")
+    return pure.parts
+
+
+def _safe_entry_path(root: Path, relative: object) -> Path:
+    parts = _canonical_entry_parts(relative)
+    value = str(relative)
     if _is_link_like(root) or not root.is_dir():
         raise RuntimeError(f"unsafe shard output root: {root}")
     resolved_root = root.resolve(strict=True)
     current = root
-    for part in pure.parts[:-1]:
+    for part in parts[:-1]:
         current = current / part
         if _is_link_like(current) or not current.is_dir():
             raise RuntimeError(f"unsafe linked shard parent directory: {current}")
-    path = current / pure.parts[-1]
+    path = current / parts[-1]
     if _is_link_like(path) or not path.is_file():
         raise RuntimeError(f"shard is not a regular file: {value}")
     resolved = path.resolve(strict=True)
@@ -1254,6 +1278,9 @@ def verify_shard_manifest(
     merge_read_rows = _validate_positive("merge_read_rows", merge_read_rows)
     path = Path(manifest_path)
     manifest = load_shard_manifest(path)
+    dataset = manifest.get("dataset")
+    if not isinstance(dataset, str) or not _PATH_TOKEN.fullmatch(dataset):
+        raise RuntimeError("invalid shard manifest dataset token")
     _reject_stale_work(path.parent)
     if preprocessing_fingerprint is not None and manifest.get(
         "preprocessing_fingerprint"
@@ -1315,7 +1342,7 @@ def verify_shard_manifest(
             if split not in _PARTITION_SET or not _PATH_TOKEN.fullmatch(label):
                 raise RuntimeError("invalid shard partition manifest entry")
             expected_relative = PurePosixPath(
-                f"dataset={manifest['dataset']}",
+                f"dataset={dataset}",
                 f"split={split}",
                 f"label={label}",
                 PurePosixPath(str(entry.get("path"))).name,
@@ -1400,7 +1427,7 @@ def verify_shard_manifest(
             > merge_fan_in * merge_read_rows
         ):
             raise RuntimeError("verification merge input exceeded configured bound")
-        dataset_root = path.parent / f"dataset={manifest['dataset']}"
+        dataset_root = path.parent / f"dataset={dataset}"
         if _is_link_like(dataset_root) or not dataset_root.is_dir():
             raise RuntimeError("shard dataset directory is missing or unsafe")
         for candidate in dataset_root.rglob("*"):
