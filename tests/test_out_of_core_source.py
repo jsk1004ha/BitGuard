@@ -551,14 +551,13 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
                 {"behavior_label": ["benign"], "x": [1]}
             ).to_csv(root / "rows.csv", index=False)
             config = _base_config(root, "csv", "rows.csv")
-            replacement_blocked = False
-
             def inject_replacement(guard):
-                nonlocal replacement_blocked
                 try:
                     work_dir.rename(moved)
-                except OSError:
-                    replacement_blocked = True
+                except OSError as exc:
+                    raise RuntimeError(
+                        "injected work_dir replacement blocked"
+                    ) from exc
                 else:
                     if os.name == "nt":
                         created = subprocess.run(
@@ -575,10 +574,13 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
                         )
                         if created.returncode != 0:
                             moved.rename(work_dir)
-                            replacement_blocked = True
+                            raise RuntimeError(
+                                "junction injection unavailable"
+                            )
                     else:
                         work_dir.symlink_to(outside, target_is_directory=True)
-                return guard.create_child()
+                guard.assert_unchanged("private child creation")
+                raise AssertionError("work_dir replacement was not detected")
 
             with patch.object(
                 source_module,
@@ -586,14 +588,10 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
                 inject_replacement,
                 create=True,
             ):
-                if os.name == "nt" and replacement_blocked:
-                    with open_normalized_source(
-                        config, work_dir=work_dir
-                    ) as source:
-                        list(source.iter_chunks())
-                else:
-                    with self.assertRaisesRegex(RuntimeError, "changed"):
-                        open_normalized_source(config, work_dir=work_dir)
+                with self.assertRaisesRegex(
+                    RuntimeError, "changed|replacement blocked"
+                ):
+                    open_normalized_source(config, work_dir=work_dir)
 
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
             self.assertEqual(set(outside.iterdir()), {sentinel})
@@ -603,6 +601,81 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
                 else:
                     work_dir.unlink()
                 moved.rename(work_dir)
+
+    def test_post_create_child_replacement_cannot_redirect_private_operations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "work"
+            work_dir.mkdir(mode=0o700)
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel.bin"
+            sentinel.write_bytes(b"outside-must-not-change")
+            before_mode = stat.S_IMODE(outside.stat().st_mode)
+            before_acl = (
+                subprocess.run(
+                    ["icacls", str(outside)],
+                    capture_output=True,
+                    check=True,
+                ).stdout
+                if os.name == "nt"
+                else b""
+            )
+            pd.DataFrame(
+                {"behavior_label": ["benign"], "x": [1]}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+
+            def replace_after_pin(guard, child: Path) -> None:
+                moved = work_dir / "moved-private-child"
+                if os.name == "nt":
+                    try:
+                        child.rename(moved)
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "injected child replacement blocked"
+                        ) from exc
+                    created = subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(child), str(outside)],
+                        capture_output=True,
+                        check=False,
+                    )
+                    if created.returncode != 0:
+                        moved.rename(child)
+                        raise RuntimeError("junction injection unavailable")
+                else:
+                    child.rename(moved)
+                    child.symlink_to(outside, target_is_directory=True)
+
+            opened = None
+            try:
+                with (
+                    patch.object(
+                        source_module,
+                        "_post_pin_private_child",
+                        replace_after_pin,
+                        create=True,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "child|work_dir|changed"),
+                ):
+                    opened = open_normalized_source(config, work_dir=work_dir)
+            finally:
+                if opened is not None:
+                    opened.close()
+
+            self.assertEqual(sentinel.read_bytes(), b"outside-must-not-change")
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), before_mode)
+            self.assertEqual(set(outside.iterdir()), {sentinel})
+            self.assertEqual(list(work_dir.iterdir()), [])
+            if os.name == "nt":
+                after_acl = subprocess.run(
+                    ["icacls", str(outside)],
+                    capture_output=True,
+                    check=True,
+                ).stdout
+                self.assertEqual(after_acl, before_acl)
 
     def test_normalized_source_does_not_retain_emitted_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -164,6 +164,8 @@ class _VerifiedSnapshot:
     path: Path
     pinned: _PinnedStat
     sha256: str
+    relative_name: str
+    directory_descriptor: int | None
 
 
 class _HashingReader:
@@ -215,6 +217,10 @@ class _WindowsFileBasicInfo(ctypes.Structure):
         ("change_time", ctypes.c_longlong),
         ("file_attributes", wintypes.DWORD),
     ]
+
+
+class _WindowsFileDispositionInfo(ctypes.Structure):
+    _fields_ = [("delete_file", wintypes.BOOL)]
 
 
 def _change_time_ns(path: Path, path_stat: os.stat_result) -> int:
@@ -374,6 +380,8 @@ def _same_work_components(
 
 def _open_windows_work_handles(
     components: Sequence[_WorkComponent],
+    *,
+    require_delete_lock: bool = False,
 ) -> list[int]:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_file = kernel32.CreateFileW
@@ -393,20 +401,30 @@ def _open_windows_work_handles(
     handles: list[int] = []
     try:
         for component in components:
-            handle = create_file(
-                str(component.path),
-                0x80,
-                0x1 | 0x2,
-                None,
-                3,
-                0x02000000 | 0x00200000,
-                None,
+            access_options = (
+                (0x10080,) if require_delete_lock else (0x10080, 0x80)
             )
-            if handle == wintypes.HANDLE(-1).value:
+            handle = wintypes.HANDLE(-1).value
+            for access in access_options:
+                handle = create_file(
+                    str(component.path),
+                    access,
+                    0x1 | 0x2,
+                    None,
+                    3,
+                    0x02000000 | 0x00200000,
+                    None,
+                )
+                if (
+                    handle is not None
+                    and handle != wintypes.HANDLE(-1).value
+                ):
+                    break
+            if handle is None or handle == wintypes.HANDLE(-1).value:
                 raise RuntimeError(
                     f"could not pin normalized source work_dir: {component.path}"
                 )
-            handles.append(int(handle))
+            handles.append(handle)
         return handles
     except BaseException:
         for handle in reversed(handles):
@@ -427,7 +445,10 @@ class _PrivateWorkGuard:
                 "requested canonical parent"
             )
         self._windows_handles: list[int] = []
+        self._child_windows_handles: list[int] = []
         self._parent_descriptor: int | None = None
+        self._child_descriptor: int | None = None
+        self._child_component: _WorkComponent | None = None
         self._closed = False
         if os.name == "nt":
             self._windows_handles = _open_windows_work_handles(self.components)
@@ -478,20 +499,25 @@ class _PrivateWorkGuard:
             except FileExistsError:
                 continue
             try:
-                self.assert_unchanged("private child creation")
-                child_stat = child.lstat()
-                attributes = int(
-                    getattr(child_stat, "st_file_attributes", 0)
-                )
-                if (
-                    stat.S_ISLNK(child_stat.st_mode)
-                    or not stat.S_ISDIR(child_stat.st_mode)
-                    or bool(attributes & 0x400)
-                    or child.resolve(strict=True).parent != self.canonical
-                ):
-                    raise RuntimeError(
-                        "private work child escaped its canonical parent"
+                child_component = _inspect_work_components(child)[-1]
+                if os.name == "nt":
+                    self._child_windows_handles = _open_windows_work_handles(
+                        [child_component], require_delete_lock=True
                     )
+                else:
+                    assert self._parent_descriptor is not None
+                    flags = os.O_RDONLY
+                    flags |= int(getattr(os, "O_DIRECTORY", 0))
+                    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+                    self._child_descriptor = os.open(
+                        name,
+                        flags,
+                        dir_fd=self._parent_descriptor,
+                    )
+                self._child_component = child_component
+                _post_pin_private_child(self, child)
+                self.assert_unchanged("private child creation")
+                self.assert_child_unchanged(child, "private child creation")
                 return child
             except BaseException as primary:
                 try:
@@ -501,24 +527,139 @@ class _PrivateWorkGuard:
                 raise
         raise FileExistsError("could not allocate a unique private work directory")
 
+    @property
+    def child_descriptor(self) -> int | None:
+        return self._child_descriptor
+
+    def assert_child_unchanged(self, child: Path, phase: str) -> None:
+        expected = self._child_component
+        if expected is None:
+            raise RuntimeError("private work child is not pinned")
+        try:
+            if os.name == "nt":
+                actual = _inspect_work_components(child)[-1]
+                identity = (
+                    actual.device,
+                    actual.inode,
+                    actual.file_type,
+                    actual.attributes,
+                )
+            else:
+                assert self._parent_descriptor is not None
+                child_stat = os.stat(
+                    child.name,
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
+                identity = (
+                    int(child_stat.st_dev),
+                    int(child_stat.st_ino),
+                    stat.S_IFMT(child_stat.st_mode),
+                    int(getattr(child_stat, "st_file_attributes", 0)),
+                )
+            if identity != (
+                expected.device,
+                expected.inode,
+                expected.file_type,
+                expected.attributes,
+            ):
+                raise RuntimeError
+            if self._child_descriptor is not None:
+                pinned = os.fstat(self._child_descriptor)
+                if (
+                    int(pinned.st_dev),
+                    int(pinned.st_ino),
+                    stat.S_IFMT(pinned.st_mode),
+                ) != (expected.device, expected.inode, expected.file_type):
+                    raise RuntimeError
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"private work child changed during {phase}"
+            ) from exc
+
     def remove_child(self, child: Path) -> None:
         if child.parent != self.canonical:
             raise RuntimeError(
                 "refusing to remove a work directory outside its parent"
             )
         if os.name == "nt":
-            child.rmdir()
+            self.assert_child_unchanged(child, "cleanup")
+            if not self._child_windows_handles:
+                raise RuntimeError("private work child handle is missing")
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            set_information = kernel32.SetFileInformationByHandle
+            set_information.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            ]
+            set_information.restype = wintypes.BOOL
+            disposition = _WindowsFileDispositionInfo(True)
+            if not set_information(
+                self._child_windows_handles[0],
+                4,
+                ctypes.byref(disposition),
+                ctypes.sizeof(disposition),
+            ):
+                raise OSError(
+                    ctypes.get_last_error(),
+                    "could not delete private work child by handle",
+                )
+            self._close_child_handles()
         else:
             assert self._parent_descriptor is not None
-            os.rmdir(child.name, dir_fd=self._parent_descriptor)
+            expected = self._child_component
+            if expected is None:
+                raise RuntimeError("private work child is not pinned")
+            try:
+                current = os.stat(
+                    child.name,
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                current = None
+            if current is not None and (
+                int(current.st_dev),
+                int(current.st_ino),
+            ) != (expected.device, expected.inode):
+                os.unlink(child.name, dir_fd=self._parent_descriptor)
+            matching_name: str | None = None
+            for entry in os.listdir(self._parent_descriptor):
+                candidate = os.stat(
+                    entry,
+                    dir_fd=self._parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (int(candidate.st_dev), int(candidate.st_ino)) == (
+                    expected.device,
+                    expected.inode,
+                ):
+                    matching_name = str(entry)
+                    break
+            if matching_name is None:
+                raise RuntimeError("private work child identity was lost")
+            os.rmdir(matching_name, dir_fd=self._parent_descriptor)
+
+    def _close_child_handles(self) -> None:
+        if self._child_descriptor is not None:
+            os.close(self._child_descriptor)
+            self._child_descriptor = None
+        if self._child_windows_handles:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            for handle in reversed(self._child_windows_handles):
+                close_handle(handle)
+            self._child_windows_handles.clear()
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if self._parent_descriptor is not None:
-            os.close(self._parent_descriptor)
-            self._parent_descriptor = None
+        self._close_child_handles()
         if self._windows_handles:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             close_handle = kernel32.CloseHandle
@@ -527,10 +668,19 @@ class _PrivateWorkGuard:
             for handle in reversed(self._windows_handles):
                 close_handle(handle)
             self._windows_handles.clear()
+        if self._parent_descriptor is not None:
+            os.close(self._parent_descriptor)
+            self._parent_descriptor = None
 
 
 def _create_private_work_child(guard: _PrivateWorkGuard) -> Path:
     return guard.create_child()
+
+
+def _post_pin_private_child(
+    guard: _PrivateWorkGuard, child: Path
+) -> None:
+    del guard, child
 
 
 def _new_snapshot_root() -> Path:
@@ -551,10 +701,17 @@ def _windows_current_sid() -> str:
     return sid_match.group(0).decode("ascii")
 
 
-def _secure_snapshot_root(root: Path) -> None:
+def _secure_snapshot_root(
+    root: Path, directory_descriptor: int | None = None
+) -> None:
     if os.name != "nt":
-        os.chmod(root, 0o700)
-        if stat.S_IMODE(root.stat().st_mode) != 0o700:
+        if directory_descriptor is None:
+            os.chmod(root, 0o700)
+            root_stat = root.stat()
+        else:
+            os.fchmod(directory_descriptor, 0o700)
+            root_stat = os.fstat(directory_descriptor)
+        if stat.S_IMODE(root_stat.st_mode) != 0o700:
             raise RuntimeError("could not enforce private snapshot permissions")
         return
     acl_path = root / ".acl-verification"
@@ -599,15 +756,19 @@ def _secure_snapshot_root(root: Path) -> None:
 class _SnapshotBuilder:
     def __init__(self, store: _SnapshotStore, file_id: int) -> None:
         self._store = store
-        self.partial_path = store.root / f"{file_id:08d}.partial"
-        self.final_path = store.root / f"{file_id:08d}.verified.csv"
+        self.partial_name = f"{file_id:08d}.partial"
+        self.final_name = f"{file_id:08d}.verified.csv"
+        self.partial_path = store.root / self.partial_name
+        self.final_path = store.root / self.final_name
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY
-        descriptor = os.open(self.partial_path, flags, 0o600)
+        descriptor = store.open_member(self.partial_name, flags, 0o600)
         self.handle: BinaryIO = os.fdopen(descriptor, "wb", buffering=0)
         self._finished = False
-        if os.name != "nt" and stat.S_IMODE(self.partial_path.stat().st_mode) != 0o600:
+        if os.name != "nt" and stat.S_IMODE(
+            store.member_stat(self.partial_name).st_mode
+        ) != 0o600:
             self.abort()
             raise RuntimeError("could not enforce private snapshot permissions")
 
@@ -620,20 +781,15 @@ class _SnapshotBuilder:
             if os.fstat(self.handle.fileno()).st_size != byte_size:
                 raise RuntimeError("verified snapshot size mismatch")
             self.handle.close()
-            os.replace(self.partial_path, self.final_path)
-            os.chmod(self.final_path, 0o400)
-            pinned = _pinned_stat(self.final_path)
-            if pinned.byte_size != byte_size:
+            self._store.replace_member(self.partial_name, self.final_name)
+            self._store.chmod_member(self.final_name, 0o400)
+            snapshot = self._store.pin_member(self.final_name, sha256)
+            if snapshot.pinned.byte_size != byte_size:
                 raise RuntimeError("verified snapshot size mismatch")
-            snapshot = _VerifiedSnapshot(self.final_path, pinned, sha256)
             self._store._publish(self, snapshot)
             self._finished = True
             if os.name != "nt":
-                directory = os.open(self._store.root, os.O_RDONLY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
+                self._store.fsync_directory()
             return snapshot
         except BaseException:
             self.abort()
@@ -645,10 +801,10 @@ class _SnapshotBuilder:
         self._finished = True
         if not self.handle.closed:
             self.handle.close()
-        for path in (self.partial_path, self.final_path):
-            if path.exists():
-                os.chmod(path, 0o600)
-                path.unlink()
+        for name in (self.partial_name, self.final_name):
+            if self._store.member_exists(name):
+                self._store.chmod_member(name, 0o600)
+                self._store.unlink_member(name)
         self._store._discard(self)
 
 
@@ -672,7 +828,11 @@ class _SnapshotStore:
         self._snapshots: list[_VerifiedSnapshot] = []
         self._closed = False
         try:
-            if self.root.exists():
+            if self.directory_descriptor is not None:
+                root_stat = os.fstat(self.directory_descriptor)
+                if not stat.S_ISDIR(root_stat.st_mode):
+                    raise RuntimeError("invalid snapshot storage")
+            elif self.root.exists():
                 root_stat = self.root.lstat()
                 if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(
                     root_stat.st_mode
@@ -680,7 +840,7 @@ class _SnapshotStore:
                     raise RuntimeError("invalid snapshot storage")
             else:
                 self.root.mkdir(mode=0o700)
-            _secure_snapshot_root(self.root)
+            _secure_snapshot_root(self.root, self.directory_descriptor)
         except BaseException as primary:
             cleanups: list[BaseException] = []
             try:
@@ -702,9 +862,104 @@ class _SnapshotStore:
         else:
             self._work_guard.remove_child(self.root)
 
+    @property
+    def directory_descriptor(self) -> int | None:
+        return (
+            self._work_guard.child_descriptor
+            if self._work_guard is not None
+            else None
+        )
+
+    def open_member(self, name: str, flags: int, mode: int = 0o600) -> int:
+        descriptor = self.directory_descriptor
+        if descriptor is None:
+            return os.open(self.root / name, flags, mode)
+        return os.open(name, flags, mode, dir_fd=descriptor)
+
+    def member_stat(self, name: str) -> os.stat_result:
+        descriptor = self.directory_descriptor
+        if descriptor is None:
+            return (self.root / name).lstat()
+        return os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+
+    def member_exists(self, name: str) -> bool:
+        try:
+            self.member_stat(name)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def chmod_member(self, name: str, mode: int) -> None:
+        descriptor = self.directory_descriptor
+        if descriptor is None:
+            os.chmod(self.root / name, mode)
+        else:
+            flags = os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0))
+            member_descriptor = os.open(name, flags, dir_fd=descriptor)
+            try:
+                os.fchmod(member_descriptor, mode)
+            finally:
+                os.close(member_descriptor)
+
+    def unlink_member(self, name: str) -> None:
+        descriptor = self.directory_descriptor
+        if descriptor is None:
+            (self.root / name).unlink()
+        else:
+            os.unlink(name, dir_fd=descriptor)
+
+    def replace_member(self, source: str, target: str) -> None:
+        descriptor = self.directory_descriptor
+        if descriptor is None:
+            os.replace(self.root / source, self.root / target)
+        else:
+            os.replace(
+                source,
+                target,
+                src_dir_fd=descriptor,
+                dst_dir_fd=descriptor,
+            )
+
+    def pin_member(self, name: str, sha256: str) -> _VerifiedSnapshot:
+        member_stat = self.member_stat(name)
+        path = self.root / name
+        pinned = (
+            _pinned_stat(path)
+            if self.directory_descriptor is None
+            else _PinnedStat(
+                int(member_stat.st_dev),
+                int(member_stat.st_ino),
+                int(member_stat.st_mode),
+                int(member_stat.st_size),
+                int(member_stat.st_mtime_ns),
+                int(member_stat.st_ctime_ns),
+            )
+        )
+        return _VerifiedSnapshot(
+            path=path,
+            pinned=pinned,
+            sha256=sha256,
+            relative_name=name,
+            directory_descriptor=self.directory_descriptor,
+        )
+
+    def fsync_directory(self) -> None:
+        descriptor = self.directory_descriptor
+        if descriptor is not None:
+            os.fsync(descriptor)
+            return
+        directory = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
     def assert_storage_unchanged(self) -> None:
         if self._work_guard is not None:
             self._work_guard.assert_unchanged("normalized source session")
+            self._work_guard.assert_child_unchanged(
+                self.root, "normalized source session"
+            )
 
     def begin(self, file_id: int) -> _SnapshotBuilder:
         builder = _SnapshotBuilder(self, file_id)
@@ -732,9 +987,9 @@ class _SnapshotStore:
                 cleanups.append(cleanup_error)
         for snapshot in self._snapshots:
             try:
-                if snapshot.path.exists():
-                    os.chmod(snapshot.path, 0o600)
-                    snapshot.path.unlink()
+                if self.member_exists(snapshot.relative_name):
+                    self.chmod_member(snapshot.relative_name, 0o600)
+                    self.unlink_member(snapshot.relative_name)
             except BaseException as cleanup_error:
                 cleanups.append(cleanup_error)
         self._snapshots.clear()
@@ -762,6 +1017,8 @@ class _VerifiedCsvPass:
         snapshot_builder: _SnapshotBuilder | None = None,
         source_guard: tuple[Path, FileFingerprint] | None = None,
         origin: str = "source",
+        directory_descriptor: int | None = None,
+        relative_name: str | None = None,
     ) -> None:
         self.path = path
         self.pinned = pinned
@@ -771,6 +1028,8 @@ class _VerifiedCsvPass:
         self.snapshot_builder = snapshot_builder
         self.source_guard = source_guard
         self.origin = origin
+        self.directory_descriptor = directory_descriptor
+        self.relative_name = relative_name
         self.fingerprint: FileFingerprint | None = None
         self.snapshot: _VerifiedSnapshot | None = None
 
@@ -780,10 +1039,36 @@ class _VerifiedCsvPass:
         path, fingerprint = self.source_guard
         _assert_source_stat(path, fingerprint, path.lstat(), self.phase)
 
+    def _path_stat(self) -> os.stat_result:
+        if self.directory_descriptor is None:
+            return self.path.lstat()
+        if self.relative_name is None:
+            raise RuntimeError("verified snapshot member name is missing")
+        return os.stat(
+            self.relative_name,
+            dir_fd=self.directory_descriptor,
+            follow_symlinks=False,
+        )
+
+    def _open(self) -> BinaryIO:
+        if self.directory_descriptor is None:
+            return self.path.open("rb", buffering=0)
+        if self.relative_name is None:
+            raise RuntimeError("verified snapshot member name is missing")
+        flags = os.O_RDONLY | int(getattr(os, "O_NOFOLLOW", 0))
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        descriptor = os.open(
+            self.relative_name,
+            flags,
+            dir_fd=self.directory_descriptor,
+        )
+        return os.fdopen(descriptor, "rb", buffering=0)
+
     def __iter__(self) -> Iterator[pd.DataFrame]:
         completed = False
         self._assert_guard()
-        with self.path.open("rb", buffering=0) as handle:
+        with self._open() as handle:
             _assert_source_stat(
                 self.path,
                 self.pinned,
@@ -791,7 +1076,9 @@ class _VerifiedCsvPass:
                 self.phase,
                 check_ctime=False,
             )
-            _assert_source_stat(self.path, self.pinned, self.path.lstat(), self.phase)
+            _assert_source_stat(
+                self.path, self.pinned, self._path_stat(), self.phase
+            )
             hashing_reader = _HashingReader(
                 handle,
                 mirror=(
@@ -820,7 +1107,7 @@ class _VerifiedCsvPass:
                     _assert_source_stat(
                         self.path,
                         self.pinned,
-                        self.path.lstat(),
+                        self._path_stat(),
                         self.phase,
                     )
                     yield chunk
@@ -844,7 +1131,7 @@ class _VerifiedCsvPass:
                         _assert_source_stat(
                             self.path,
                             self.pinned,
-                            self.path.lstat(),
+                            self._path_stat(),
                             self.phase,
                         )
                         if hashing_reader.bytes_read != self.pinned.byte_size:
@@ -975,13 +1262,47 @@ def _new_selection_path(work_dir: Path | None = None) -> Path:
 class _SelectionIndex:
     """Disk-backed row membership and materialization-order index."""
 
-    def __init__(self, work_dir: Path | None = None) -> None:
-        self.path = (
-            _new_selection_path()
-            if work_dir is None
-            else _new_selection_path(work_dir)
-        )
-        self._connection = sqlite3.connect(self.path)
+    def __init__(
+        self,
+        work_dir: Path | None = None,
+        directory_descriptor: int | None = None,
+    ) -> None:
+        self._directory_descriptor = directory_descriptor
+        self._relative_name: str | None = None
+        if directory_descriptor is None:
+            self.path = (
+                _new_selection_path()
+                if work_dir is None
+                else _new_selection_path(work_dir)
+            )
+            connection_path = self.path
+        else:
+            if work_dir is None:
+                raise RuntimeError("selection work directory is missing")
+            self._relative_name = (
+                f"bitguard-selection-{secrets.token_hex(12)}.sqlite3"
+            )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            descriptor = os.open(
+                self._relative_name,
+                flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            os.close(descriptor)
+            self.path = work_dir / self._relative_name
+            fd_roots = (
+                Path(f"/proc/self/fd/{directory_descriptor}"),
+                Path(f"/dev/fd/{directory_descriptor}"),
+            )
+            fd_root = next((path for path in fd_roots if path.is_dir()), None)
+            if fd_root is None:
+                os.unlink(self._relative_name, dir_fd=directory_descriptor)
+                raise RuntimeError(
+                    "platform does not support descriptor-relative SQLite storage"
+                )
+            connection_path = fd_root / self._relative_name
+        self._connection = sqlite3.connect(connection_path)
         self._closed = False
         self._connection.executescript(
             """
@@ -1196,10 +1517,25 @@ class _SelectionIndex:
             return
         self._closed = True
         self._connection.close()
-        self.path.unlink(missing_ok=True)
-        Path(f"{self.path}-journal").unlink(missing_ok=True)
-        Path(f"{self.path}-wal").unlink(missing_ok=True)
-        Path(f"{self.path}-shm").unlink(missing_ok=True)
+        names = (
+            self._relative_name,
+            f"{self._relative_name}-journal" if self._relative_name else None,
+            f"{self._relative_name}-wal" if self._relative_name else None,
+            f"{self._relative_name}-shm" if self._relative_name else None,
+        )
+        if self._directory_descriptor is not None:
+            for name in names:
+                if name is None:
+                    continue
+                try:
+                    os.unlink(name, dir_fd=self._directory_descriptor)
+                except FileNotFoundError:
+                    pass
+        else:
+            self.path.unlink(missing_ok=True)
+            Path(f"{self.path}-journal").unlink(missing_ok=True)
+            Path(f"{self.path}-wal").unlink(missing_ok=True)
+            Path(f"{self.path}-shm").unlink(missing_ok=True)
 
 
 def _iter_selected_raw(
@@ -1218,6 +1554,8 @@ def _iter_selected_raw(
         expected_sha256=plan.snapshot.sha256,
         source_guard=(plan.path, plan.fingerprint),
         origin="snapshot",
+        directory_descriptor=plan.snapshot.directory_descriptor,
+        relative_name=plan.snapshot.relative_name,
     )
     for chunk in csv_pass:
         source_row_start = offset
@@ -1813,7 +2151,10 @@ def _build_iteration_plan(
             (
                 _SelectionIndex()
                 if work_dir is None
-                else _SelectionIndex(snapshots.root)
+                else _SelectionIndex(
+                    snapshots.root,
+                    directory_descriptor=snapshots.directory_descriptor,
+                )
             )
             if max_rows is not None or class_limit is not None
             else None
