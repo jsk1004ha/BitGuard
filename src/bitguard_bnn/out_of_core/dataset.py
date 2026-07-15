@@ -63,6 +63,87 @@ class _BatchSpec:
     rows: int
 
 
+@dataclass(frozen=True, slots=True)
+class _BatchLayout:
+    """Arithmetic logical-batch layout with constant-size state."""
+
+    row_count: int
+    batch_size: int
+    allow_singleton: bool
+
+    def __post_init__(self) -> None:
+        if self.row_count <= 0:
+            raise ValueError("row_count must be positive")
+        if self.batch_size < 2:
+            raise ValueError("batch_size must be at least two")
+        quotient, remainder = divmod(self.row_count, self.batch_size)
+        if remainder == 1 and not self.allow_singleton:
+            if quotient == 0:
+                raise ValueError("a single-row dataset cannot form a training batch")
+            if self.batch_size == 2:
+                raise ValueError(
+                    "odd row coverage cannot avoid a singleton with batch_size=2"
+                )
+
+    @property
+    def batch_count(self) -> int:
+        quotient, remainder = divmod(self.row_count, self.batch_size)
+        return quotient + int(remainder > 0)
+
+    def size_at(self, index: int) -> int:
+        if index < 0 or index >= self.batch_count:
+            raise IndexError("logical batch index is out of range")
+        quotient, remainder = divmod(self.row_count, self.batch_size)
+        if remainder != 1:
+            return self.batch_size if index < quotient else remainder
+        if quotient == 0:
+            return 1
+        if self.batch_size == 2:
+            return self.batch_size if index < quotient else 1
+        if index < quotient - 1:
+            return self.batch_size
+        return self.batch_size - 1 if index == quotient - 1 else 2
+
+    def start_at(self, index: int) -> int:
+        if index < 0 or index > self.batch_count:
+            raise IndexError("logical batch index is out of range")
+        if index == self.batch_count:
+            return self.row_count
+        quotient, remainder = divmod(self.row_count, self.batch_size)
+        if remainder == 1 and quotient > 0 and self.batch_size > 2:
+            if index == quotient:
+                return quotient * self.batch_size - 1
+        return index * self.batch_size
+
+    def first_index_starting_at_or_after(self, row_offset: int) -> int:
+        if row_offset < 0 or row_offset > self.row_count:
+            raise ValueError("row offset is outside the logical batch layout")
+        lower = 0
+        upper = self.batch_count
+        while lower < upper:
+            middle = (lower + upper) // 2
+            if self.start_at(middle) < row_offset:
+                lower = middle + 1
+            else:
+                upper = middle
+        return lower
+
+    def iter_sizes(self, start_index: int = 0) -> Iterator[int]:
+        if start_index < 0 or start_index > self.batch_count:
+            raise ValueError("logical batch start index is out of range")
+        for index in range(start_index, self.batch_count):
+            yield self.size_at(index)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResumeLayout:
+    layout: _BatchLayout
+    start_index: int
+    start_shard_position: int
+    skip_rows: int
+    start_batch_position: int
+
+
 def _identity(value: Any) -> Any:
     """Spawn-pickle-safe DataLoader collate function."""
 
@@ -183,6 +264,11 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             raise RuntimeError("prepared shard entries do not cover the requested split")
         if split == "train" and expected < 2:
             raise ValueError("streaming training requires at least two rows")
+        _BatchLayout(
+            row_count=expected,
+            batch_size=int(batch_size),
+            allow_singleton=split != "train",
+        )
 
         self.descriptor_path = prepared.descriptor_path
         self.preprocessor_path = prepared.preprocessor_path
@@ -334,7 +420,8 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             raise TypeError("artifact is not a FeaturePreprocessor")
         if tuple(processor.selected_features) != self.selected_features:
             raise RuntimeError("frozen preprocessor no longer matches shard features")
-        _, _, start_position, _ = _resume_layout(self)
+        resume = _resume_layout(self)
+        start_position = resume.start_shard_position
         for position, entry in enumerate(self.permuted_shards()):
             if position < start_position:
                 continue
@@ -346,7 +433,7 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
 def _ordered_chunks(
     dataset: ParquetTrainingDataset, num_workers: int
 ) -> Iterator[dict[str, Any]]:
-    _, _, start_position, _ = _resume_layout(dataset)
+    start_position = _resume_layout(dataset).start_shard_position
     if start_position == len(dataset.entries):
         return
     loader = torch.utils.data.DataLoader(
@@ -385,76 +472,88 @@ def _ordered_chunks(
 
 def _logical_batch_sizes(
     row_count: int, batch_size: int, *, allow_singleton: bool
-) -> tuple[int, ...]:
-    full, remainder = divmod(row_count, batch_size)
-    sizes = [batch_size] * full
-    if remainder == 1:
-        if not sizes:
-            if allow_singleton:
-                return (1,)
-            raise ValueError("a single-row dataset cannot form a training batch")
-        if batch_size == 2:
-            if allow_singleton:
-                sizes.append(1)
-                return tuple(sizes)
-            raise ValueError(
-                "odd row coverage cannot avoid a singleton with batch_size=2"
-            )
-        sizes[-1] -= 1
-        sizes.append(2)
-    elif remainder:
-        sizes.append(remainder)
-    return tuple(sizes)
+) -> Iterator[int]:
+    return _BatchLayout(
+        row_count=row_count,
+        batch_size=batch_size,
+        allow_singleton=allow_singleton,
+    ).iter_sizes()
 
 
-def _batch_specs(dataset: ParquetTrainingDataset) -> tuple[_BatchSpec, ...]:
-    entries = dataset.permuted_shards()
-    shard_position = 0
-    shard_start = 0
-    shard_batch_positions: dict[int, int] = {}
-    specs: list[_BatchSpec] = []
-    global_start = 0
-    for rows in _logical_batch_sizes(
+def _batch_layout(dataset: ParquetTrainingDataset) -> _BatchLayout:
+    return _BatchLayout(
         dataset.row_count,
         dataset.batch_size,
         allow_singleton=dataset.split != "train",
-    ):
-        while global_start >= shard_start + entries[shard_position].rows:
-            shard_start += entries[shard_position].rows
-            shard_position += 1
-        batch_position = shard_batch_positions.get(shard_position, 0)
-        shard_batch_positions[shard_position] = batch_position + 1
-        specs.append(
-            _BatchSpec(
-                shard_position=shard_position,
-                batch_position=batch_position,
-                global_start=global_start,
-                rows=rows,
-            )
-        )
-        global_start += rows
-    if global_start != dataset.row_count:
-        raise RuntimeError("logical batch plan does not cover the prepared split")
-    return tuple(specs)
+    )
 
 
 def _resume_layout(
     dataset: ParquetTrainingDataset,
-) -> tuple[tuple[_BatchSpec, ...], int, int, int]:
-    specs = _batch_specs(dataset)
+) -> _ResumeLayout:
+    layout = _batch_layout(dataset)
+    entries = dataset.permuted_shards()
     if dataset.cursor is None:
-        first = specs[0]
-        return specs, 0, first.shard_position, 0
+        return _ResumeLayout(layout, 0, 0, 0, 0)
     target = (dataset.cursor.shard_position, dataset.cursor.batch_position)
     if target == (len(dataset.entries), 0):
-        return specs, len(specs), len(dataset.entries), 0
-    for index, spec in enumerate(specs):
-        if (spec.shard_position, spec.batch_position) != target:
-            continue
-        entries = dataset.permuted_shards()
-        preceding = sum(entry.rows for entry in entries[: spec.shard_position])
-        return specs, index, spec.shard_position, spec.global_start - preceding
-    raise ValueError("resume cursor does not identify a logical batch boundary")
+        return _ResumeLayout(
+            layout,
+            layout.batch_count,
+            len(entries),
+            0,
+            0,
+        )
+    shard_position = dataset.cursor.shard_position
+    if shard_position < 0 or shard_position >= len(entries):
+        raise ValueError("resume cursor does not identify a logical batch boundary")
+    preceding = sum(entry.rows for entry in entries[:shard_position])
+    shard_end = preceding + entries[shard_position].rows
+    first_index = layout.first_index_starting_at_or_after(preceding)
+    start_index = first_index + dataset.cursor.batch_position
+    if start_index >= layout.batch_count:
+        raise ValueError("resume cursor does not identify a logical batch boundary")
+    global_start = layout.start_at(start_index)
+    if global_start < preceding or global_start >= shard_end:
+        raise ValueError("resume cursor does not identify a logical batch boundary")
+    return _ResumeLayout(
+        layout,
+        start_index,
+        shard_position,
+        global_start - preceding,
+        dataset.cursor.batch_position,
+    )
+
+
+def _iter_batch_specs(
+    dataset: ParquetTrainingDataset,
+    resume: _ResumeLayout,
+) -> Iterator[_BatchSpec]:
+    entries = dataset.permuted_shards()
+    shard_position = resume.start_shard_position
+    preceding = sum(entry.rows for entry in entries[:shard_position])
+    shard_end = (
+        dataset.row_count
+        if shard_position == len(entries)
+        else preceding + entries[shard_position].rows
+    )
+    batch_position = resume.start_batch_position
+    for index in range(resume.start_index, resume.layout.batch_count):
+        global_start = resume.layout.start_at(index)
+        while global_start >= shard_end:
+            preceding = shard_end
+            shard_position += 1
+            if shard_position >= len(entries):
+                raise RuntimeError("logical batch start exceeds prepared shard coverage")
+            shard_end = preceding + entries[shard_position].rows
+            batch_position = 0
+        yield _BatchSpec(
+            shard_position=shard_position,
+            batch_position=batch_position,
+            global_start=global_start,
+            rows=resume.layout.size_at(index),
+        )
+        batch_position += 1
 
 
 def _take_rows(
@@ -525,14 +624,14 @@ def _concatenate_parts(parts: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def _logical_batches(
     dataset: ParquetTrainingDataset, num_workers: int
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
-    specs, start_index, _, skip_rows = _resume_layout(dataset)
-    if start_index == len(specs):
+    resume = _resume_layout(dataset)
+    if resume.start_index == resume.layout.batch_count:
         return
     chunks = iter(_ordered_chunks(dataset, num_workers))
     state: list[Any] = [None, 0]
-    if skip_rows:
-        _take_rows(chunks, state, skip_rows)
-    for spec in specs[start_index:]:
+    if resume.skip_rows:
+        _take_rows(chunks, state, resume.skip_rows)
+    for spec in _iter_batch_specs(dataset, resume):
         shard_position, batch = _take_rows(chunks, state, spec.rows)
         if shard_position != spec.shard_position:
             raise RuntimeError("logical batch start does not match its manifest plan")

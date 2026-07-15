@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import pickle
 import tempfile
+import tracemalloc
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -14,6 +16,57 @@ import pyarrow.parquet as pq
 import yaml
 
 from tests.test_out_of_core_prepare import _source_contract, _write_botiot
+
+
+class BatchLayoutBoundedMemoryTests(unittest.TestCase):
+    def test_huge_resume_layout_does_not_materialize_one_object_per_batch(self) -> None:
+        from bitguard_bnn.out_of_core.dataset import (
+            DataCursor,
+            _ShardEntry,
+            _resume_layout,
+        )
+
+        row_count = 100_000_001
+        batch_size = 2_048
+        batch_position = 48_827
+        entries = (
+            _ShardEntry(
+                path="unused.parquet",
+                fingerprint="f" * 64,
+                rows=row_count,
+                label="benign",
+            ),
+        )
+        dataset = SimpleNamespace(
+            row_count=row_count,
+            batch_size=batch_size,
+            split="train",
+            epoch=7,
+            cursor=DataCursor(7, 0, batch_position, 12),
+            entries=entries,
+            permuted_shards=lambda: entries,
+        )
+
+        tracemalloc.start()
+        layout = _resume_layout(dataset)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        self.assertFalse(isinstance(layout, (list, tuple)))
+        self.assertEqual(layout.start_index, batch_position)
+        self.assertLess(peak, 2 * 1024 * 1024)
+
+    def test_odd_training_rows_with_batch_size_two_are_rejected(self) -> None:
+        from bitguard_bnn.out_of_core.dataset import _logical_batch_sizes
+
+        with self.assertRaisesRegex(ValueError, "batch_size=2"):
+            tuple(
+                _logical_batch_sizes(
+                    5,
+                    2,
+                    allow_singleton=False,
+                )
+            )
 
 
 class OutOfCoreDatasetTests(unittest.TestCase):
@@ -219,9 +272,28 @@ class OutOfCoreDatasetTests(unittest.TestCase):
             )
         verify.assert_called_once()
         self.assertEqual(
-            _logical_batch_sizes(1, 4, allow_singleton=True),
+            tuple(_logical_batch_sizes(1, 4, allow_singleton=True)),
             (1,),
         )
+
+        odd_entry = dict(train_entry)
+        odd_entry["rows"] = 5
+        odd_manifest = {**manifest, "entries": [odd_entry]}
+        odd_prepared = replace(self.prepared, train_count=5)
+        with (
+            patch(
+                "bitguard_bnn.out_of_core.dataset.verify_prepared_dataset",
+                return_value=odd_prepared,
+            ),
+            patch(
+                "bitguard_bnn.out_of_core.dataset.load_shard_manifest",
+                return_value=odd_manifest,
+            ),
+            self.assertRaisesRegex(ValueError, "batch_size=2"),
+        ):
+            ParquetTrainingDataset(
+                self.prepared.descriptor_path, batch_size=2, seed=1
+            )
 
     def test_corrupt_descriptor_and_manifest_are_rejected_before_iteration(self) -> None:
         from bitguard_bnn.out_of_core.dataset import ParquetTrainingDataset
