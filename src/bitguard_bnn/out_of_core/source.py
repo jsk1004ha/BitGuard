@@ -460,11 +460,14 @@ def _select_class_uids(
                     elif entry > heap[0]:
                         heapq.heapreplace(heap, entry)
                 ordinals[label] = ordinal
-    materialization_order = tuple(
-        entry[2]
-        for heap in heaps.values()
-        for entry in sorted(heap, key=lambda item: (-item[0], -item[1]))
-    )
+    ordered_uids: list[str] = []
+    for label, heap in heaps.items():
+        if ordinals[label] <= limit:
+            retained = sorted(heap, key=lambda item: -item[1])
+        else:
+            retained = sorted(heap, key=lambda item: (-item[0], -item[1]))
+        ordered_uids.extend(entry[2] for entry in retained)
+    materialization_order = tuple(ordered_uids)
     return frozenset(materialization_order), materialization_order
 
 

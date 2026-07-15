@@ -12,6 +12,7 @@ import pandas as pd
 from bitguard_bnn.config import DEFAULTS
 from bitguard_bnn.data import (
     LoadedDataset,
+    _FrameAccumulator,
     load_botiot,
     load_dataset,
     load_generic_csv,
@@ -236,6 +237,97 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
 
         self.assertEqual(identity(legacy), expected)
         self.assertEqual(identity(materialized), expected)
+
+    def test_materialized_order_preserves_groups_when_cap_is_not_exceeded(
+        self,
+    ) -> None:
+        expected = [
+            (3, "scan_like"),
+            (1, "scan_like"),
+            (2, "benign"),
+            (0, "benign"),
+        ]
+        for class_cap in (100, 2):
+            with (
+                self.subTest(class_cap=class_cap),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                pd.DataFrame(
+                    {
+                        "behavior_label": [
+                            "benign",
+                            "scan_like",
+                            "benign",
+                            "scan_like",
+                        ],
+                        "x": range(4),
+                    }
+                ).to_csv(root / "rows.csv", index=False)
+                config = _base_config(root, "csv", "rows.csv")
+                config["dataset"]["chunk_size"] = 1
+                config["dataset"]["max_rows_per_class"] = class_cap
+
+                materialized = load_dataset(config).frame
+
+            self.assertEqual(
+                [
+                    (int(index), str(label))
+                    for index, label in zip(
+                        materialized["sequence_index"],
+                        materialized["behavior_label"],
+                    )
+                ],
+                expected,
+            )
+
+    def test_materialized_order_matches_legacy_at_first_and_later_overflow(
+        self,
+    ) -> None:
+        cases = (
+            ("first_overflow", 1, (4,)),
+            ("later_overflow", 2, (2, 4)),
+        )
+        for name, class_cap, file_rows in cases:
+            with (
+                self.subTest(name=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                for file_index, rows in enumerate(file_rows):
+                    pd.DataFrame(
+                        {
+                            "behavior_label": [
+                                "benign" if index % 2 == 0 else "scan_like"
+                                for index in range(rows)
+                            ],
+                            "x": [file_index * 10 + index for index in range(rows)],
+                        }
+                    ).to_csv(root / f"{file_index}.csv", index=False)
+                config = _base_config(root, "csv", "*.csv")
+                config["dataset"]["chunk_size"] = 1
+                config["dataset"]["max_rows_per_class"] = class_cap
+
+                source_frames: dict[str, list[pd.DataFrame]] = {}
+                for chunk in iter_normalized_chunks(
+                    config, apply_sampling_caps=False
+                ):
+                    source_frames.setdefault(
+                        chunk.source_relative_path, []
+                    ).append(chunk.frame)
+                oracle = _FrameAccumulator(
+                    class_cap, int(config["experiment"]["seed"])
+                )
+                for frames in source_frames.values():
+                    oracle.add(pd.concat(frames, ignore_index=True))
+                expected = oracle.finish(int(config["experiment"]["seed"]))
+
+                materialized = load_dataset(config).frame
+
+            self.assertEqual(
+                materialized["row_uid"].tolist(),
+                expected["row_uid"].tolist(),
+            )
 
     def test_header_only_file_is_skipped_when_later_file_has_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
