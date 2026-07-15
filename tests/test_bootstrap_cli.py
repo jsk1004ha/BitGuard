@@ -126,6 +126,27 @@ class BootstrapRegistryTest(unittest.TestCase):
 
 
 class BootstrapOptionsTest(unittest.TestCase):
+    def test_url_looking_path_inputs_are_rejected_before_resolution(self):
+        cases = (
+            ("--data-root", "https://user:secret@example.invalid/data?token=data"),
+            ("--runs-root", r"https:\user:secret@example.invalid\runs?token=runs"),
+            ("--botiot-source", "https://user:secret@example.invalid/archive.zip"),
+        )
+        for option, value in cases:
+            arguments = ["--dataset", "nbaiot", option, value]
+            if option == "--botiot-source":
+                arguments = [
+                    "--dataset",
+                    "botiot",
+                    option,
+                    value,
+                    "--accept-botiot-academic-license",
+                ]
+            with self.subTest(option=option), self.assertRaisesRegex(
+                ValueError, "local filesystem path"
+            ):
+                parse_bootstrap_options(arguments)
+
     def test_restart_stage_choices_use_canonical_state_order(self):
         parser = argparse.ArgumentParser()
         add_bootstrap_arguments(parser)

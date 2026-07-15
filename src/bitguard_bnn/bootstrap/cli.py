@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -9,6 +10,15 @@ from .types import BootstrapOptions
 
 DATASETS = ("nbaiot", "botiot")
 COMPUTE_PROFILES = ("auto", "cpu", "cu118", "cu124")
+_URLISH_PATH = re.compile(r"https?:[\\/]+", re.IGNORECASE)
+
+
+def _resolve_local_path(value: str, option: str) -> Path:
+    if _URLISH_PATH.search(value):
+        raise ValueError(
+            f"{option} must be a local filesystem path; URL-looking values are not allowed"
+        )
+    return Path(value).expanduser().resolve()
 
 
 def add_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
@@ -50,11 +60,11 @@ def options_from_namespace(args: argparse.Namespace) -> BootstrapOptions:
 
     return BootstrapOptions(
         datasets=datasets,
-        botiot_source=Path(args.botiot_source).expanduser().resolve()
+        botiot_source=_resolve_local_path(args.botiot_source, "--botiot-source")
         if args.botiot_source is not None
         else None,
-        data_root=Path(args.data_root).expanduser().resolve(),
-        runs_root=Path(args.runs_root).expanduser().resolve(),
+        data_root=_resolve_local_path(args.data_root, "--data-root"),
+        runs_root=_resolve_local_path(args.runs_root, "--runs-root"),
         compute=args.compute,
         prepare_only=args.prepare_only,
         install_system_tools=args.install_system_tools,

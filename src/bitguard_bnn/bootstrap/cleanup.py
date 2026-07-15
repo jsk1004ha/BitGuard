@@ -12,6 +12,26 @@ from typing import Any
 _DEBT_PREFIXES = (".bitguard-retired-", ".bitguard-extract-")
 
 
+def _powershell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _inspection_command(paths: Iterable[str]) -> str:
+    supplied = tuple(paths)
+    warning = (
+        "Do not delete automatically. Inspect identity, link type, and size before "
+        "any manual cleanup."
+    )
+    if not supplied:
+        return f"Write-Output {_powershell_literal(warning + ' No retained artifacts found.')}"
+    literals = ", ".join(_powershell_literal(path) for path in supplied)
+    return (
+        f"$paths = @({literals}); Write-Output {_powershell_literal(warning)}; "
+        "Get-Item -Force -LiteralPath $paths | "
+        "Select-Object FullName,Attributes,LinkType,Length"
+    )
+
+
 def _artifact_sizes(path: Path) -> tuple[int, int]:
     apparent = 0
     unique = 0
@@ -86,8 +106,7 @@ def scan_cleanup_debt(roots: Iterable[Path | str]) -> dict[str, Any]:
         "artifacts": artifacts,
         "apparent_bytes": apparent_total,
         "unique_bytes": unique_total,
-        "recovery_command": (
-            "Do not delete automatically. Inspect each listed path and its link count "
-            "first; remove it manually only after confirming no active bootstrap uses it."
+        "recovery_command": _inspection_command(
+            str(artifact["path"]) for artifact in artifacts
         ),
     }

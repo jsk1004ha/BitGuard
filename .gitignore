@@ -17,6 +17,7 @@ dist/
 .omx/state/
 .omx/logs/
 .omx/cache/
+.omx/metrics.json
 
 # Bootstrap reports emitted when the shared writer lock cannot be used
 .bitguard-bootstrap-failure-*.json

@@ -90,7 +90,10 @@ At the current acquisition milestone, `--prepare-only` stops after schema
 inspection with `status: "sources_verified"`. Later out-of-core stages consume
 these immutable manifests. Resume is automatic; use `--restart-stage NAME` only
 after inspecting a reported failure. The final report is
-`data/.bitguard/bootstrap-report.json`.
+`data/.bitguard/bootstrap-report.json`; its `report_path` is authoritative when
+a lock/path failure requires a deterministic sibling fallback. The `reports`
+mapping locates preflight, environment, acquisition, extraction, and per-dataset
+schema reports when those artifacts exist.
 
 The filesystem safety boundary covers untrusted network/archive content and
 cooperative BitGuard writers inside a trusted workspace. Malicious

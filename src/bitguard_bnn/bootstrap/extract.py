@@ -64,6 +64,21 @@ class ExtractionResult:
         }
 
 
+def _reject_capture_entries(entries: Sequence[ArchiveEntry]) -> None:
+    excluded = tuple(
+        entry.path
+        for entry in entries
+        if not entry.is_dir
+        and PurePosixPath(entry.path).suffix.casefold() in {".pcap", ".pcapng"}
+    )
+    if excluded:
+        sample = ", ".join(excluded[:3])
+        raise ArchiveExtractionError(
+            "PCAP capture input is excluded from the CSV bootstrap; "
+            f"archive listing contains: {sample}"
+        )
+
+
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _WINDOWS_RESERVED = {
     "con",
@@ -553,6 +568,7 @@ def extract_zip(
         with archive:
             infos = archive.infolist()
             entries = _zip_entries(infos)
+            _reject_capture_entries(entries)
             declared = _declared_preflight(
                 entries,
                 destination_path.parent,
@@ -858,6 +874,7 @@ def extract_rar(
             entries = parse_7z_listing(stdout)
         except ArchiveExtractionError as error:
             raise ArchiveExtractionError(f"7-Zip listing failed validation: {error}") from error
+        _reject_capture_entries(entries)
         declared = _declared_preflight(
             entries,
             destination_path.parent,

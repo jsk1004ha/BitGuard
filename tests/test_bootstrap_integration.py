@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from bitguard_bnn.bootstrap.cleanup import scan_cleanup_debt
 from bitguard_bnn.bootstrap.download import download_file
@@ -16,12 +17,34 @@ from bitguard_bnn.bootstrap.inspect import inspect_csv_dataset
 from bitguard_bnn.bootstrap.orchestrator import (
     BootstrapDependencies,
     Stage,
+    _lock_path,
     run_bootstrap,
 )
+from bitguard_bnn.bootstrap.state import BootstrapWriterLock
 from bitguard_bnn.bootstrap.types import BootstrapOptions
 
 
 class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
+    REQUIRED_REPORT_KEYS = {
+        "version",
+        "status",
+        "last_completed_stage",
+        "failed_stage",
+        "error",
+        "recovery_command",
+        "inputs",
+        "compute",
+        "state",
+        "manifests",
+        "schema_reports",
+        "cleanup_debt",
+        "executed_stages",
+        "reused_stages",
+        "threat_model",
+        "report_path",
+        "reports",
+    }
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -80,6 +103,28 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
             inspector=inspector,
         )
 
+    def assert_comprehensive_report(self, report: dict[str, object]) -> None:
+        self.assertEqual(set(report), self.REQUIRED_REPORT_KEYS)
+        self.assertIsInstance(report["manifests"], dict)
+        self.assertIsInstance(report["schema_reports"], dict)
+        self.assertIsInstance(report["cleanup_debt"], dict)
+        self.assertIsInstance(report["executed_stages"], list)
+        self.assertIsInstance(report["reused_stages"], list)
+        self.assertEqual(
+            set(report["reports"]),
+            {
+                "bootstrap",
+                "preflight",
+                "environment",
+                "acquisition",
+                "extraction",
+                "schemas",
+            },
+        )
+        self.assertEqual(report["reports"]["bootstrap"], report["report_path"])
+        persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(persisted, report)
+
     def test_stage_record_has_name_signature_and_run(self) -> None:
         stage = Stage("inspect", lambda: "signature", lambda: ())
         self.assertEqual(stage.name, "inspect")
@@ -98,6 +143,7 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         )
 
         self.assertEqual(first["status"], "sources_verified")
+        self.assert_comprehensive_report(first)
         self.assertEqual(first["last_completed_stage"], "inspect")
         self.assertIsNone(first["failed_stage"])
         state = json.loads(
@@ -112,6 +158,9 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         for dataset in ("nbaiot", "botiot"):
             self.assertTrue(Path(first["manifests"][dataset]).is_file())
             self.assertTrue(Path(first["schema_reports"][dataset]).is_file())
+        for name in ("preflight", "environment", "acquisition", "extraction"):
+            self.assertTrue(Path(first["reports"][name]).is_file())
+        self.assertEqual(first["reports"]["schemas"], first["schema_reports"])
 
         second_zip = Mock(side_effect=AssertionError("ZIP extraction must be reused"))
         second_inspector = Mock(side_effect=AssertionError("inspection must be reused"))
@@ -181,6 +230,7 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         failed = run_bootstrap(self.options, dependencies=self.dependencies())
 
         self.assertEqual(failed["status"], "failed")
+        self.assert_comprehensive_report(failed)
         self.assertEqual(failed["failed_stage"], "extract")
         self.assertIn("does not match its prior verified tree", failed["error"])
 
@@ -213,6 +263,57 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertEqual(failed["failed_stage"], "preflight")
         self.assertIn("PCAP capture input is excluded", failed["error"])
         self.assertFalse((self.data_root / ".bitguard" / "acquired").exists())
+
+    def test_botiot_zip_pcap_listing_fails_before_final_tree_publication(self) -> None:
+        archive_path = self.root / "botiot-with-capture.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("flows.csv", "category,subcategory\nNormal,Normal\n")
+            archive.writestr("nested/capture.pcap", b"excluded")
+        options = BootstrapOptions(
+            **{
+                **self.options.__dict__,
+                "datasets": ("botiot",),
+                "botiot_source": archive_path.resolve(),
+            }
+        )
+
+        failed = run_bootstrap(options, dependencies=self.dependencies())
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failed_stage"], "extract")
+        self.assertIn("PCAP capture input is excluded", failed["error"])
+        raw_root = self.data_root / "raw"
+        self.assertEqual(list(raw_root.glob("botiot-*")), [])
+
+    def test_nested_rar_failure_retains_private_candidate_without_final_tree(self) -> None:
+        archive_path = self.root / "botiot-with-nested-rar.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("flows.csv", "category,subcategory\nNormal,Normal\n")
+            archive.writestr("nested.rar", b"rar")
+        options = BootstrapOptions(
+            **{
+                **self.options.__dict__,
+                "datasets": ("botiot",),
+                "botiot_source": archive_path.resolve(),
+            }
+        )
+
+        def reject_nested(*_args, **_kwargs):
+            raise RuntimeError("PCAP capture input is excluded from nested RAR listing")
+
+        dependencies = BootstrapDependencies(
+            nbaiot_archive=self.nbaiot_archive,
+            available_bytes=10**12,
+            compute_resolver=self.dependencies().compute_resolver,
+            rar_extractor=reject_nested,
+        )
+        failed = run_bootstrap(options, dependencies=dependencies)
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("PCAP capture input is excluded", failed["error"])
+        raw_root = self.data_root / "raw"
+        self.assertEqual(list(raw_root.glob("botiot-*")), [])
+        self.assertTrue(list(raw_root.glob(".bitguard-extract-*")))
 
     def test_failure_report_is_atomic_redacted_and_restart_is_actionable(self) -> None:
         def fail_zip(*_args, **_kwargs):
@@ -252,6 +353,112 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertEqual(recovered["status"], "sources_verified")
         self.assertIn("extract", recovered["executed_stages"])
 
+    def test_writer_lock_identity_depends_only_on_data_root(self) -> None:
+        alternate = BootstrapOptions(
+            **{**self.options.__dict__, "runs_root": (self.root / "other-runs").resolve()}
+        )
+
+        self.assertEqual(_lock_path(self.options), _lock_path(alternate))
+        with BootstrapWriterLock(_lock_path(self.options)):
+            failed = run_bootstrap(
+                alternate,
+                raw_inputs={
+                    "data_root": "https://user:secret@example.invalid/data?token=lock",
+                },
+                dependencies=self.dependencies(),
+            )
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failed_stage"], "preflight")
+        self.assert_comprehensive_report(failed)
+        self.assertIsNone(failed["reports"]["preflight"])
+        self.assertEqual(failed["reports"]["schemas"], {})
+        encoded = json.dumps(failed)
+        self.assertNotIn("secret", encoded)
+        self.assertNotIn("token=lock", encoded)
+
+    def test_lock_path_resolution_failure_uses_comprehensive_fallback_report(self) -> None:
+        with patch(
+            "bitguard_bnn.bootstrap.orchestrator._lock_path",
+            side_effect=RuntimeError(
+                "bad https://user:secret@example.invalid/root?token=path#fragment"
+            ),
+        ):
+            failed = run_bootstrap(
+                self.options,
+                raw_inputs={
+                    "runs_root": "https://user:secret@example.invalid/runs?token=input"
+                },
+                dependencies=self.dependencies(),
+            )
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failed_stage"], "preflight")
+        self.assert_comprehensive_report(failed)
+        encoded = json.dumps(failed)
+        self.assertNotIn("secret", encoded)
+        self.assertNotIn("token=path", encoded)
+        self.assertNotIn("token=input", encoded)
+
+    def test_recursive_report_redaction_covers_windows_mangled_url_paths(self) -> None:
+        mangled = (
+            self.root
+            / r"https:\user:password@example.invalid\data?token=resolved#fragment"
+        )
+        unsafe_options = BootstrapOptions(
+            **{**self.options.__dict__, "data_root": mangled}
+        )
+        debt = {
+            "artifacts": [{"path": str(mangled), "nested": [str(mangled)]}],
+            "apparent_bytes": 0,
+            "unique_bytes": 0,
+            "recovery_command": f"inspect {mangled}",
+        }
+
+        with patch(
+            "bitguard_bnn.bootstrap.orchestrator.scan_cleanup_debt",
+            return_value=debt,
+        ):
+            failed = run_bootstrap(
+                unsafe_options,
+                raw_inputs={"nested": {"paths": [str(mangled)]}},
+                dependencies=self.dependencies(),
+            )
+
+        self.assertEqual(failed["status"], "failed")
+        self.assert_comprehensive_report(failed)
+        encoded = json.dumps(failed)
+        for secret in ("password", "token=resolved", "#fragment"):
+            self.assertNotIn(secret, encoded)
+        self.assertNotIn("user:", encoded)
+
+    def test_lock_release_failure_uses_same_comprehensive_report_schema(self) -> None:
+        original_release = BootstrapWriterLock.release
+
+        def fail_after_release(lock):
+            original_release(lock)
+            raise RuntimeError(
+                "release https://user:secret@example.invalid/lock?token=release failed"
+            )
+
+        with patch.object(BootstrapWriterLock, "release", fail_after_release):
+            failed = run_bootstrap(
+                self.options,
+                raw_inputs={
+                    "data_root": "https://user:secret@example.invalid/data?token=input"
+                },
+                dependencies=self.dependencies(),
+            )
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["last_completed_stage"], "inspect")
+        self.assertEqual(failed["failed_stage"], "lock-release")
+        self.assert_comprehensive_report(failed)
+        encoded = json.dumps(failed)
+        self.assertNotIn("secret", encoded)
+        self.assertNotIn("token=release", encoded)
+        self.assertNotIn("token=input", encoded)
+
 
 class CleanupDebtTest(unittest.TestCase):
     def test_scan_reports_apparent_and_inode_deduplicated_bytes(self) -> None:
@@ -279,6 +486,13 @@ class CleanupDebtTest(unittest.TestCase):
             self.assertEqual(report["unique_bytes"], 8)
             self.assertEqual(len(report["artifacts"]), 3)
             self.assertIn("Do not delete automatically", report["recovery_command"])
+            escaped = str(retired).replace("'", "''")
+            self.assertIn(escaped, report["recovery_command"])
+            self.assertIn("Get-Item", report["recovery_command"])
+            self.assertIn("-LiteralPath", report["recovery_command"])
+            self.assertNotRegex(
+                report["recovery_command"], r"(?i)Remove-Item|del(?:ete)?-Item"
+            )
 
 
 class GitIgnoreContractTest(unittest.TestCase):
@@ -292,8 +506,30 @@ class GitIgnoreContractTest(unittest.TestCase):
         }
         for expected in (".venv/", "data/", "runs/", "__pycache__/", ".pytest_cache/"):
             self.assertIn(expected, lines)
+        self.assertIn(".omx/metrics.json", lines)
         self.assertNotIn(".omx/", lines)
+        self.assertNotIn(".omx/project-memory.json", lines)
+        self.assertNotIn(".omx/notepad.md", lines)
         self.assertNotIn("docs/superpowers/plans/", lines)
+
+        root = Path(__file__).resolve().parents[1]
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--no-index", "-q", ".omx/metrics.json"],
+            cwd=root,
+            check=False,
+        )
+        self.assertEqual(ignored.returncode, 0)
+        for retained in (
+            ".omx/project-memory.json",
+            ".omx/notepad.md",
+            ".omx/plans/prd-bootstrap.md",
+        ):
+            result = subprocess.run(
+                ["git", "check-ignore", "--no-index", "-q", retained],
+                cwd=root,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, retained)
 
 
 if __name__ == "__main__":

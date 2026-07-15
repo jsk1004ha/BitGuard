@@ -127,6 +127,14 @@ class SafeZipExtractionTest(unittest.TestCase):
             "unsafe archive path",
         )
 
+    def test_rejects_capture_entries_from_the_validated_listing_before_writing(self) -> None:
+        for name in ("capture.pcap", "nested/CAPTURE.PCAPNG"):
+            with self.subTest(name=name):
+                self._assert_rejected_without_destination(
+                    [("flows.csv", b"x\n1\n"), (name, b"capture")],
+                    "PCAP capture input is excluded",
+                )
+
     def test_rejects_file_directory_prefix_conflicts_before_writing(self) -> None:
         self._assert_rejected_without_destination(
             [("prefix", b"file"), ("PREFIX/child.csv", b"row")],
@@ -356,6 +364,32 @@ Mode = drwxr-xr-x
                 ArchiveExtractionError, pattern
             ):
                 parse_7z_listing(listing)
+
+    def test_rejects_capture_listing_before_invoking_rar_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rar"
+            source.write_bytes(b"rar")
+            destination = root / "out"
+            listing = self.LISTING.replace("nested/data.csv", "nested/capture.pcap")
+            calls: list[list[str]] = []
+
+            def run(args, **kwargs):
+                calls.append(list(args))
+                return subprocess.CompletedProcess(args, 0, listing, "")
+
+            with self.assertRaisesRegex(
+                ArchiveExtractionError, "PCAP capture input is excluded"
+            ):
+                extract_rar(
+                    source,
+                    destination,
+                    which_fn=lambda _: "/tools/7z",
+                    run_fn=run,
+                )
+
+            self.assertEqual([call[1] for call in calls], ["l"])
+            self.assertFalse(destination.exists())
 
     def test_missing_tool_reports_exact_non_privileged_remediation(self) -> None:
         cases = (

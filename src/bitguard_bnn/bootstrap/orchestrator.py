@@ -13,10 +13,12 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 from .cleanup import scan_cleanup_debt
 from .download import DownloadResult, download_file, sanitize_url
 from .extract import ExtractionResult, extract_rar, extract_zip
+from .fsops import rename_directory_noreplace
 from .inspect import SchemaInspectionReport, inspect_csv_dataset
 from .manifest import build_source_manifest, write_source_manifest
 from .preflight import (
@@ -39,7 +41,8 @@ UNKNOWN_REMOTE_ARCHIVE_BYTES = 4 * 1024**3
 ARCHIVE_EXPANSION_FACTOR = 12
 REPORT_AND_METADATA_BYTES = 64 * 1024**2
 DEFAULT_DISK_RESERVE_BYTES = 2 * 1024**3
-_URL_IN_TEXT = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_URLISH_IN_TEXT = re.compile(r"https?:[\\/]+[^\s\"'<>]+", re.IGNORECASE)
+_URLISH_PATH = re.compile(r"https?:[\\/]+", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +50,13 @@ class Stage:
     name: str
     input_signature: Callable[[], str]
     run: Callable[[], Sequence[Path]]
+
+
+class SourceContext(TypedDict):
+    kind: str
+    digest: str | None
+    bytes: int
+    source: Path | None
 
 
 def _default_compute_resolver(requested: str) -> dict[str, object]:
@@ -172,31 +182,51 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
     temporary.replace(path)
 
 
-def _safe_url_or_text(value: object) -> object:
+def _redact_text(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        matched = match.group(0)
+        candidate = matched.rstrip(".,;:)]}")
+        suffix = matched[len(candidate) :]
+        normalized = re.sub(
+            r"^(https?):[\\/]+",
+            lambda item: f"{item.group(1)}://",
+            candidate,
+            count=1,
+            flags=re.IGNORECASE,
+        ).replace("\\", "/")
+        try:
+            return sanitize_url(normalized) + suffix
+        except Exception:
+            return "<redacted-url>" + suffix
+
+    return _URLISH_IN_TEXT.sub(replace, value)
+
+
+def _redact_report_value(value: object) -> object:
+    """Recursively remove URL credentials and URL query/fragment material."""
+
     if isinstance(value, os.PathLike):
         value = os.fspath(value)
-    if not isinstance(value, str):
-        return value
-    try:
-        if value.lower().startswith(("http://", "https://")):
-            return sanitize_url(value)
-    except Exception:
-        return "<redacted-invalid-url>"
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, Mapping):
+        return {key: _redact_report_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_report_value(item) for item in value]
     return value
 
 
 def _safe_error(error: BaseException) -> str:
-    text = f"{type(error).__name__}: {error}"
+    return _redact_text(f"{type(error).__name__}: {error}")
 
-    def replace(match: re.Match[str]) -> str:
-        candidate = match.group(0).rstrip(".,;:)")
-        suffix = match.group(0)[len(candidate) :]
-        try:
-            return sanitize_url(candidate) + suffix
-        except Exception:
-            return "<redacted-url>" + suffix
 
-    return _URL_IN_TEXT.sub(replace, text)
+def _resolved_local_path(path: Path, label: str) -> Path:
+    raw = str(path)
+    if _URLISH_PATH.search(raw):
+        raise RuntimeError(
+            f"{label} must be a local filesystem path; URL-looking values are not allowed"
+        )
+    return path.expanduser().resolve(strict=False)
 
 
 def _existing_parent(path: Path) -> Path:
@@ -211,11 +241,30 @@ def _existing_parent(path: Path) -> Path:
 
 
 def _lock_path(options: BootstrapOptions) -> Path:
-    parent = _existing_parent(options.data_root.parent)
-    identity = _json_signature(
-        {"data_root": str(options.data_root), "runs_root": str(options.runs_root)}
-    )[:20]
+    data_root = _resolved_local_path(options.data_root, "data_root")
+    parent = _existing_parent(data_root.parent)
+    identity = _json_signature({"data_root": str(data_root)})[:20]
     return parent / f".bitguard-bootstrap-{identity}.lock"
+
+
+def _fallback_report_paths(options: BootstrapOptions) -> tuple[Path, ...]:
+    raw_data_root = str(options.data_root)
+    identity = _json_signature({"data_root": raw_data_root})[:20]
+    cwd = Path.cwd().resolve(strict=True)
+    parents: list[Path] = []
+    if not _URLISH_PATH.search(raw_data_root):
+        try:
+            resolved_parent = options.data_root.expanduser().resolve(strict=False).parent
+            parents.append(_existing_parent(resolved_parent))
+        except BaseException:
+            pass
+    parents.append(cwd)
+    unique: list[Path] = []
+    for parent in parents:
+        candidate = parent / f".bitguard-bootstrap-{identity}-failure-report.json"
+        if candidate not in unique:
+            unique.append(candidate)
+    return tuple(unique)
 
 
 def _copy_file(source: Path, destination: Path, expected_digest: str) -> Path:
@@ -338,8 +387,11 @@ def _nested_rars(root: Path) -> tuple[Path, ...]:
 
 
 def _recovery(stage: str | None) -> str:
-    if stage is None:
-        return "Inspect the bootstrap report, correct the input or resource error, and rerun the original command."
+    if stage is None or stage not in STAGE_ORDER:
+        return (
+            "Inspect the bootstrap report, correct the input or resource error, and "
+            "rerun the original command."
+        )
     return (
         "Inspect retained artifacts and correct the reported cause, then rerun the "
         f"original command with --restart-stage {stage}."
@@ -355,39 +407,23 @@ def run_bootstrap(
     """Acquire and verify selected CSV sources, returning a durable report."""
 
     deps = dependencies or BootstrapDependencies()
-    registry = load_registry()
     metadata_root = options.data_root / ".bitguard"
     report_path = metadata_root / "bootstrap-report.json"
     state_path = metadata_root / "bootstrap-state.json"
+    preflight_path = metadata_root / "preflight.json"
+    environment_path = metadata_root / "environment.json"
+    acquisition_report_path = metadata_root / "acquisition.json"
+    extraction_report_path = metadata_root / "extraction.json"
+    acquisition_root = metadata_root / "acquired"
+    extraction_root = options.data_root / "raw"
+    manifest_root = metadata_root / "manifests"
+    schema_root = metadata_root / "schema"
     original = {
         "botiot_source": None,
         "data_root": str(options.data_root),
         "runs_root": str(options.runs_root),
         **dict(raw_inputs or {}),
     }
-    safe_original = {key: _safe_url_or_text(value) for key, value in original.items()}
-    safe_resolved = {
-        key: _safe_url_or_text(value)
-        for key, value in options.to_dict().items()
-    }
-    try:
-        lock_path = _lock_path(options)
-    except BaseException as error:
-        fallback = Path.cwd() / (
-            f".bitguard-bootstrap-failure-{os.getpid()}-{uuid.uuid4().hex}.json"
-        )
-        result: dict[str, object] = {
-            "version": REPORT_FORMAT_VERSION,
-            "status": "failed",
-            "last_completed_stage": None,
-            "failed_stage": "preflight",
-            "error": _safe_error(error),
-            "recovery_command": _recovery("preflight"),
-            "inputs": {"original": safe_original, "resolved": safe_resolved},
-            "report_path": str(fallback),
-        }
-        _write_json(fallback, result)
-        return result
     executed: list[str] = []
     reused: list[str] = []
     failed_stage: str | None = None
@@ -395,10 +431,41 @@ def run_bootstrap(
     compute: dict[str, object] | None = None
     manifests: dict[str, str] = {}
     schemas: dict[str, str] = {}
-    cleanup_roots: set[Path] = {metadata_root, options.data_root}
+    cleanup_roots: set[Path] = {
+        metadata_root,
+        options.data_root,
+        acquisition_root,
+        extraction_root,
+        manifest_root,
+        schema_root,
+    }
 
-    def report(status: str, error: BaseException | None = None) -> dict[str, object]:
-        debt = scan_cleanup_debt(tuple(sorted(cleanup_roots, key=str)))
+    def existing_locator(path: Path) -> str | None:
+        try:
+            return str(path) if path.is_file() else None
+        except OSError:
+            return None
+
+    def cleanup_debt() -> dict[str, object]:
+        try:
+            return dict(scan_cleanup_debt(tuple(sorted(cleanup_roots, key=str))))
+        except BaseException as error:
+            return {
+                "artifacts": [],
+                "apparent_bytes": 0,
+                "unique_bytes": 0,
+                "recovery_command": (
+                    "Write-Output 'Cleanup-debt inspection failed; inspect the "
+                    "reported roots manually without deleting them.'"
+                ),
+                "scan_error": _safe_error(error),
+            }
+
+    def build_report(
+        status: str,
+        error: BaseException | None,
+        actual_report_path: Path,
+    ) -> dict[str, object]:
         result: dict[str, object] = {
             "version": REPORT_FORMAT_VERSION,
             "status": status,
@@ -406,29 +473,94 @@ def run_bootstrap(
             "failed_stage": failed_stage,
             "error": None if error is None else _safe_error(error),
             "recovery_command": _recovery(failed_stage) if error is not None else None,
-            "inputs": {"original": safe_original, "resolved": safe_resolved},
+            "inputs": {"original": original, "resolved": options.to_dict()},
             "compute": compute,
             "state": str(state_path),
-            "manifests": manifests,
-            "schema_reports": schemas,
-            "cleanup_debt": debt,
-            "executed_stages": executed,
-            "reused_stages": reused,
+            "manifests": dict(manifests),
+            "schema_reports": dict(schemas),
+            "cleanup_debt": cleanup_debt(),
+            "executed_stages": list(executed),
+            "reused_stages": list(reused),
             "threat_model": (
                 "Defends untrusted network/archive input and cooperative writers in a "
                 "trusted workspace. Malicious same-account parent-namespace or hardlink "
                 "mutation is outside this contract."
             ),
+            "report_path": str(actual_report_path),
+            "reports": {
+                "bootstrap": str(actual_report_path),
+                "preflight": existing_locator(preflight_path),
+                "environment": existing_locator(environment_path),
+                "acquisition": existing_locator(acquisition_report_path),
+                "extraction": existing_locator(extraction_report_path),
+                "schemas": dict(schemas),
+            },
         }
-        _write_json(report_path, result)
-        return result
+        redacted = _redact_report_value(result)
+        if not isinstance(redacted, dict):  # pragma: no cover - fixed report shape
+            raise TypeError("bootstrap report redaction produced a non-mapping")
+        return redacted
 
-    current_stage: str | None = None
+    def persist_report(
+        status: str,
+        error: BaseException | None,
+        *,
+        preferred: Path | None,
+    ) -> dict[str, object]:
+        nonlocal failed_stage
+        targets = ([preferred] if preferred is not None else []) + list(
+            _fallback_report_paths(options)
+        )
+        unique_targets: list[Path] = []
+        for target in targets:
+            if target not in unique_targets:
+                unique_targets.append(target)
+
+        report_status = status
+        report_error = error
+        last_write_error: BaseException | None = None
+        for target in unique_targets:
+            payload = build_report(report_status, report_error, target)
+            try:
+                _write_json(target, payload)
+                return payload
+            except BaseException as write_error:
+                last_write_error = write_error
+                report_status = "failed"
+                if failed_stage is None:
+                    failed_stage = "report"
+                detail = _safe_error(write_error)
+                if report_error is None:
+                    report_error = RuntimeError(
+                        f"Bootstrap report persistence failed: {detail}"
+                    )
+                else:
+                    report_error = RuntimeError(
+                        f"{_safe_error(report_error)}; bootstrap report persistence "
+                        f"also failed: {detail}"
+                    )
+        assert last_write_error is not None
+        raise last_write_error
+
+    def report(status: str, error: BaseException | None = None) -> dict[str, object]:
+        return persist_report(status, error, preferred=report_path)
+
+    current_stage: str | None = "preflight"
+    lock_entered = False
+    try:
+        lock_path = _lock_path(options)
+    except BaseException as error:
+        failed_stage = "preflight"
+        return persist_report("failed", error, preferred=None)
+
     try:
         with BootstrapWriterLock(lock_path):
+            lock_entered = True
             try:
                 current_stage = "preflight"
-                source_context: dict[str, dict[str, object]] = {}
+                registry = load_registry()
+                _resolved_local_path(options.runs_root, "runs_root")
+                source_context: dict[str, SourceContext] = {}
                 if "nbaiot" in options.datasets:
                     if deps.nbaiot_archive is None:
                         remote_bytes = deps.nbaiot_download_size or UNKNOWN_REMOTE_ARCHIVE_BYTES
@@ -452,8 +584,10 @@ def run_bootstrap(
                 if "botiot" in options.datasets:
                     if not options.accepted_botiot_license or options.botiot_source is None:
                         raise RuntimeError(
-                            "BoT-IoT requires a local source and explicit academic-license acknowledgement"
+                            "BoT-IoT requires a local source and explicit "
+                            "academic-license acknowledgement"
                         )
+                    _resolved_local_path(options.botiot_source, "botiot_source")
                     source = options.botiot_source.resolve(strict=True)
                     try:
                         source.relative_to(options.data_root)
@@ -480,9 +614,9 @@ def run_bootstrap(
                         "source": source,
                     }
 
-                download_bytes = sum(int(item["bytes"]) for item in source_context.values())
+                download_bytes = sum(item["bytes"] for item in source_context.values())
                 archive_bytes = sum(
-                    int(item["bytes"])
+                    item["bytes"]
                     for item in source_context.values()
                     if item["kind"] in {"zip", "rar"}
                 )
@@ -491,7 +625,7 @@ def run_bootstrap(
                     ArchiveInspection(()),
                     final_download_bytes=download_bytes,
                     planned_partial_bytes=(
-                        int(source_context.get("nbaiot", {}).get("bytes", 0))
+                        source_context["nbaiot"]["bytes"]
                         if deps.nbaiot_archive is None and "nbaiot" in source_context
                         else 0
                     ),
@@ -513,27 +647,11 @@ def run_bootstrap(
                 if options.restart_stage is not None:
                     state.invalidate_from(options.restart_stage, STAGE_ORDER)
 
-                preflight_path = metadata_root / "preflight.json"
-                environment_path = metadata_root / "environment.json"
-                acquisition_root = metadata_root / "acquired"
-                extraction_root = options.data_root / "raw"
-                manifest_root = metadata_root / "manifests"
-                schema_root = metadata_root / "schema"
-                cleanup_roots.update(
-                    {
-                        metadata_root,
-                        acquisition_root,
-                        extraction_root,
-                        manifest_root,
-                        schema_root,
-                    }
-                )
-
                 acquired: dict[str, Path] = {}
                 raw_roots: dict[str, Path] = {}
                 for dataset, context in source_context.items():
-                    digest = context["digest"]
-                    token = str(digest or "official")
+                    source_digest = context["digest"]
+                    token = str(source_digest or "official")
                     kind = str(context["kind"])
                     acquired[dataset] = (
                         acquisition_root / f"{dataset}-{token}"
@@ -621,7 +739,6 @@ def run_bootstrap(
                                 "destination": str(destination),
                                 "sha256": digest,
                             }
-                    acquisition_report_path = metadata_root / "acquisition.json"
                     _write_json(acquisition_report_path, {"datasets": acquisition_report})
                     outputs.append(acquisition_report_path)
                     return tuple(outputs)
@@ -630,7 +747,6 @@ def run_bootstrap(
                     extraction_root.mkdir(parents=True, exist_ok=True)
                     outputs: list[Path] = []
                     extraction_report: dict[str, object] = {}
-                    extraction_report_path = metadata_root / "extraction.json"
                     prior_trees: dict[str, str] = {}
                     if extraction_report_path.is_file():
                         try:
@@ -674,25 +790,58 @@ def run_bootstrap(
                                 "tree_sha256": _tree_digest(destination)[0],
                             }
                         else:
+                            candidate = destination.with_name(
+                                f".bitguard-extract-{dataset}-{uuid.uuid4().hex}"
+                            )
                             result = _extract_archive(
                                 source,
-                                destination,
+                                candidate,
                                 kind=kind,
                                 dependencies=deps,
                                 install_system_tools=options.install_system_tools,
                             )
-                            nested_reports: list[dict[str, object]] = []
-                            for nested in _nested_rars(destination):
+                            nested_results: list[ExtractionResult] = []
+                            for nested in _nested_rars(candidate):
                                 nested_destination = nested.with_suffix("")
                                 nested_result = deps.rar_extractor(
                                     nested,
                                     nested_destination,
                                     install_system_tools=options.install_system_tools,
                                 )
-                                nested_reports.append(nested_result.as_dict())
+                                nested_results.append(nested_result)
+                            _reject_excluded_capture_files(candidate)
+                            try:
+                                rename_directory_noreplace(candidate, destination)
+                            except FileExistsError as error:
+                                raise RuntimeError(
+                                    "Final extraction destination appeared before "
+                                    f"publication: {destination}; private candidate "
+                                    f"is retained at {candidate}."
+                                ) from error
+                            except OSError as error:
+                                raise RuntimeError(
+                                    "Could not publish verified extraction candidate "
+                                    f"{candidate} to {destination}: {error}. The "
+                                    "private candidate is retained for inspection."
+                                ) from error
+
+                            def relocated(value: ExtractionResult) -> dict[str, object]:
+                                payload = value.as_dict()
+                                for field in ("source", "destination"):
+                                    path = Path(str(payload[field]))
+                                    try:
+                                        relative = path.relative_to(candidate)
+                                    except ValueError:
+                                        continue
+                                    payload[field] = str(destination / relative)
+                                return payload
+
                             extraction_report[dataset] = {
-                                **result.as_dict(),
-                                "nested_rar": nested_reports,
+                                **relocated(result),
+                                "nested_rar": [
+                                    relocated(nested_result)
+                                    for nested_result in nested_results
+                                ],
                                 "tree_sha256": _tree_digest(destination)[0],
                             }
                         _reject_excluded_capture_files(destination)
@@ -839,21 +988,5 @@ def run_bootstrap(
                 failed_stage = current_stage
                 return report("failed", error)
     except BaseException as error:
-        failed_stage = current_stage
-        # Lock acquisition/release failure must not mutate the shared report path;
-        # use a process-unique sibling report under the already trusted parent.
-        fallback = lock_path.with_name(
-            f"{lock_path.stem}-failure-{os.getpid()}-{uuid.uuid4().hex}.json"
-        )
-        result = {
-            "version": REPORT_FORMAT_VERSION,
-            "status": "failed",
-            "last_completed_stage": last_completed,
-            "failed_stage": failed_stage,
-            "error": _safe_error(error),
-            "recovery_command": _recovery(failed_stage),
-            "inputs": {"original": safe_original, "resolved": safe_resolved},
-            "report_path": str(fallback),
-        }
-        _write_json(fallback, result)
-        return result
+        failed_stage = "lock-release" if lock_entered else "preflight"
+        return persist_report("failed", error, preferred=None)
