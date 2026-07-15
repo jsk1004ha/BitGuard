@@ -89,13 +89,21 @@ _MEMBERSHIP_SCHEMA = pa.schema(
 
 
 class _ResourceTracker:
-    def __init__(self, root: Path, max_rows_per_run: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        max_rows_per_run: int,
+        merge_read_batch_rows: int,
+    ) -> None:
         self.root = root
         self.configured_max_rows_per_run = max_rows_per_run
+        self.configured_merge_read_batch_rows = merge_read_batch_rows
         self.max_run_rows = 0
         self.run_count = 0
         self.temporary_bytes_peak = 0
         self.max_merge_fan_in_observed = 0
+        self._merge_input_rows_buffered = 0
+        self.max_merge_input_rows_buffered = 0
 
     def record_run(self, rows: int) -> None:
         self.max_run_rows = max(self.max_run_rows, rows)
@@ -111,6 +119,18 @@ class _ResourceTracker:
             except OSError:
                 continue
         self.temporary_bytes_peak = max(self.temporary_bytes_peak, size)
+
+    def open_merge_batch(self, rows: int) -> None:
+        self._merge_input_rows_buffered += rows
+        self.max_merge_input_rows_buffered = max(
+            self.max_merge_input_rows_buffered,
+            self._merge_input_rows_buffered,
+        )
+
+    def close_merge_batch(self, rows: int) -> None:
+        self._merge_input_rows_buffered -= rows
+        if self._merge_input_rows_buffered < 0:
+            raise RuntimeError("merge input row accounting underflow")
 
 
 def _record_to_dict(record: SourceRowRecord) -> dict[str, Any]:
@@ -265,23 +285,34 @@ def _write_run(
     tracker.record_run(len(rows))
 
 
-def _iter_run(path: Path, batch_rows: int) -> Generator[dict[str, Any], None, None]:
+def _iter_run(
+    path: Path,
+    batch_rows: int,
+    tracker: _ResourceTracker | None = None,
+) -> Generator[dict[str, Any], None, None]:
     with path.open("rb") as handle:
         parquet = pq.ParquetFile(handle)
         for batch in parquet.iter_batches(batch_size=batch_rows):
-            yield from batch.to_pylist()
+            rows = batch.to_pylist()
+            if tracker is not None:
+                tracker.open_merge_batch(len(rows))
+            try:
+                yield from rows
+            finally:
+                if tracker is not None:
+                    tracker.close_merge_batch(len(rows))
 
 
 def _merge_direct(
     paths: Sequence[Path],
     key: Callable[[Mapping[str, Any]], tuple[Any, ...]],
-    batch_rows: int,
+    merge_read_batch_rows: int,
     tracker: _ResourceTracker,
 ) -> Iterator[dict[str, Any]]:
     tracker.max_merge_fan_in_observed = max(
         tracker.max_merge_fan_in_observed, len(paths)
     )
-    iterators = [_iter_run(path, batch_rows) for path in paths]
+    iterators = [_iter_run(path, merge_read_batch_rows, tracker) for path in paths]
     merged = heapq.merge(*iterators, key=key)
     try:
         yield from merged
@@ -296,6 +327,7 @@ def _write_merged_run(
     key: Callable[[Mapping[str, Any]], tuple[Any, ...]],
     schema: pa.Schema,
     max_rows_per_run: int,
+    merge_read_batch_rows: int,
     tracker: _ResourceTracker,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -303,7 +335,7 @@ def _write_merged_run(
     buffer: list[dict[str, Any]] = []
     max_buffer_rows = 0
     try:
-        for row in _merge_direct(paths, key, max_rows_per_run, tracker):
+        for row in _merge_direct(paths, key, merge_read_batch_rows, tracker):
             buffer.append(row)
             if len(buffer) >= max_rows_per_run:
                 writer.write_table(pa.Table.from_pylist(buffer, schema=schema))
@@ -325,6 +357,7 @@ def _merge_runs(
     work: Path,
     schema: pa.Schema,
     max_rows_per_run: int,
+    merge_read_batch_rows: int,
     merge_fan_in: int,
     tracker: _ResourceTracker,
 ) -> Iterator[dict[str, Any]]:
@@ -352,6 +385,7 @@ def _merge_runs(
                     key,
                     schema,
                     max_rows_per_run,
+                    merge_read_batch_rows,
                     tracker,
                 )
                 owned.add(destination)
@@ -362,7 +396,7 @@ def _merge_runs(
                 owned.discard(old_path)
             current = next_paths
             pass_number += 1
-        yield from _merge_direct(current, key, max_rows_per_run, tracker)
+        yield from _merge_direct(current, key, merge_read_batch_rows, tracker)
     finally:
         for path in owned:
             path.unlink(missing_ok=True)
@@ -429,6 +463,7 @@ def _validate_coordinates(
     paths: Sequence[Path],
     work: Path,
     max_rows_per_run: int,
+    merge_read_batch_rows: int,
     merge_fan_in: int,
     tracker: _ResourceTracker,
 ) -> None:
@@ -443,6 +478,7 @@ def _validate_coordinates(
         work=work,
         schema=_INSPECTION_SCHEMA,
         max_rows_per_run=max_rows_per_run,
+        merge_read_batch_rows=merge_read_batch_rows,
         merge_fan_in=merge_fan_in,
         tracker=tracker,
     ):
@@ -459,6 +495,7 @@ def _inspect_uid_order(
     configured_attacks: set[str],
     work: Path,
     max_rows_per_run: int,
+    merge_read_batch_rows: int,
     merge_fan_in: int,
     tracker: _ResourceTracker,
 ) -> tuple[str, dict[str, Any]]:
@@ -476,6 +513,7 @@ def _inspect_uid_order(
         work=work,
         schema=_INSPECTION_SCHEMA,
         max_rows_per_run=max_rows_per_run,
+        merge_read_batch_rows=merge_read_batch_rows,
         merge_fan_in=merge_fan_in,
         tracker=tracker,
     ):
@@ -657,6 +695,7 @@ def _assign_strategy_rows(
     forced_count: int,
     total_rows: int,
     max_rows_per_run: int,
+    merge_read_batch_rows: int,
     merge_fan_in: int,
     tracker: _ResourceTracker,
 ) -> tuple[list[Path], dict[str, Any]]:
@@ -707,6 +746,7 @@ def _assign_strategy_rows(
         work=work,
         schema=_INSPECTION_SCHEMA,
         max_rows_per_run=max_rows_per_run,
+        merge_read_batch_rows=merge_read_batch_rows,
         merge_fan_in=merge_fan_in,
         tracker=tracker,
     ):
@@ -776,6 +816,7 @@ def _write_membership(
     assignment_paths: Sequence[Path],
     destination: Path,
     max_rows_per_run: int,
+    merge_read_batch_rows: int,
     merge_fan_in: int,
     tracker: _ResourceTracker,
 ) -> tuple[dict[str, int], dict[str, Any], str, str]:
@@ -809,6 +850,7 @@ def _write_membership(
                 work=destination.parent,
                 schema=_ASSIGNMENT_SCHEMA,
                 max_rows_per_run=max_rows_per_run,
+                merge_read_batch_rows=merge_read_batch_rows,
                 merge_fan_in=merge_fan_in,
                 tracker=tracker,
             ):
@@ -956,6 +998,7 @@ def build_split_plan(
     *,
     max_rows_per_run: int = 65_536,
     merge_fan_in: int = 32,
+    merge_read_batch_rows: int = 1_024,
     source_manifest_fingerprint: str | None = None,
 ) -> SplitPlan:
     """Inspect normalized chunks and publish an exact, UID-sorted split plan."""
@@ -966,12 +1009,23 @@ def build_split_plan(
     if isinstance(merge_fan_in, bool) or int(merge_fan_in) < 2:
         raise ValueError("merge_fan_in must be at least 2")
     merge_fan_in = int(merge_fan_in)
+    if (
+        isinstance(merge_read_batch_rows, bool)
+        or not isinstance(merge_read_batch_rows, Integral)
+        or int(merge_read_batch_rows) <= 0
+    ):
+        raise ValueError("merge_read_batch_rows must be a positive integer")
+    merge_read_batch_rows = int(merge_read_batch_rows)
     cfg = _validate_config(config)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     work = output / f".split-{uuid.uuid4().hex}.partial"
     work.mkdir()
-    tracker = _ResourceTracker(work, max_rows_per_run)
+    tracker = _ResourceTracker(
+        work,
+        max_rows_per_run,
+        merge_read_batch_rows,
+    )
     publication_partial: Path | None = None
     membership_path: Path | None = None
     manifest_path: Path | None = None
@@ -989,6 +1043,7 @@ def build_split_plan(
             coordinate_paths,
             work,
             max_rows_per_run,
+            merge_read_batch_rows,
             merge_fan_in,
             tracker,
         )
@@ -1002,6 +1057,7 @@ def build_split_plan(
             configured_attacks,
             work,
             max_rows_per_run,
+            merge_read_batch_rows,
             merge_fan_in,
             tracker,
         )
@@ -1050,6 +1106,7 @@ def build_split_plan(
             forced_count,
             total_rows,
             max_rows_per_run,
+            merge_read_batch_rows,
             merge_fan_in,
             tracker,
         )
@@ -1058,6 +1115,7 @@ def build_split_plan(
             assignment_paths,
             membership_partial,
             max_rows_per_run,
+            merge_read_batch_rows,
             merge_fan_in,
             tracker,
         )
@@ -1146,6 +1204,9 @@ def build_split_plan(
                 "run_count": tracker.run_count,
                 "merge_fan_in_limit": merge_fan_in,
                 "max_merge_fan_in_observed": tracker.max_merge_fan_in_observed,
+                "merge_read_batch_rows": tracker.configured_merge_read_batch_rows,
+                "max_merge_input_rows_buffered": tracker.max_merge_input_rows_buffered,
+                "merge_input_rows_buffered_limit": merge_fan_in * merge_read_batch_rows,
                 "temporary_bytes_peak": tracker.temporary_bytes_peak,
                 "final_membership_bytes": membership_partial.stat().st_size,
                 "task1_verified_snapshot_disk_not_included": True,

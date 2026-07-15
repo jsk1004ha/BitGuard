@@ -93,6 +93,7 @@ class OutOfCoreSplitTests(unittest.TestCase):
         sizes: tuple[int, ...] = (5, 3, 7),
         max_rows_per_run: int = 4,
         merge_fan_in: int = 32,
+        merge_read_batch_rows: int = 1_024,
         source_manifest_fingerprint: str | None = None,
     ) -> SplitPlan:
         from bitguard_bnn.out_of_core.split import build_split_plan
@@ -103,6 +104,7 @@ class OutOfCoreSplitTests(unittest.TestCase):
             output,
             max_rows_per_run=max_rows_per_run,
             merge_fan_in=merge_fan_in,
+            merge_read_batch_rows=merge_read_batch_rows,
             source_manifest_fingerprint=source_manifest_fingerprint,
         )
 
@@ -342,25 +344,61 @@ class OutOfCoreSplitTests(unittest.TestCase):
 
     def test_multi_pass_merge_never_exceeds_fan_in_and_preserves_singleton_carries(self) -> None:
         rows = _rows(18)
-        with tempfile.TemporaryDirectory() as temp:
-            plan = self._build(
+        with (
+            tempfile.TemporaryDirectory() as bounded_temp,
+            tempfile.TemporaryDirectory() as reference_temp,
+        ):
+            bounded = self._build(
                 rows,
                 _config("time"),
-                Path(temp),
+                Path(bounded_temp),
                 sizes=(18,),
-                max_rows_per_run=1,
+                max_rows_per_run=7,
                 merge_fan_in=2,
+                merge_read_batch_rows=2,
+            )
+            reference = self._build(
+                rows,
+                _config("time"),
+                Path(reference_temp),
+                sizes=(18,),
+                max_rows_per_run=7,
+                merge_fan_in=32,
+                merge_read_batch_rows=7,
             )
             manifest = json.loads(
-                plan.membership_path.with_suffix(".manifest.json").read_text("utf-8")
+                bounded.membership_path.with_suffix(".manifest.json").read_text("utf-8")
             )
-            membership = _membership(plan)
+            membership = _membership(bounded)
+            reference_membership = _membership(reference)
+        pd.testing.assert_frame_equal(membership, reference_membership)
+        self.assertEqual(bounded.fingerprint, reference.fingerprint)
         self.assertEqual(len(membership), len(rows))
         self.assertEqual(membership["row_uid"].tolist(), sorted(membership["row_uid"]))
         self.assertLessEqual(
             manifest["resource_usage"]["max_merge_fan_in_observed"], 2
         )
         self.assertEqual(manifest["resource_usage"]["merge_fan_in_limit"], 2)
+        self.assertEqual(manifest["resource_usage"]["merge_read_batch_rows"], 2)
+        self.assertEqual(
+            manifest["resource_usage"]["merge_input_rows_buffered_limit"], 4
+        )
+        self.assertEqual(
+            manifest["resource_usage"]["max_merge_input_rows_buffered"], 4
+        )
+
+    def test_merge_read_batch_limit_requires_a_positive_integer(self) -> None:
+        from bitguard_bnn.out_of_core.split import build_split_plan
+
+        for invalid in (0, -1, True, 1.5, "2"):
+            with self.subTest(value=invalid), tempfile.TemporaryDirectory() as temp:
+                with self.assertRaisesRegex(ValueError, "merge_read_batch_rows"):
+                    build_split_plan(
+                        _chunks(_rows(20)),
+                        _config("random"),
+                        Path(temp),
+                        merge_read_batch_rows=invalid,  # type: ignore[arg-type]
+                    )
 
     def test_manifest_publication_failure_rolls_back_membership_and_partials(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
