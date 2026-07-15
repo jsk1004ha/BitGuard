@@ -80,20 +80,44 @@ URLs are neither accepted nor persisted.
 
 PCAP capture acquisition and PCAP-to-flow conversion are excluded because this
 trainer consumes model-ready CSV features. Full CSV preparation and training
-can take many hours or days and require substantial disk. The acquisition
-preflight reserves a complete partial N-BaIoT download and a complete verified
-archive/snapshot (approximately 2x the archive), extraction space, metadata
+can take many hours or days and require substantial disk. Before preparation,
+the bootstrap sums source snapshots, split-membership SQLite, three-pass audit
+SQLite, external merge runs, staged shards, and final shards per filesystem
+device. The acquisition preflight also reserves a complete partial N-BaIoT
+download and a complete verified archive/snapshot, extraction space, metadata
 overhead, and a safety reserve. When remote size is unavailable, it uses a
 documented conservative 4 GiB archive estimate.
 
-At the current acquisition milestone, `--prepare-only` stops after schema
-inspection with `status: "sources_verified"`. Later out-of-core stages consume
-these immutable manifests. Resume is automatic; use `--restart-stage NAME` only
-after inspecting a reported failure. The final report is
+`--prepare-only` now succeeds with `status: "prepared"` only after every
+accepted CSV row appears exactly once in a verified train, validation, or test
+Parquet shard. Resume is automatic, but the `validate` stage always rechecks
+external shard bytes, schemas, split membership, preprocessing artifacts, and
+coverage even when the control descriptor is reusable. Use `--restart-stage
+NAME` only after inspecting a reported failure. The final report is
 `data/.bitguard/bootstrap-report.json`; its `report_path` is authoritative when
 a lock/path failure requires a deterministic sibling fallback. The `reports`
-mapping locates preflight, environment, acquisition, extraction, and per-dataset
-schema reports when those artifacts exist.
+mapping locates preflight, environment, acquisition, extraction, preparation,
+and per-dataset schema reports when those artifacts exist.
+
+The ordinary `configs/nbaiot.yaml` and `configs/botiot.yaml` remain capped
+development profiles. `configs/full/nbaiot.yaml` and
+`configs/full/botiot.yaml` are separate uncapped Parquet profiles: all rows
+contribute to exact counts, split coverage, ANOVA sufficient statistics, and
+later optimization/evaluation. Median, robust-scaler, encoder, and benign
+distance quantiles use a deterministic bounded priority sketch and are marked
+approximate with capacity/error provenance in `feature_manifest.json`.
+
+Prepare either dataset independently:
+
+```powershell
+.\bootstrap.ps1 --dataset nbaiot --prepare-only
+.\bootstrap.ps1 --dataset botiot --prepare-only --botiot-source D:\Downloads\BoT-IoT --accept-botiot-academic-license
+```
+
+```bash
+./bootstrap.sh --dataset nbaiot --prepare-only
+./bootstrap.sh --dataset botiot --prepare-only --botiot-source ~/Downloads/BoT-IoT --accept-botiot-academic-license
+```
 
 The filesystem safety boundary covers untrusted network/archive content and
 cooperative BitGuard writers inside a trusted workspace. Malicious

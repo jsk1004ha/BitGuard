@@ -62,6 +62,7 @@ class Stage:
     name: str
     input_signature: Callable[[], str]
     run: Callable[[], Sequence[Path]]
+    always_run: bool = False
 
 
 class SourceContext(TypedDict):
@@ -111,6 +112,9 @@ class BootstrapDependencies:
     rar_extractor: Callable[..., ExtractionResult] = extract_rar
     inspector: Callable[..., SchemaInspectionReport] = inspect_csv_dataset
     compute_resolver: Callable[[str], Mapping[str, object]] = _default_compute_resolver
+    preparer: Callable[..., object] | None = None
+    prepared_verifier: Callable[[Path], object] | None = None
+    preparation_signature_token: str | None = None
 
 
 def _json_signature(value: object) -> str:
@@ -977,6 +981,7 @@ def run_bootstrap(
     """Acquire and verify selected CSV sources, returning a durable report."""
 
     deps = dependencies or BootstrapDependencies()
+    preparation_enabled = dependencies is None or deps.preparer is not None
     metadata_root = options.data_root / ".bitguard"
     report_path = metadata_root / "bootstrap-report.json"
     state_path = metadata_root / "bootstrap-state.json"
@@ -990,6 +995,10 @@ def run_bootstrap(
     extraction_root = options.data_root / "raw"
     manifest_root = metadata_root / "manifests"
     schema_root = metadata_root / "schema"
+    prepared_descriptor_root = metadata_root / "prepared"
+    preparation_report_path = metadata_root / "preparation.json"
+    preparation_work_root = metadata_root / "preparation-work"
+    prepared_output_root = options.data_root / "prepared"
     original = {
         "botiot_source": None,
         "data_root": str(options.data_root),
@@ -1007,6 +1016,7 @@ def run_bootstrap(
     schemas: dict[str, str] = {}
     acquisition_journals: dict[str, str] = {}
     extraction_journals: dict[str, str] = {}
+    prepared_datasets: dict[str, str] = {}
     cleanup_roots: set[Path] = {
         metadata_root,
         options.data_root,
@@ -1016,6 +1026,9 @@ def run_bootstrap(
         extraction_journal_root,
         manifest_root,
         schema_root,
+        prepared_descriptor_root,
+        preparation_work_root,
+        prepared_output_root,
     }
 
     def existing_locator(path: Path) -> str | None:
@@ -1045,6 +1058,18 @@ def run_bootstrap(
         error: BaseException | None,
         actual_report_path: Path,
     ) -> dict[str, object]:
+        reports: dict[str, object] = {
+            "bootstrap": str(actual_report_path),
+            "preflight": existing_locator(preflight_path),
+            "environment": existing_locator(environment_path),
+            "acquisition": existing_locator(acquisition_report_path),
+            "extraction": existing_locator(extraction_report_path),
+            "schemas": dict(schemas),
+            "acquisition_journals": dict(acquisition_journals),
+            "extraction_journals": dict(extraction_journals),
+        }
+        if preparation_enabled:
+            reports["preparation"] = existing_locator(preparation_report_path)
         result: dict[str, object] = {
             "version": REPORT_FORMAT_VERSION,
             "status": status,
@@ -1074,17 +1099,11 @@ def run_bootstrap(
                 "mutation is outside this contract."
             ),
             "report_path": str(actual_report_path),
-            "reports": {
-                "bootstrap": str(actual_report_path),
-                "preflight": existing_locator(preflight_path),
-                "environment": existing_locator(environment_path),
-                "acquisition": existing_locator(acquisition_report_path),
-                "extraction": existing_locator(extraction_report_path),
-                "schemas": dict(schemas),
-                "acquisition_journals": dict(acquisition_journals),
-                "extraction_journals": dict(extraction_journals),
-            },
+            "reports": reports,
         }
+        if preparation_enabled:
+            result["prepared_datasets"] = dict(prepared_datasets)
+            result["next_stage"] = "train" if status == "prepared" else None
         redacted = _redact_report_value(result)
         if not isinstance(redacted, dict):  # pragma: no cover - fixed report shape
             raise TypeError("bootstrap report redaction produced a non-mapping")
@@ -1184,7 +1203,8 @@ def run_bootstrap(
                             ) from verification_error
                         if (
                             isinstance(visible, dict)
-                            and visible.get("status") == "sources_verified"
+                            and visible.get("status")
+                            in {"sources_verified", "prepared"}
                         ):
                             raise RuntimeError(
                                 "Could not invalidate a contradictory canonical "
@@ -1866,7 +1886,205 @@ def run_bootstrap(
                         outputs.extend((manifest_path, schema_path))
                     return tuple(outputs)
 
-                stages = (
+                def full_config_path(dataset: str) -> Path:
+                    repository = Path(__file__).resolve().parents[3]
+                    return repository / "configs" / "full" / f"{dataset}.yaml"
+
+                def prepared_descriptor_path(dataset: str) -> Path:
+                    return prepared_descriptor_root / f"{dataset}.json"
+
+                def preparation_signature() -> str:
+                    from bitguard_bnn.out_of_core import (
+                        prepare as prepare_module,
+                        preprocess as preprocess_module,
+                        quantiles as quantiles_module,
+                        shard as shard_module,
+                        source as source_module,
+                        split as split_module,
+                    )
+
+                    implementations = {
+                        name: _regular_digest(Path(module.__file__ or ""))[0]
+                        for name, module in {
+                            "prepare": prepare_module,
+                            "source": source_module,
+                            "split": split_module,
+                            "quantiles": quantiles_module,
+                            "preprocess": preprocess_module,
+                            "shard": shard_module,
+                        }.items()
+                    }
+
+                    return _json_signature(
+                        {
+                            "datasets": {
+                                dataset: {
+                                    "raw": _tree_digest(raw_roots[dataset])[0],
+                                    "source_manifest": _regular_digest(
+                                        Path(manifests[dataset])
+                                    )[0],
+                                    "schema": _regular_digest(Path(schemas[dataset]))[0],
+                                    "config": _regular_digest(
+                                        full_config_path(dataset)
+                                    )[0],
+                                }
+                                for dataset in options.datasets
+                            },
+                            "algorithm": prepare_module.PREPARATION_ALGORITHM,
+                            "algorithm_versions": {
+                                "source_normalization": "bitguard.normalization-signature.v1",
+                                "split": split_module.SPLIT_ALGORITHM,
+                                "split_membership": split_module.MEMBERSHIP_ALGORITHM,
+                                "quantile": (
+                                    f"{quantiles_module.ALGORITHM}.v"
+                                    f"{quantiles_module.VERSION}"
+                                ),
+                                "preprocess": preprocess_module.STREAMING_PREPROCESS_VERSION,
+                                "shard": shard_module.SHARD_ALGORITHM,
+                                "coverage": shard_module.COVERAGE_ALGORITHM,
+                            },
+                            "implementations": implementations,
+                            "dependency_token": deps.preparation_signature_token,
+                            "environment": _regular_digest(environment_path)[0],
+                        }
+                    )
+
+                def preparation_disk_requirements() -> dict[str, object]:
+                    from bitguard_bnn.out_of_core.prepare import (
+                        estimate_preparation_disk,
+                    )
+
+                    groups: dict[int, dict[str, object]] = {}
+
+                    def add(path: Path, required: int, dataset: str, kind: str) -> None:
+                        parent = _existing_parent(path)
+                        device = int(parent.stat().st_dev)
+                        group = groups.setdefault(
+                            device,
+                            {
+                                "path": str(parent),
+                                "required_bytes": 0,
+                                "datasets": {},
+                            },
+                        )
+                        group["required_bytes"] = (
+                            cast(int, group["required_bytes"]) + required
+                        )
+                        datasets = cast(dict[str, dict[str, int]], group["datasets"])
+                        values = datasets.setdefault(dataset, {})
+                        values[kind] = values.get(kind, 0) + required
+
+                    estimates: dict[str, dict[str, int]] = {}
+                    for dataset in options.datasets:
+                        estimate = estimate_preparation_disk(
+                            Path(manifests[dataset]),
+                            Path(schemas[dataset]),
+                            train_fraction=0.70,
+                        )
+                        estimates[dataset] = estimate.as_dict()
+                        work_bytes = (
+                            estimate.source_snapshot_bytes
+                            + estimate.membership_sqlite_bytes
+                            + estimate.audit_sqlite_bytes
+                            + estimate.external_merge_bytes
+                        )
+                        final_bytes = estimate.staging_bytes + estimate.final_shard_bytes
+                        add(preparation_work_root / dataset, work_bytes, dataset, "work")
+                        add(prepared_output_root / dataset, final_bytes, dataset, "output")
+                    for group in groups.values():
+                        probe = Path(str(group["path"]))
+                        available_bytes = (
+                            deps.available_bytes
+                            if deps.available_bytes is not None
+                            else shutil.disk_usage(probe).free
+                        )
+                        required_bytes = cast(int, group["required_bytes"])
+                        group["available_bytes"] = int(available_bytes)
+                        if int(available_bytes) < required_bytes:
+                            raise RuntimeError(
+                                "Insufficient disk for full-data preparation on "
+                                f"{probe}: required={required_bytes} bytes, "
+                                f"available={available_bytes} bytes."
+                            )
+                    return {
+                        "estimates": estimates,
+                        "device_groups": {
+                            str(device): value for device, value in sorted(groups.items())
+                        },
+                    }
+
+                preparation_disk: dict[str, object] = {}
+
+                def run_shard() -> Sequence[Path]:
+                    nonlocal preparation_disk
+                    from bitguard_bnn.out_of_core.prepare import prepare_full_dataset
+
+                    preparation_disk = preparation_disk_requirements()
+                    _ensure_durable_directory(prepared_descriptor_root)
+                    _ensure_durable_directory(prepared_output_root)
+                    _ensure_durable_directory(preparation_work_root)
+                    preparer = deps.preparer or prepare_full_dataset
+                    outputs: list[Path] = []
+                    for dataset in options.datasets:
+                        descriptor = prepared_descriptor_path(dataset)
+                        preparer(
+                            full_config_path(dataset),
+                            raw_root=raw_roots[dataset],
+                            source_manifest_path=Path(manifests[dataset]),
+                            schema_report_path=Path(schemas[dataset]),
+                            output_dir=prepared_output_root / dataset,
+                            descriptor_path=descriptor,
+                            work_dir=preparation_work_root / dataset,
+                        )
+                        if not descriptor.is_file() or descriptor.is_symlink():
+                            raise RuntimeError(
+                                f"preparation did not publish its control descriptor: {descriptor}"
+                            )
+                        prepared_datasets[dataset] = str(descriptor)
+                        outputs.append(descriptor)
+                    return tuple(outputs)
+
+                def validate_signature() -> str:
+                    return _json_signature(
+                        {
+                            dataset: _regular_digest(
+                                prepared_descriptor_path(dataset)
+                            )[0]
+                            for dataset in options.datasets
+                        }
+                    )
+
+                def run_validate() -> Sequence[Path]:
+                    from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
+
+                    verifier = deps.prepared_verifier or verify_prepared_dataset
+                    verified: dict[str, object] = {}
+                    for dataset in options.datasets:
+                        descriptor = prepared_descriptor_path(dataset)
+                        result = verifier(descriptor)
+                        prepared_datasets[dataset] = str(descriptor)
+                        if hasattr(result, "to_dict"):
+                            verified[dataset] = result.to_dict()
+                        else:
+                            verified[dataset] = {
+                                "descriptor_path": str(descriptor),
+                                "descriptor_sha256": _regular_digest(descriptor)[0],
+                            }
+                    if not preparation_disk:
+                        preparation_disk.update(preparation_disk_requirements())
+                    _write_json(
+                        preparation_report_path,
+                        {
+                            "status": "prepared",
+                            "datasets": verified,
+                            "disk": dict(preparation_disk),
+                            "prepare_only": options.prepare_only,
+                            "next_stage": "train",
+                        },
+                    )
+                    return (preparation_report_path,)
+
+                stages: tuple[Stage, ...] = (
                     Stage(
                         "preflight",
                         lambda: _json_signature(
@@ -1946,14 +2164,26 @@ def run_bootstrap(
                         run_inspect,
                     ),
                 )
+                if preparation_enabled:
+                    stages += (
+                        Stage("shard", preparation_signature, run_shard),
+                        Stage(
+                            "validate",
+                            validate_signature,
+                            run_validate,
+                            always_run=True,
+                        ),
+                    )
 
                 for stage in stages:
                     current_stage = stage.name
                     signature = stage.input_signature()
-                    if state.reusable(stage.name, signature):
+                    reusable = state.reusable(stage.name, signature)
+                    if reusable and not stage.always_run:
                         reused.append(stage.name)
                     else:
-                        state.invalidate_from(stage.name, STAGE_ORDER)
+                        if not reusable:
+                            state.invalidate_from(stage.name, STAGE_ORDER)
                         outputs = tuple(stage.run())
                         state.complete(stage.name, stage.input_signature(), outputs)
                         executed.append(stage.name)
@@ -1971,8 +2201,15 @@ def run_bootstrap(
                             schemas[dataset] = str(
                                 schema_root / f"{dataset}-{source_token}.json"
                             )
+                    if stage.name == "shard" and reusable:
+                        for dataset in options.datasets:
+                            prepared_datasets[dataset] = str(
+                                prepared_descriptor_path(dataset)
+                            )
 
-                final_status = "sources_verified"
+                final_status = (
+                    "prepared" if preparation_enabled else "sources_verified"
+                )
             except BaseException as error:
                 failed_stage = current_stage
                 primary_error = error

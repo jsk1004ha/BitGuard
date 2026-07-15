@@ -18,7 +18,12 @@ DEFAULTS: dict[str, Any] = {
     "experiment": {"name": "bitguard", "output_dir": "runs", "seed": 2309},
     "dataset": {
         "type": "csv",
+        "storage": "csv",
+        "shard_manifest": None,
         "chunk_size": 200_000,
+        "record_batch_rows": 65_536,
+        "shard_target_rows": 1_000_000,
+        "quantile_sketch_capacity": 200_000,
         "max_rows_per_file": None,
         "max_rows_per_class": None,
         "drop_columns": [],
@@ -138,7 +143,11 @@ def load_config(path: str | Path) -> dict[str, Any]:
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
     config = _deep_merge(DEFAULTS, raw)
-    project_root = config_path.parent.parent if config_path.parent.name == "configs" else Path.cwd()
+    configs_root = next(
+        (parent for parent in config_path.parents if parent.name == "configs"),
+        None,
+    )
+    project_root = configs_root.parent if configs_root is not None else Path.cwd()
     config["_config_path"] = str(config_path)
     config["_project_root"] = str(project_root.resolve())
     validate_config(config)
@@ -146,6 +155,35 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
 
 def validate_config(config: dict[str, Any]) -> None:
+    dataset = config["dataset"]
+    storage = str(dataset.get("storage", "csv"))
+    if storage not in {"csv", "parquet"}:
+        raise ValueError("dataset.storage must be csv or parquet")
+    shard_manifest = dataset.get("shard_manifest")
+    if storage == "parquet":
+        if not isinstance(shard_manifest, str) or not shard_manifest.strip():
+            raise ValueError(
+                "dataset.shard_manifest must be a non-empty path for parquet storage"
+            )
+        if Path(shard_manifest).suffix.casefold() != ".json":
+            raise ValueError("dataset.shard_manifest must name a JSON manifest")
+    elif shard_manifest is not None:
+        raise ValueError("dataset.shard_manifest requires dataset.storage=parquet")
+    for name in (
+        "chunk_size",
+        "record_batch_rows",
+        "shard_target_rows",
+        "quantile_sketch_capacity",
+    ):
+        value = dataset.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"dataset.{name} must be a positive integer")
+    for name in ("max_rows_per_file", "max_rows_per_class", "max_loaded_rows"):
+        value = dataset.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ValueError(f"dataset.{name} must be a positive integer or null")
     fractions = [
         float(config["split"]["train_fraction"]),
         float(config["split"]["validation_fraction"]),

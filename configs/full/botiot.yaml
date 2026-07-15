@@ -1,0 +1,92 @@
+experiment:
+  name: botiot_full
+  output_dir: runs
+  seed: 2309
+
+dataset:
+  type: botiot
+  path: data/BoT-IoT/**/*.csv
+  storage: parquet
+  shard_manifest: data/prepared/botiot/shard_manifest.json
+  chunk_size: 200000
+  record_batch_rows: 65536
+  shard_target_rows: 1000000
+  quantile_sketch_capacity: 200000
+  max_rows_per_file: null
+  max_rows_per_class: null
+  max_loaded_rows: null
+  label_column: category
+  raw_attack_column: subcategory
+  device_column: saddr
+  time_column: stime
+  drop_columns: [pkSeqID, seq, saddr, daddr, sport, dport, smac, dmac]
+
+split:
+  strategy: time
+  train_fraction: 0.70
+  validation_fraction: 0.15
+  test_fraction: 0.15
+  held_out_devices: []
+  seed: 2309
+
+preprocess:
+  feature_budget: 32
+  selection: cost_aware
+  scaler: robust
+  encoder: hybrid
+  thermometer_bits: 2
+  feature_cost_csv: null
+  open_set:
+    enabled: true
+    confidence_threshold: 0.60
+    benign_distance_quantile: 0.99
+
+model:
+  type: cost_aware_bnn
+  hidden_dims: [64, 32]
+  dropout: 0.05
+  binary_first_layer: true
+  gate_temperature: 1.0
+
+loss:
+  type: focal
+  focal_gamma: 2.0
+  class_weighted: true
+  lambda_feature: 0.01
+  beta_fn: 0.25
+  gamma_fp: 0.05
+
+training:
+  epochs: 30
+  batch_size: 2048
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  patience: 6
+  num_workers: 4
+  device: auto
+  amp: true
+
+cascade:
+  enabled: false
+  tiny_feature_budget: 12
+  hidden_dims: [16]
+  min_attack_recall: 0.995
+  threshold_grid_size: 201
+  temporal_penalty: 0.30
+  false_negative_cost: 0.10
+  device_criticality_default: 0.0
+
+temporal:
+  enabled: true
+  increment: 2
+  decay: 1
+  evidence_threshold: 0.45
+  risk_weights: {model: 0.55, scan: 0.13, flood: 0.13, beacon: 0.10, unknown: 0.14, benign: 0.08}
+  action_thresholds: [0.18, 0.30, 0.44, 0.60, 0.78]
+
+evaluation:
+  high_risk_labels: [scan_like, flood_like, exfil_like, unknown_like]
+  save_predictions: true
+  make_plots: true
+  benchmark_warmup: 50
+  benchmark_repeats: 500
