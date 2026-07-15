@@ -188,6 +188,39 @@ class SchemaInspectionTest(unittest.TestCase):
             ):
                 inspect_csv_dataset("botiot", root, required_columns=("missing",))
 
+    def test_cross_file_feature_names_remain_case_sensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "device").mkdir()
+            (root / "device" / "a_benign.csv").write_text(
+                "Rate\n1\n", encoding="utf-8"
+            )
+            (root / "device" / "b_benign.csv").write_text(
+                "rate\n1\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(
+                SchemaInspectionError, "feature schema mismatch"
+            ):
+                inspect_csv_dataset("nbaiot", root)
+
+    def test_cross_file_feature_order_is_deterministic_after_nfc_normalization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "device").mkdir()
+            (root / "device" / "a_benign.csv").write_text(
+                "cafe\N{COMBINING ACUTE ACCENT},z\n1,2\n", encoding="utf-8"
+            )
+            (root / "device" / "b_benign.csv").write_text(
+                "z,caf\N{LATIN SMALL LETTER E WITH ACUTE}\n2,1\n", encoding="utf-8"
+            )
+
+            report = inspect_csv_dataset("nbaiot", root)
+
+            self.assertEqual(report.feature_columns, ("café", "z"))
+
     def test_duplicate_headers_empty_files_and_non_csv_sources_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

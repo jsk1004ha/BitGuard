@@ -384,8 +384,12 @@ def _header_mapping(header: Sequence[str], path: Path) -> dict[str, str]:
     return mapping
 
 
+def _normalized_column_name(column: str) -> str:
+    return unicodedata.normalize("NFC", column.strip())
+
+
 def _column_key(column: str) -> str:
-    return unicodedata.normalize("NFC", column.strip()).casefold()
+    return _normalized_column_name(column).casefold()
 
 
 def _find(
@@ -449,9 +453,7 @@ def _schema_for(
     dropped = {column for column in header if _column_key(column) in drop_keys}
     excluded = metadata | dropped
     candidates = tuple(
-        sorted(
-            (column for column in header if column not in excluded), key=str.casefold
-        )
+        sorted((column for column in header if column not in excluded), key=_column_key)
     )
     if not candidates:
         raise SchemaInspectionError(f"no numeric feature columns remain in {path}")
@@ -763,15 +765,17 @@ def _inspect_csv_dataset_unlocked(
                 )
                 schema = plan.schema
                 file_features = plan.feature_columns
+                normalized_file_features = tuple(
+                    _normalized_column_name(column) for column in file_features
+                )
                 file_unusable = plan.unusable_columns
                 if canonical_features is None:
-                    canonical_features = file_features
-                elif {_column_key(item) for item in file_features} != {
-                    _column_key(item) for item in canonical_features
-                }:
+                    canonical_features = normalized_file_features
+                elif normalized_file_features != canonical_features:
                     raise SchemaInspectionError(
                         f"feature schema mismatch in {path}: "
-                        f"expected={list(canonical_features)}, observed={list(file_features)}"
+                        f"expected={list(canonical_features)}, "
+                        f"observed={list(normalized_file_features)}"
                     )
 
                 handle, opened, path_before = _open_pinned_text(path)
@@ -865,7 +869,7 @@ def _inspect_csv_dataset_unlocked(
                         accepted_rows=file_accepted,
                         rejected_rows=sum(file_rejections.values()),
                         columns=plan.header,
-                        feature_columns=file_features,
+                        feature_columns=normalized_file_features,
                         unusable_columns=file_unusable,
                         excluded_columns=schema.excluded,
                         class_counts=tuple(sorted(file_classes.items())),
