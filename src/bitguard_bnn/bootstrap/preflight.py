@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import importlib
 import importlib.metadata
+import math
 import os
 import re
 import shutil
@@ -44,6 +45,16 @@ def _nonempty_string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ResourceProbeError(f"{name} must be a non-empty string, got {value!r}.")
     return value.strip()
+
+
+def _device_index(value: object, name: str = "device_index") -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be a non-negative integer or None, got {value!r}.")
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}.")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,19 +293,66 @@ def inspect_local_archives(
     paths: Iterable[str | os.PathLike[str]],
     *,
     stat_fn: Callable[[Path], Any] | None = None,
+    lstat_fn: Callable[[Path], Any] | None = None,
 ) -> ArchiveInspection:
     """Resolve and stably size complete archives plus adjacent ``.partial`` files."""
 
     probe = (lambda candidate: candidate.stat()) if stat_fn is None else stat_fn
+    lexical_probe = (lambda candidate: candidate.lstat()) if lstat_fn is None else lstat_fn
     observations: list[ArchiveObservation] = []
     seen: set[Path] = set()
     for supplied in paths:
         try:
-            resolved = Path(supplied).expanduser().resolve(strict=False)
+            expanded = Path(supplied).expanduser()
+            lexical = Path(os.path.abspath(os.fspath(expanded)))
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise ResourceProbeError(
                 f"Cannot resolve archive path {supplied!r}: {error}."
             ) from error
+        try:
+            lexical_first_result = lexical_probe(lexical)
+        except FileNotFoundError as error:
+            raise ResourceProbeError(f"Archive does not exist: {lexical}.") from error
+        except OSError as error:
+            raise ResourceProbeError(f"Cannot inspect archive {lexical}: {error}.") from error
+        try:
+            lexical_mode = lexical_first_result.st_mode
+        except AttributeError as error:
+            raise ResourceProbeError(
+                f"Cannot safely inspect archive {lexical}: lstat result is incomplete."
+            ) from error
+        if stat.S_ISLNK(lexical_mode):
+            raise ResourceProbeError(
+                f"Archive symlink {lexical} is not allowed because adjacent partial "
+                "files cannot be accounted for safely."
+            )
+        lexical_first = _snapshot_fields(
+            lexical, lexical_first_result, "archive"
+        )
+        try:
+            resolved = lexical.resolve(strict=False)
+            lexical_second_result = lexical_probe(lexical)
+        except (FileNotFoundError, OSError, RuntimeError) as error:
+            raise ResourceProbeError(
+                f"Archive {lexical} changed during inspection: {error}."
+            ) from error
+        try:
+            lexical_second_mode = lexical_second_result.st_mode
+        except AttributeError as error:
+            raise ResourceProbeError(
+                f"Archive {lexical} changed during inspection: lstat result is incomplete."
+            ) from error
+        if stat.S_ISLNK(lexical_second_mode):
+            raise ResourceProbeError(
+                f"Archive {lexical} changed during inspection: it became a symlink."
+            )
+        lexical_second = _snapshot_fields(
+            lexical, lexical_second_result, "archive"
+        )
+        if lexical_first != lexical_second:
+            raise ResourceProbeError(
+                f"Archive {lexical} changed during inspection; retry once it is stable."
+            )
         if resolved in seen:
             raise ResourceProbeError(f"Duplicate archive path after resolution: {resolved}.")
         seen.add(resolved)
@@ -557,6 +615,7 @@ class DriverInfo:
     device_name: str | None = None
     memory_bytes: int | None = None
     cuda_profile: str | None = None
+    device_index: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.nvidia, bool):
@@ -573,6 +632,7 @@ class DriverInfo:
                 raise ValueError("memory_bytes must be positive when provided.")
         if self.cuda_profile not in {None, "cu118", "cu124"}:
             raise ValueError("cuda_profile must be cu118, cu124, or None.")
+        _device_index(self.device_index)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -581,6 +641,7 @@ class DriverInfo:
             "device_name": self.device_name,
             "memory_bytes": self.memory_bytes,
             "cuda_profile": self.cuda_profile,
+            "device_index": self.device_index,
         }
 
 
@@ -590,6 +651,10 @@ NVIDIA_SMI_COMMAND = (
     "--format=csv,noheader",
 )
 
+# A driver probe must never delay bootstrap indefinitely. Callers may lower this
+# bound for their environment while retaining deterministic timeout handling.
+NVIDIA_SMI_TIMEOUT_SECONDS = 10
+
 
 _NVIDIA_MEMORY = re.compile(r"(?P<mib>[0-9]+)\s+MiB", re.IGNORECASE)
 
@@ -597,19 +662,46 @@ _NVIDIA_MEMORY = re.compile(r"(?P<mib>[0-9]+)\s+MiB", re.IGNORECASE)
 def probe_nvidia_driver(
     *,
     run: Callable[..., Any] | None = None,
+    device_index: int | None = None,
+    timeout_seconds: float = NVIDIA_SMI_TIMEOUT_SECONDS,
 ) -> DriverInfo:
-    """Probe exactly one NVIDIA GPU, rejecting ambiguous or malformed output."""
+    """Probe one NVIDIA GPU with bounded, strict UTF-8 subprocess handling."""
 
     runner = subprocess.run if run is None else run
+    selected_index = _device_index(device_index)
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError(
+            f"timeout_seconds must be a finite positive number, got {timeout_seconds!r}."
+        )
+    command = list(NVIDIA_SMI_COMMAND)
+    if selected_index is not None:
+        command.insert(1, f"--id={selected_index}")
     try:
         result = runner(
-            list(NVIDIA_SMI_COMMAND),
+            command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=timeout_seconds,
             check=False,
         )
     except FileNotFoundError:
         return DriverInfo(nvidia=False)
+    except subprocess.TimeoutExpired as error:
+        raise NvidiaProbeError(
+            f"nvidia-smi timed out after {timeout_seconds} seconds; "
+            "verify the NVIDIA driver is responsive."
+        ) from error
+    except UnicodeError as error:
+        raise NvidiaProbeError(
+            f"Could not decode nvidia-smi output as strict UTF-8: {error}."
+        ) from error
     except OSError as error:
         raise NvidiaProbeError(f"Could not execute nvidia-smi: {error}.") from error
     try:
@@ -654,6 +746,7 @@ def probe_nvidia_driver(
         driver_version=driver_version,
         device_name=device_name,
         memory_bytes=memory_mib * 1024**2,
+        device_index=selected_index,
     )
 
 
@@ -743,6 +836,7 @@ class TorchVerification:
     device_name: str
     torch_version: str
     torch_cuda_version: str | None
+    device_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.selected_profile not in {"cpu", "cu118", "cu124"}:
@@ -758,6 +852,7 @@ class TorchVerification:
             not isinstance(self.torch_cuda_version, str) or not self.torch_cuda_version
         ):
             raise TypeError("torch_cuda_version must be a non-empty string or None.")
+        _device_index(self.device_index)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -766,6 +861,7 @@ class TorchVerification:
             "device_name": self.device_name,
             "torch_version": self.torch_version,
             "torch_cuda_version": self.torch_cuda_version,
+            "device_index": self.device_index,
         }
 
 
@@ -774,11 +870,42 @@ def verify_torch_compute(
     *,
     torch_module: Any | None = None,
     importer: Callable[[str], Any] | None = None,
+    device_index: int | None = None,
+    driver: DriverInfo | None = None,
 ) -> TorchVerification:
-    """Lazily smoke-test the selected Torch device with allocation, addition, and sync."""
+    """Lazily smoke-test one explicit runtime device.
+
+    Unlike the installer check, an explicit CPU runtime choice is valid even when
+    the installed Torch wheel includes CUDA; only CPU tensor work is performed.
+    """
 
     if selected_profile not in {"cpu", "cu118", "cu124"}:
         raise ValueError(f"Unknown selected compute profile {selected_profile!r}.")
+    requested_index = _device_index(device_index)
+    if driver is not None and not isinstance(driver, DriverInfo):
+        raise TypeError("driver must be DriverInfo or None.")
+    cuda_selected = selected_profile != "cpu"
+    if not cuda_selected:
+        if requested_index is not None:
+            raise ValueError("device_index must be None for CPU verification.")
+        selected_index = None
+    else:
+        selected_index = 0 if requested_index is None else requested_index
+        if driver is not None:
+            if not driver.nvidia:
+                raise RuntimeError(
+                    "CUDA device index verification failed: DriverInfo reports no "
+                    "NVIDIA device; no CPU fallback was applied."
+                )
+            if (
+                driver.device_index is not None
+                and driver.device_index != selected_index
+            ):
+                raise RuntimeError(
+                    "CUDA device index mismatch: DriverInfo selected "
+                    f"cuda:{driver.device_index} but verification requested "
+                    f"cuda:{selected_index}; no CPU fallback was applied."
+                )
     if torch_module is None:
         import_module = importlib.import_module if importer is None else importer
         try:
@@ -794,7 +921,6 @@ def verify_torch_compute(
             f"Torch version verification failed: invalid __version__ {torch_version!r}."
         )
 
-    cuda_selected = selected_profile != "cpu"
     try:
         torch_cuda_version = torch_module.version.cuda
     except Exception as error:
@@ -830,7 +956,8 @@ def verify_torch_compute(
                 f"{torch_cuda_version!r} ({installed_profile}); "
                 "no CPU fallback was applied."
             )
-        device = "cuda:0"
+        assert selected_index is not None
+        device = f"cuda:{selected_index}"
     else:
         device = "cpu"
 
@@ -853,8 +980,9 @@ def verify_torch_compute(
         )
 
     if cuda_selected:
+        assert selected_index is not None
         try:
-            device_name = torch_module.cuda.get_device_name(0)
+            device_name = torch_module.cuda.get_device_name(selected_index)
         except Exception as error:
             raise RuntimeError(f"CUDA device-name verification failed: {error}.") from error
         if not isinstance(device_name, str) or not device_name:
@@ -873,6 +1001,7 @@ def verify_torch_compute(
         device_name=device_name,
         torch_version=torch_version,
         torch_cuda_version=torch_cuda_version,
+        device_index=selected_index,
     )
 
 
@@ -949,7 +1078,11 @@ def build_post_install_report(
     package_names: Sequence[str] = DEFAULT_PACKAGE_NAMES,
     version_fn: Callable[[str], str] | None = None,
 ) -> PostInstallReport:
-    """Aggregate already-verified compute and read-only resource facts."""
+    """Aggregate mutually consistent compute and read-only resource facts.
+
+    A CPU runtime choice may coexist with an NVIDIA driver and CUDA-enabled Torch
+    wheel. CUDA selections, however, must agree on profile, device, and index.
+    """
 
     if not isinstance(verification, TorchVerification):
         raise TypeError("verification must be TorchVerification.")
@@ -961,6 +1094,63 @@ def build_post_install_report(
         raise TypeError("ram must be RAMFacts.")
     if not isinstance(disk, DiskFacts):
         raise TypeError("disk must be DiskFacts.")
+    cuda_selected = verification.selected_profile != "cpu"
+    if not cuda_selected:
+        if verification.device != "cpu" or verification.device_index is not None:
+            raise ResourceProbeError(
+                "Post-install report facts are contradictory: CPU verification "
+                "must use device='cpu' with no device index."
+            )
+    else:
+        if not driver.nvidia:
+            raise ResourceProbeError(
+                "Post-install report facts are contradictory: CUDA was verified "
+                "but DriverInfo reports no NVIDIA device."
+            )
+        if verification.device_index is None:
+            raise ResourceProbeError(
+                "Post-install report facts are contradictory: CUDA verification "
+                "has no selected device index."
+            )
+        expected_device = f"cuda:{verification.device_index}"
+        if verification.device != expected_device:
+            raise ResourceProbeError(
+                "Post-install report facts are contradictory: CUDA device "
+                f"{verification.device!r} does not match index "
+                f"{verification.device_index}."
+            )
+        if (
+            driver.device_index is not None
+            and driver.device_index != verification.device_index
+        ):
+            raise ResourceProbeError(
+                "Post-install report facts are contradictory: DriverInfo selected "
+                f"cuda:{driver.device_index} but Torch verified {expected_device}."
+            )
+        if (
+            driver.cuda_profile is not None
+            and driver.cuda_profile != verification.selected_profile
+        ):
+            raise ResourceProbeError(
+                "Post-install report facts are contradictory: DriverInfo profile "
+                f"{driver.cuda_profile} does not match verified profile "
+                f"{verification.selected_profile}."
+            )
+        try:
+            installed_profile = _profile_for_torch_cuda_build(
+                verification.torch_cuda_version
+            )
+        except RuntimeError as error:
+            raise ResourceProbeError(
+                "Post-install report facts are contradictory: verified CUDA build "
+                f"is invalid: {error}."
+            ) from error
+        if installed_profile != verification.selected_profile:
+            raise ResourceProbeError(
+                "Post-install report facts are contradictory: verified profile "
+                f"{verification.selected_profile} does not match Torch CUDA build "
+                f"{verification.torch_cuda_version!r}."
+            )
     packages = collect_package_versions(package_names, version_fn=version_fn)
     return PostInstallReport(
         verification=verification,

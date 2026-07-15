@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from bitguard_bnn.bootstrap.preflight import (
     NVIDIA_SMI_COMMAND,
+    NVIDIA_SMI_TIMEOUT_SECONDS,
     CPUFacts,
     DiskFacts,
     DriverInfo,
@@ -21,6 +22,7 @@ from bitguard_bnn.bootstrap.preflight import (
     RAMFacts,
     ResourceProbeError,
     ResourceRequest,
+    TorchVerification,
     build_post_install_report,
     choose_compute,
     collect_package_versions,
@@ -178,6 +180,19 @@ class ArchiveInspectionTests(unittest.TestCase):
         Path(f"{archive}.partial").mkdir()
         with self.assertRaisesRegex(ResourceProbeError, "partial.*not a regular file"):
             inspect_local_archives([archive])
+
+    def test_archive_symlink_is_rejected_before_partial_accounting(self):
+        target = self.root / "target.zip"
+        target.write_bytes(b"archive")
+        link = self.root / "link.zip"
+        try:
+            link.symlink_to(target)
+        except OSError as error:
+            self.skipTest(f"symlink creation unavailable: {error}")
+        Path(f"{link}.partial").write_bytes(b"partial")
+
+        with self.assertRaisesRegex(ResourceProbeError, "symlink.*not allowed"):
+            inspect_local_archives([link])
 
     def test_partial_appearing_during_absence_probe_fails_closed(self):
         archive = (self.root / "archive.zip").resolve()
@@ -428,12 +443,71 @@ class NvidiaProbeAndSelectionTests(unittest.TestCase):
         driver = probe_nvidia_driver(run=run)
 
         run.assert_called_once_with(
-            list(NVIDIA_SMI_COMMAND), capture_output=True, text=True, check=False
+            list(NVIDIA_SMI_COMMAND),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=NVIDIA_SMI_TIMEOUT_SECONDS,
+            check=False,
         )
         self.assertTrue(driver.nvidia)
         self.assertEqual(driver.driver_version, "555.42")
         self.assertEqual(driver.device_name, "NVIDIA RTX 4090")
         self.assertEqual(driver.memory_bytes, 24576 * 1024**2)
+        self.assertIsNone(driver.device_index)
+        json.dumps(driver.as_dict())
+
+    def test_nvidia_probe_timeout_is_bounded_and_actionable(self):
+        timeout = subprocess.TimeoutExpired(list(NVIDIA_SMI_COMMAND), timeout=2)
+        with self.assertRaisesRegex(NvidiaProbeError, "timed out.*2"):
+            probe_nvidia_driver(run=Mock(side_effect=timeout), timeout_seconds=2)
+
+    def test_nvidia_probe_decode_failure_is_wrapped_actionably(self):
+        decode_error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        with self.assertRaisesRegex(NvidiaProbeError, "UTF-8.*decode"):
+            probe_nvidia_driver(run=Mock(side_effect=decode_error))
+
+    def test_nvidia_probe_selects_device_index_one_explicitly(self):
+        result = SimpleNamespace(
+            returncode=0,
+            stdout="555.42, NVIDIA RTX 4090, 24576 MiB\n",
+            stderr="",
+        )
+        run = Mock(return_value=result)
+
+        driver = probe_nvidia_driver(run=run, device_index=1)
+
+        run.assert_called_once_with(
+            [
+                "nvidia-smi",
+                "--id=1",
+                "--query-gpu=driver_version,name,memory.total",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=NVIDIA_SMI_TIMEOUT_SECONDS,
+            check=False,
+        )
+        self.assertEqual(driver.device_index, 1)
+        self.assertEqual(driver.as_dict()["device_index"], 1)
+
+    def test_invalid_nvidia_device_selectors_fail_before_subprocess(self):
+        for index in (True, -1, 1.5):
+            with self.subTest(index=index):
+                run = Mock()
+                with self.assertRaises((TypeError, ValueError)):
+                    probe_nvidia_driver(run=run, device_index=index)  # type: ignore[arg-type]
+                run.assert_not_called()
+
+    def test_selected_nvidia_probe_still_rejects_multiple_rows(self):
+        output = "555.42, GPU A, 1024 MiB\n555.42, GPU B, 2048 MiB\n"
+        result = SimpleNamespace(returncode=0, stdout=output, stderr="")
+        with self.assertRaisesRegex(NvidiaProbeError, "multiple GPU rows"):
+            probe_nvidia_driver(run=Mock(return_value=result), device_index=1)
 
     def test_missing_nvidia_smi_means_no_nvidia_driver(self):
         driver = probe_nvidia_driver(run=Mock(side_effect=FileNotFoundError()))
@@ -573,14 +647,14 @@ class _FakeCuda:
         self._available = available
         self._sync_error = sync_error
         self.synchronized = False
+        self.device_name_indices: list[int] = []
 
     def is_available(self) -> bool:
         return self._available
 
     def get_device_name(self, index: int) -> str:
-        if index != 0:
-            raise AssertionError(index)
-        return "Fake GPU"
+        self.device_name_indices.append(index)
+        return "Fake GPU" if index == 0 else f"Fake GPU {index}"
 
     def synchronize(self) -> None:
         if self._sync_error is not None:
@@ -634,6 +708,49 @@ class TorchVerificationTests(unittest.TestCase):
         self.assertEqual(verification.selected_profile, "cu124")
         self.assertEqual(verification.device, "cuda:0")
         self.assertEqual(verification.device_name, "Fake GPU")
+        self.assertEqual(verification.device_index, 0)
+
+    def test_cuda_verification_uses_selected_device_index_consistently(self):
+        torch = _FakeTorch(cuda_available=True, cuda_build="12.4")
+        driver = DriverInfo(nvidia=True, cuda_profile="cu124", device_index=1)
+
+        verification = verify_torch_compute(
+            "cu124",
+            torch_module=torch,
+            device_index=1,
+            driver=driver,
+        )
+
+        self.assertEqual(torch.allocations, [((1,), "cuda:1")])
+        self.assertEqual(torch.cuda.device_name_indices, [1])
+        self.assertEqual(verification.device, "cuda:1")
+        self.assertEqual(verification.device_index, 1)
+        self.assertEqual(verification.device_name, "Fake GPU 1")
+        self.assertEqual(verification.as_dict()["device_index"], 1)
+
+    def test_torch_verification_rejects_driver_device_index_mismatch(self):
+        torch = _FakeTorch(cuda_available=True, cuda_build="12.4")
+        driver = DriverInfo(nvidia=True, cuda_profile="cu124", device_index=1)
+        with self.assertRaisesRegex(RuntimeError, "device index.*mismatch"):
+            verify_torch_compute(
+                "cu124",
+                torch_module=torch,
+                device_index=0,
+                driver=driver,
+            )
+        self.assertEqual(torch.allocations, [])
+
+    def test_torch_verification_rejects_invalid_device_indexes(self):
+        for index in (True, -1, 1.5):
+            with self.subTest(index=index):
+                torch = _FakeTorch(cuda_available=True, cuda_build="12.4")
+                with self.assertRaises((TypeError, ValueError)):
+                    verify_torch_compute(
+                        "cu124",
+                        torch_module=torch,
+                        device_index=index,  # type: ignore[arg-type]
+                    )
+                self.assertEqual(torch.allocations, [])
 
     def test_cuda_unavailable_never_falls_back_during_torch_verification(self):
         torch = _FakeTorch(cuda_available=False, cuda_build="12.4")
@@ -721,6 +838,7 @@ class TorchVerificationTests(unittest.TestCase):
                 device_name="Fake GPU",
                 memory_bytes=24 * 1024**3,
                 cuda_profile="cu124",
+                device_index=0,
             ),
             cpu=CPUFacts(logical_count=16, used_fallback=False),
             ram=RAMFacts(
@@ -738,11 +856,74 @@ class TorchVerificationTests(unittest.TestCase):
         self.assertEqual(serialized["compute"]["device"], "cuda:0")
         self.assertEqual(serialized["compute"]["device_name"], "Fake GPU")
         self.assertEqual(serialized["compute"]["torch_cuda_version"], "12.4")
+        self.assertEqual(serialized["compute"]["device_index"], 0)
+        self.assertEqual(serialized["compute"]["driver"]["device_index"], 0)
         self.assertEqual(serialized["resources"]["cpu"]["logical_count"], 16)
         self.assertEqual(serialized["resources"]["ram"]["available_bytes"], 48 * 1024**3)
         self.assertEqual(serialized["resources"]["disk"]["required_bytes"], 100)
         self.assertEqual(serialized["installed_packages"]["pyarrow"], "18.0.0")
         json.dumps(serialized)
+
+    def test_post_install_report_rejects_contradictory_cuda_facts(self):
+        verification = verify_torch_compute(
+            "cu124",
+            torch_module=_FakeTorch(cuda_available=True, cuda_build="12.4"),
+        )
+        cpu = CPUFacts(logical_count=4, used_fallback=False)
+        ram = RAMFacts(total_bytes=100, available_bytes=25, platform="posix")
+        disk = DiskFacts(required_bytes=10, available_bytes=20, path="C:/data")
+        contradictory_drivers = (
+            DriverInfo(nvidia=False),
+            DriverInfo(nvidia=True, cuda_profile="cu118", device_index=0),
+            DriverInfo(nvidia=True, cuda_profile="cu124", device_index=1),
+        )
+
+        for driver in contradictory_drivers:
+            with self.subTest(driver=driver):
+                with self.assertRaisesRegex(ResourceProbeError, "contradictory"):
+                    build_post_install_report(
+                        verification=verification,
+                        driver=driver,
+                        cpu=cpu,
+                        ram=ram,
+                        disk=disk,
+                        package_names=(),
+                    )
+
+    def test_post_install_report_rejects_cpu_verification_labeled_cuda(self):
+        verification = TorchVerification(
+            selected_profile="cpu",
+            device="cuda:0",
+            device_name="CPU",
+            torch_version="2.5.1",
+            torch_cuda_version="12.4",
+        )
+        with self.assertRaisesRegex(ResourceProbeError, "contradictory"):
+            build_post_install_report(
+                verification=verification,
+                driver=DriverInfo(nvidia=True, device_index=0),
+                cpu=CPUFacts(logical_count=4, used_fallback=False),
+                ram=RAMFacts(total_bytes=100, available_bytes=25, platform="posix"),
+                disk=DiskFacts(required_bytes=10, available_bytes=20),
+                package_names=(),
+            )
+
+    def test_cpu_runtime_report_allows_cuda_capable_installed_wheel(self):
+        verification = verify_torch_compute(
+            "cpu",
+            torch_module=_FakeTorch(cuda_available=True, cuda_build="12.4"),
+        )
+        report = build_post_install_report(
+            verification=verification,
+            driver=DriverInfo(nvidia=True, cuda_profile="cu124", device_index=1),
+            cpu=CPUFacts(logical_count=4, used_fallback=False),
+            ram=RAMFacts(total_bytes=100, available_bytes=25, platform="posix"),
+            disk=DiskFacts(required_bytes=10, available_bytes=20),
+            package_names=(),
+        )
+
+        self.assertEqual(report.as_dict()["compute"]["selected_profile"], "cpu")
+        self.assertEqual(report.as_dict()["compute"]["device"], "cpu")
 
 
 if __name__ == "__main__":
