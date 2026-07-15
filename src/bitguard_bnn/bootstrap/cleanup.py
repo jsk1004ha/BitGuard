@@ -22,7 +22,7 @@ def _powershell_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _inspection_command(paths: Iterable[str]) -> str:
+def inspection_command(paths: Iterable[str]) -> str:
     supplied = tuple(paths)
     warning = (
         "Do not delete automatically. Inspect identity, link type, and size before "
@@ -125,7 +125,7 @@ def scan_cleanup_debt(roots: Iterable[Path | str]) -> dict[str, Any]:
         "artifacts": artifacts,
         "apparent_bytes": apparent_total,
         "unique_bytes": unique_total,
-        "recovery_command": _inspection_command(
+        "recovery_command": inspection_command(
             str(artifact["path"]) for artifact in artifacts
         ),
     }

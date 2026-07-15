@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast
 
-from .cleanup import scan_cleanup_debt
+from .cleanup import inspection_command, scan_cleanup_debt
 from .download import DownloadResult, download_file
 from .extract import ExtractionResult, extract_rar, extract_zip
 from .fsops import rename_directory_noreplace
@@ -198,6 +198,65 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
         os.close(descriptor)
     temporary.replace(path)
     _fsync_parent_directory(path)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably flush a directory where the platform exposes directory fds."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    sync_error: OSError | None = None
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        sync_error = error
+    try:
+        os.close(descriptor)
+    except OSError as close_error:
+        if sync_error is not None:
+            raise OSError(
+                f"directory fsync failed: {sync_error}; directory close failed: "
+                f"{close_error}"
+            ) from sync_error
+        raise
+    if sync_error is not None:
+        raise sync_error
+
+
+def _ensure_durable_directory(path: Path) -> bool:
+    """Create one protocol root and durably publish it before it is used."""
+
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot inspect protocol directory {path}: {error}"
+        ) from error
+    else:
+        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
+            raise RuntimeError(
+                f"Protocol directory must be a non-symlink directory: {path}"
+            )
+        return False
+
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        current = path.lstat()
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+            raise RuntimeError(
+                f"Protocol directory must be a non-symlink directory: {path}"
+            )
+        return False
+    created = path.lstat()
+    if stat.S_ISLNK(created.st_mode) or not stat.S_ISDIR(created.st_mode):
+        raise RuntimeError(f"Created protocol directory changed type: {path}")
+    _fsync_directory(path)
+    _fsync_parent_directory(path)
+    return True
 
 
 def _redact_text(value: str) -> str:
@@ -631,9 +690,8 @@ def run_bootstrap(
                 "artifacts": [],
                 "apparent_bytes": 0,
                 "unique_bytes": 0,
-                "recovery_command": (
-                    "Write-Output 'Cleanup-debt inspection failed; inspect the "
-                    "reported roots manually without deleting them.'"
+                "recovery_command": inspection_command(
+                    str(root) for root in sorted(cleanup_roots, key=str)
                 ),
                 "scan_error": _safe_error(error),
             }
@@ -895,8 +953,8 @@ def run_bootstrap(
                     return (environment_path,)
 
                 def run_acquire() -> Sequence[Path]:
-                    acquisition_root.mkdir(parents=True, exist_ok=True)
-                    acquisition_journal_root.mkdir(parents=True, exist_ok=True)
+                    _ensure_durable_directory(acquisition_root)
+                    _ensure_durable_directory(acquisition_journal_root)
                     outputs: list[Path] = []
                     acquisition_report: dict[str, object] = {}
                     journal_fields = {
@@ -1118,8 +1176,8 @@ def run_bootstrap(
                     return tuple(outputs)
 
                 def run_extract() -> Sequence[Path]:
-                    extraction_root.mkdir(parents=True, exist_ok=True)
-                    extraction_journal_root.mkdir(parents=True, exist_ok=True)
+                    _ensure_durable_directory(extraction_root)
+                    _ensure_durable_directory(extraction_journal_root)
                     outputs: list[Path] = []
                     extraction_report: dict[str, object] = {}
                     journal_fields = {

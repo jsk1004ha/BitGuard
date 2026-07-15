@@ -423,6 +423,102 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         durable.assert_any_call(destination)
         self.assertEqual(destination.read_bytes(), b"verified")
 
+    def test_durable_directory_helper_orders_syncs_and_skips_existing_roots(
+        self,
+    ) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        parent = self.root / "protocol-parent"
+        parent.mkdir()
+        root = parent / "protocol-root"
+        events: list[tuple[str, Path]] = []
+        real_mkdir = Path.mkdir
+
+        def tracked_mkdir(path, *args, **kwargs):
+            if Path(path) == root:
+                events.append(("mkdir", root))
+            return real_mkdir(path, *args, **kwargs)
+
+        def fallback(path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+        ensure = getattr(orchestrator_module, "_ensure_durable_directory", fallback)
+        with (
+            patch.object(Path, "mkdir", tracked_mkdir),
+            patch.object(
+                orchestrator_module,
+                "_fsync_directory",
+                side_effect=lambda path: events.append(("fsync-self", Path(path))),
+                create=True,
+            ),
+            patch.object(
+                orchestrator_module,
+                "_fsync_parent_directory",
+                side_effect=lambda path: events.append(("fsync-parent", Path(path))),
+            ),
+        ):
+            ensure(root)
+
+        self.assertEqual(
+            events,
+            [
+                ("mkdir", root),
+                ("fsync-self", root),
+                ("fsync-parent", root),
+            ],
+        )
+        events.clear()
+        with (
+            patch.object(Path, "mkdir", tracked_mkdir),
+            patch.object(
+                orchestrator_module,
+                "_fsync_directory",
+                side_effect=lambda path: events.append(("fsync-self", Path(path))),
+                create=True,
+            ),
+            patch.object(
+                orchestrator_module,
+                "_fsync_parent_directory",
+                side_effect=lambda path: events.append(("fsync-parent", Path(path))),
+            ),
+        ):
+            ensure(root)
+        self.assertEqual(events, [])
+
+    def test_protocol_roots_use_durable_creation_in_stage_order(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        observed: list[Path] = []
+        real_ensure = getattr(orchestrator_module, "_ensure_durable_directory", None)
+
+        def track(path):
+            path = Path(path)
+            observed.append(path)
+            if real_ensure is None:
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                real_ensure(path)
+
+        with patch.object(
+            orchestrator_module,
+            "_ensure_durable_directory",
+            side_effect=track,
+            create=True,
+        ):
+            report = run_bootstrap(self.options, dependencies=self.dependencies())
+
+        self.assertEqual(report["status"], "sources_verified")
+        metadata = self.data_root / ".bitguard"
+        self.assertEqual(
+            observed,
+            [
+                metadata / "acquired",
+                metadata / "acquisition-journal",
+                self.data_root / "raw",
+                metadata / "extraction-journal",
+            ],
+        )
+
     def test_journal_and_aggregate_reports_redact_injected_downloader_urls(
         self,
     ) -> None:
@@ -764,6 +860,47 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         for secret in ("password", "token=resolved", "#fragment"):
             self.assertNotIn(secret, encoded)
         self.assertNotIn("user:", encoded)
+
+    def test_cleanup_scan_failure_reuses_platform_inspection_command(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        data_root = (self.root / "data with ' quote").resolve()
+        options = BootstrapOptions(
+            **{
+                **self.options.__dict__,
+                "data_root": data_root,
+                "runs_root": (self.root / "runs with ' quote").resolve(),
+            }
+        )
+
+        commands: dict[str, str] = {}
+        for system in ("Linux", "Windows"):
+            with (
+                self.subTest(system=system),
+                patch(
+                    "bitguard_bnn.bootstrap.cleanup.platform.system",
+                    return_value=system,
+                ),
+                patch.object(
+                    orchestrator_module,
+                    "scan_cleanup_debt",
+                    side_effect=OSError("injected cleanup scan failure"),
+                ),
+                patch.object(
+                    orchestrator_module,
+                    "_lock_path",
+                    side_effect=RuntimeError("injected early failure"),
+                ),
+            ):
+                report = run_bootstrap(options, dependencies=self.dependencies())
+            commands[system] = report["cleanup_debt"]["recovery_command"]
+
+        self.assertIn("ls -ld --", commands["Linux"])
+        self.assertIn(shlex.quote(str(data_root)), commands["Linux"])
+        self.assertNotRegex(commands["Linux"], r"(^|\s)rm(\s|$)")
+        self.assertIn("Get-Item -Force -LiteralPath", commands["Windows"])
+        self.assertIn(str(data_root).replace("'", "''"), commands["Windows"])
+        self.assertNotIn("Remove-Item", commands["Windows"])
 
     def test_recursive_redaction_sanitizes_urlish_keys_and_space_tails(self) -> None:
         first_key = (
