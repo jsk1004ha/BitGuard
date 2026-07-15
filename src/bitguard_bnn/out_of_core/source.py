@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import functools
 import heapq
@@ -11,7 +12,9 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import warnings
+import weakref
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -49,6 +52,31 @@ class NormalizedChunk:
     frame: pd.DataFrame
     source_relative_path: str
     source_row_start: int
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedSourceFileProof:
+    """Immutable evidence binding one normalized input to verified source bytes."""
+
+    relative_path: str
+    logical_identity: str
+    source_fingerprint: FileFingerprint
+    raw_row_count: int
+    normalized_row_count: int
+    snapshot_byte_size: int
+    snapshot_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedSourceProof:
+    """Immutable evidence shared by every pass through a normalized source."""
+
+    dataset: str
+    feature_names: tuple[str, ...]
+    row_count: int
+    files: tuple[NormalizedSourceFileProof, ...]
+    snapshot_bytes: int
+    fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,8 +289,39 @@ def _assert_source_stat(
         raise RuntimeError(f"dataset source changed during {phase}: {path}")
 
 
-def _new_snapshot_root() -> Path:
-    return Path(tempfile.mkdtemp(prefix="bitguard-verified-source-"))
+def _validated_work_dir(work_dir: Path) -> Path:
+    requested = Path(work_dir)
+    try:
+        work_stat = requested.lstat()
+    except OSError as exc:
+        raise ValueError(
+            f"normalized source work_dir is not accessible: {requested}"
+        ) from exc
+    is_junction = getattr(os.path, "isjunction", lambda _path: False)
+    if (
+        stat.S_ISLNK(work_stat.st_mode)
+        or bool(is_junction(requested))
+        or not stat.S_ISDIR(work_stat.st_mode)
+    ):
+        raise ValueError(
+            f"normalized source work_dir must be a real directory: {requested}"
+        )
+    if os.name != "nt":
+        if hasattr(os, "getuid") and work_stat.st_uid != os.getuid():
+            raise ValueError("normalized source work_dir must be owned by this user")
+        if stat.S_IMODE(work_stat.st_mode) & 0o077:
+            raise ValueError("normalized source work_dir must be private (mode 0700)")
+    return requested.resolve(strict=True)
+
+
+def _new_snapshot_root(work_dir: Path | None = None) -> Path:
+    parent = _validated_work_dir(work_dir) if work_dir is not None else None
+    return Path(
+        tempfile.mkdtemp(
+            prefix="bitguard-verified-source-",
+            dir=str(parent) if parent is not None else None,
+        )
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -381,8 +440,12 @@ class _SnapshotBuilder:
 
 
 class _SnapshotStore:
-    def __init__(self) -> None:
-        self.root = _new_snapshot_root()
+    def __init__(self, work_dir: Path | None = None) -> None:
+        self.root = (
+            _new_snapshot_root()
+            if work_dir is None
+            else _new_snapshot_root(work_dir)
+        )
         self._builders: set[_SnapshotBuilder] = set()
         self._snapshots: list[_VerifiedSnapshot] = []
         self._closed = False
@@ -641,9 +704,11 @@ def _close_reader(reader: object) -> None:
         close()
 
 
-def _new_selection_path() -> Path:
+def _new_selection_path(work_dir: Path | None = None) -> Path:
     descriptor, name = tempfile.mkstemp(
-        prefix="bitguard-selection-", suffix=".sqlite3"
+        prefix="bitguard-selection-",
+        suffix=".sqlite3",
+        dir=str(work_dir) if work_dir is not None else None,
     )
     os.close(descriptor)
     return Path(name)
@@ -652,8 +717,12 @@ def _new_selection_path() -> Path:
 class _SelectionIndex:
     """Disk-backed row membership and materialization-order index."""
 
-    def __init__(self) -> None:
-        self.path = _new_selection_path()
+    def __init__(self, work_dir: Path | None = None) -> None:
+        self.path = (
+            _new_selection_path()
+            if work_dir is None
+            else _new_selection_path(work_dir)
+        )
         self._connection = sqlite3.connect(self.path)
         self._closed = False
         self._connection.executescript(
@@ -819,6 +888,35 @@ class _SelectionIndex:
             "JOIN selected_class_row AS s USING(uid) "
             "ORDER BY c.file_id, c.row_index"
         )
+
+    def selected_class_counts(self) -> dict[int, int]:
+        return {
+            int(file_id): int(count)
+            for file_id, count in self._connection.execute(
+                "SELECT c.file_id, COUNT(*) FROM class_candidate AS c "
+                "JOIN selected_class_row AS s USING(uid) GROUP BY c.file_id"
+            )
+        }
+
+    def proof_membership_tokens(self, *, class_limited: bool) -> Iterator[str]:
+        if class_limited:
+            for (uid,) in self._connection.execute(
+                "SELECT uid FROM selected_class_row ORDER BY uid"
+            ):
+                yield f"uid:{uid}"
+            return
+        for file_id, all_rows in self._connection.execute(
+            "SELECT file_id, all_rows FROM file_mode ORDER BY file_id"
+        ):
+            if bool(all_rows):
+                yield f"file:{int(file_id)}:all"
+                continue
+            for (row_index,) in self._connection.execute(
+                "SELECT row_index FROM selected_file_row "
+                "WHERE file_id = ? ORDER BY row_index",
+                (file_id,),
+            ):
+                yield f"file:{int(file_id)}:row:{int(row_index)}"
 
     def materialization_order(self, uids: Sequence[str]) -> dict[str, int]:
         order: dict[str, int] = {}
@@ -1410,11 +1508,31 @@ def _select_class_rows(
     )
 
 
+def _attach_cleanup_notes(
+    primary: BaseException, cleanups: Sequence[BaseException]
+) -> None:
+    for cleanup in cleanups:
+        primary.add_note(
+            "normalized source cleanup context: "
+            f"{type(cleanup).__name__}: {cleanup}"
+        )
+
+
+def _raise_cleanup_errors(cleanups: Sequence[BaseException]) -> None:
+    if not cleanups:
+        return
+    primary = cleanups[0]
+    _attach_cleanup_notes(primary, cleanups[1:])
+    raise primary
+
+
 def _build_iteration_plan(
     config: dict[str, Any],
     path_override: Path | None,
     apply_sampling_caps: bool,
     dataset_type: str | None = None,
+    *,
+    work_dir: Path | None = None,
 ) -> _IterationPlan:
     source = _resolve_source(config, path_override, dataset_type)
     cfg = config["dataset"]
@@ -1428,13 +1546,17 @@ def _build_iteration_plan(
     class_limit = int(class_limit) if class_limit is not None else None
     if max_rows is not None and max_rows <= 0:
         raise ValueError("max_rows must be positive or null")
-    snapshots = _SnapshotStore()
+    snapshots = _SnapshotStore(work_dir)
     selection: _SelectionIndex | None = None
     file_plans: list[_FilePlan] = []
     drop_columns = set(cfg.get("drop_columns", []))
     try:
         selection = (
-            _SelectionIndex()
+            (
+                _SelectionIndex()
+                if work_dir is None
+                else _SelectionIndex(snapshots.root)
+            )
             if max_rows is not None or class_limit is not None
             else None
         )
@@ -1495,21 +1617,33 @@ def _build_iteration_plan(
             class_limited=class_limit is not None,
             feature_columns=features,
         )
-    except BaseException:
-        try:
-            if selection is not None:
+    except BaseException as primary:
+        cleanups: list[BaseException] = []
+        if selection is not None:
+            try:
                 selection.close()
-        finally:
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+        try:
             snapshots.close()
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
+        _attach_cleanup_notes(primary, cleanups)
         raise
 
 
 def _close_iteration_plan(plan: _IterationPlan) -> None:
-    try:
-        if plan.selection is not None:
+    cleanups: list[BaseException] = []
+    if plan.selection is not None:
+        try:
             plan.selection.close()
-    finally:
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
+    try:
         plan.snapshots.close()
+    except BaseException as cleanup_error:
+        cleanups.append(cleanup_error)
+    _raise_cleanup_errors(cleanups)
 
 
 def _iter_planned_file_chunks(
@@ -1547,6 +1681,235 @@ def _iter_planned_chunks(
         yield from _iter_planned_file_chunks(config, plan, file_plan)
 
 
+def _proof_digest_update(digest: Any, value: str) -> None:
+    encoded = value.encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, "big", signed=False))
+    digest.update(encoded)
+
+
+def _normalized_source_proof(plan: _IterationPlan) -> NormalizedSourceProof:
+    selected_counts = (
+        plan.selection.selected_class_counts()
+        if plan.class_limited and plan.selection is not None
+        else {
+            file_plan.file_id: file_plan.selected_row_count
+            for file_plan in plan.files
+        }
+    )
+    file_proofs = tuple(
+        NormalizedSourceFileProof(
+            relative_path=file_plan.relative_path,
+            logical_identity=file_plan.logical_identity,
+            source_fingerprint=file_plan.fingerprint,
+            raw_row_count=file_plan.row_count,
+            normalized_row_count=int(selected_counts.get(file_plan.file_id, 0)),
+            snapshot_byte_size=file_plan.snapshot.pinned.byte_size,
+            snapshot_sha256=file_plan.snapshot.sha256,
+        )
+        for file_plan in plan.files
+    )
+    digest = hashlib.sha256()
+    _proof_digest_update(digest, "algorithm:bitguard.normalized-source-proof.v1")
+    _proof_digest_update(digest, f"dataset:{plan.source.kind}")
+    _proof_digest_update(digest, f"feature-count:{len(plan.feature_columns)}")
+    for feature in plan.feature_columns:
+        _proof_digest_update(digest, f"feature:{feature}")
+    _proof_digest_update(digest, f"file-count:{len(file_proofs)}")
+    for proof in file_proofs:
+        for value in (
+            f"relative-path:{proof.relative_path}",
+            f"logical-identity:{proof.logical_identity}",
+            f"source-sha256:{proof.source_fingerprint.sha256}",
+            f"source-bytes:{proof.source_fingerprint.byte_size}",
+            f"raw-rows:{proof.raw_row_count}",
+            f"normalized-rows:{proof.normalized_row_count}",
+        ):
+            _proof_digest_update(digest, value)
+    if plan.selection is None:
+        _proof_digest_update(digest, "membership:all")
+    else:
+        for token in plan.selection.proof_membership_tokens(
+            class_limited=plan.class_limited
+        ):
+            _proof_digest_update(digest, token)
+    row_count = sum(proof.normalized_row_count for proof in file_proofs)
+    return NormalizedSourceProof(
+        dataset=plan.source.kind,
+        feature_names=plan.feature_columns,
+        row_count=row_count,
+        files=file_proofs,
+        snapshot_bytes=sum(proof.snapshot_byte_size for proof in file_proofs),
+        fingerprint=digest.hexdigest(),
+    )
+
+
+class _NormalizedSourceIterator(Iterator[NormalizedChunk]):
+    def __init__(
+        self,
+        source: NormalizedSource,
+        token: object,
+        iterator: Iterator[NormalizedChunk],
+    ) -> None:
+        self._source = source
+        self._token = token
+        self._iterator = iterator
+        self._step_lock = threading.Lock()
+        self._finished = False
+
+    def __iter__(self) -> _NormalizedSourceIterator:
+        return self
+
+    def __next__(self) -> NormalizedChunk:
+        with self._step_lock:
+            if self._finished:
+                raise StopIteration
+            try:
+                return next(self._iterator)
+            except StopIteration:
+                self._finish(None)
+                raise
+            except BaseException as primary:
+                self._finish(primary)
+                raise
+
+    def close(self) -> None:
+        with self._step_lock:
+            self._finish(None)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+    def _finish(self, primary: BaseException | None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        cleanups: list[BaseException] = []
+        try:
+            close = getattr(self._iterator, "close", None)
+            if callable(close):
+                close()
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
+        finally:
+            self._source._release_pass(self._token)
+        if primary is not None:
+            _attach_cleanup_notes(primary, cleanups)
+        else:
+            _raise_cleanup_errors(cleanups)
+
+
+class NormalizedSource:
+    """A verified, repeatable normalized source with explicit lifetime control."""
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        plan: _IterationPlan,
+    ) -> None:
+        self._config = config
+        self._plan = plan
+        self._proof = _normalized_source_proof(plan)
+        self._state_lock = threading.Lock()
+        self._active_token: object | None = None
+        self._active_iterator: (
+            weakref.ReferenceType[_NormalizedSourceIterator] | None
+        ) = None
+        self._closed = False
+
+    @property
+    def proof(self) -> NormalizedSourceProof:
+        return self._proof
+
+    def iter_chunks(self) -> _NormalizedSourceIterator:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("normalized source is closed")
+            if self._active_token is not None:
+                raise RuntimeError("a normalized source pass is already active")
+            token = object()
+            self._active_token = token
+        try:
+            iterator = iter(_iter_planned_chunks(self._config, self._plan))
+        except BaseException:
+            self._release_pass(token)
+            raise
+        source_iterator = _NormalizedSourceIterator(self, token, iterator)
+        with self._state_lock:
+            self._active_iterator = weakref.ref(source_iterator)
+        return source_iterator
+
+    def _release_pass(self, token: object) -> None:
+        with self._state_lock:
+            if self._active_token is token:
+                self._active_token = None
+                self._active_iterator = None
+
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            if self._active_token is not None:
+                raise RuntimeError(
+                    "cannot close normalized source while a pass is active"
+                )
+            self._closed = True
+        _close_iteration_plan(self._plan)
+
+    def __enter__(self) -> NormalizedSource:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("normalized source is closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object | None,
+    ) -> None:
+        with self._state_lock:
+            active = (
+                self._active_iterator()
+                if self._active_iterator is not None
+                else None
+            )
+        cleanups: list[BaseException] = []
+        if active is not None:
+            try:
+                active.close()
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            cleanups.append(cleanup_error)
+        if exc is not None:
+            _attach_cleanup_notes(exc, cleanups)
+        else:
+            _raise_cleanup_errors(cleanups)
+
+
+def open_normalized_source(
+    config: dict[str, Any],
+    path_override: Path | None = None,
+    apply_sampling_caps: bool = True,
+    work_dir: Path | None = None,
+) -> NormalizedSource:
+    """Build one verified source plan that can drive multiple bounded passes."""
+
+    captured_config = copy.deepcopy(config)
+    plan = _build_iteration_plan(
+        captured_config,
+        path_override,
+        apply_sampling_caps,
+        work_dir=work_dir,
+    )
+    return NormalizedSource(captured_config, plan)
+
+
 def iter_normalized_chunks(
     config: dict[str, Any],
     *,
@@ -1555,11 +1918,34 @@ def iter_normalized_chunks(
 ) -> Iterator[NormalizedChunk]:
     """Yield normalized dataset chunks without concatenating source frames."""
 
-    plan = _build_iteration_plan(config, path_override, apply_sampling_caps)
+    source: NormalizedSource | None = None
+    iterator: Iterator[NormalizedChunk] | None = None
+    primary: BaseException | None = None
     try:
-        yield from _iter_planned_chunks(config, plan)
+        source = open_normalized_source(
+            config,
+            path_override=path_override,
+            apply_sampling_caps=apply_sampling_caps,
+        )
+        iterator = source.iter_chunks()
+        yield from iterator
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        _close_iteration_plan(plan)
+        cleanups: list[BaseException] = []
+        for resource in (iterator, source):
+            if resource is None:
+                continue
+            try:
+                close = getattr(resource, "close")
+                close()
+            except BaseException as cleanup_error:
+                cleanups.append(cleanup_error)
+        if primary is not None:
+            _attach_cleanup_notes(primary, cleanups)
+        else:
+            _raise_cleanup_errors(cleanups)
 
 
 def load_normalized_dataset(

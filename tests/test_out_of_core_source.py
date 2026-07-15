@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import copy
+import gc
 import inspect
 import os
 import re
 import stat
 import tempfile
 import unittest
+import weakref
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,7 +25,11 @@ from bitguard_bnn.data import (
     load_nbaiot,
 )
 from bitguard_bnn.out_of_core import source as source_module
-from bitguard_bnn.out_of_core.source import iter_normalized_chunks
+from bitguard_bnn.out_of_core.source import (
+    NormalizedSourceProof,
+    iter_normalized_chunks,
+    open_normalized_source,
+)
 
 
 def _base_config(root: Path, dataset_type: str, path: str) -> dict:
@@ -81,6 +88,315 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
             config = _base_config(root, "csv", "generic.csv")
 
             self._assert_parity(config)
+
+    def test_normalized_source_builds_one_verified_plan_for_repeated_passes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            pd.DataFrame(
+                {
+                    "behavior_label": ["benign", "scan_like"] * 5,
+                    "timestamp": range(10),
+                    "x": range(10),
+                }
+            ).to_csv(path, index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            source_bytes = 0
+            snapshot_bytes = 0
+            original_build = source_module._build_iteration_plan
+            original_read = source_module._HashingReader.read
+
+            def count_bytes(reader, size: int = -1):
+                nonlocal source_bytes, snapshot_bytes
+                block = original_read(reader, size)
+                if reader.origin == "source":
+                    source_bytes += len(block)
+                else:
+                    snapshot_bytes += len(block)
+                return block
+
+            with (
+                patch.object(
+                    source_module,
+                    "_build_iteration_plan",
+                    wraps=original_build,
+                ) as build,
+                patch.object(source_module._HashingReader, "read", count_bytes),
+                open_normalized_source(config) as source,
+            ):
+                proof = source.proof
+                passes = [
+                    pd.concat(
+                        [chunk.frame for chunk in source.iter_chunks()],
+                        ignore_index=True,
+                    )
+                    for _ in range(5)
+                ]
+
+            build.assert_called_once()
+            self.assertIsInstance(proof, NormalizedSourceProof)
+            self.assertEqual(proof.row_count, 10)
+            self.assertEqual(proof.snapshot_bytes, path.stat().st_size)
+            self.assertEqual(source_bytes, path.stat().st_size)
+            self.assertEqual(snapshot_bytes, path.stat().st_size * 5)
+            for repeated in passes[1:]:
+                pd.testing.assert_frame_equal(repeated, passes[0])
+
+    def test_normalized_source_early_close_and_iterator_error_release_pass(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 5, "x": range(5)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+
+            with open_normalized_source(config) as source:
+                iterator = source.iter_chunks()
+                next(iterator)
+                iterator.close()
+                self.assertEqual(
+                    sum(len(chunk.frame) for chunk in source.iter_chunks()), 5
+                )
+
+                original = source_module._iter_planned_chunks
+                calls = 0
+
+                def fail_once(
+                    config: dict, plan: source_module._IterationPlan
+                ):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise RuntimeError("pass failed")
+                    yield from original(config, plan)
+
+                with patch.object(
+                    source_module, "_iter_planned_chunks", fail_once
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "pass failed"):
+                        next(source.iter_chunks())
+                    self.assertEqual(
+                        sum(len(chunk.frame) for chunk in source.iter_chunks()), 5
+                    )
+
+    def test_normalized_source_rejects_concurrent_use_and_close_while_active(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 3, "x": range(3)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            source = open_normalized_source(config)
+            iterator = source.iter_chunks()
+
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                source.iter_chunks()
+            with self.assertRaisesRegex(RuntimeError, "active"):
+                source.close()
+
+            iterator.close()
+            source.close()
+            source.close()
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                source.iter_chunks()
+
+    def test_normalized_source_captures_config_and_closes_resources_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 5, "x": range(5)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            original_close = source_module._close_iteration_plan
+
+            with patch.object(
+                source_module,
+                "_close_iteration_plan",
+                wraps=original_close,
+            ) as close_plan:
+                source = open_normalized_source(config)
+                config["dataset"]["chunk_size"] = 1
+                config["dataset"]["drop_columns"] = ["x"]
+                self.assertEqual(
+                    [len(chunk.frame) for chunk in source.iter_chunks()],
+                    [2, 2, 1],
+                )
+                source.close()
+                source.close()
+
+            close_plan.assert_called_once()
+            self.assertEqual(source.proof.feature_names, ("x",))
+            with self.assertRaises(FrozenInstanceError):
+                source.proof.row_count = 0  # type: ignore[misc]
+
+    def test_normalized_source_context_exit_closes_an_active_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "work"
+            work_dir.mkdir(mode=0o700)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 5, "x": range(5)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            config["dataset"]["max_rows_per_file"] = 4
+
+            with self.assertRaisesRegex(ValueError, "body primary"):
+                with open_normalized_source(
+                    config, work_dir=work_dir
+                ) as source:
+                    iterator = source.iter_chunks()
+                    next(iterator)
+                    raise ValueError("body primary")
+
+            self.assertEqual(list(work_dir.iterdir()), [])
+
+    def test_abandoned_iterator_releases_session_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 5, "x": range(5)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+
+            with open_normalized_source(config) as source:
+                iterator = source.iter_chunks()
+                next(iterator)
+                reference = weakref.ref(iterator)
+                del iterator
+                gc.collect()
+                self.assertIsNone(reference())
+                self.assertEqual(
+                    sum(len(chunk.frame) for chunk in source.iter_chunks()), 5
+                )
+
+    def test_compatibility_iterator_preserves_primary_cleanup_error_context(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 3, "x": range(3)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            original_close = source_module._SnapshotStore.close
+
+            def close_then_fail(store: source_module._SnapshotStore) -> None:
+                original_close(store)
+                raise RuntimeError("cleanup secondary")
+
+            with (
+                patch.object(
+                    source_module,
+                    "_iter_planned_chunks",
+                    side_effect=RuntimeError("emit primary"),
+                ),
+                patch.object(
+                    source_module._SnapshotStore,
+                    "close",
+                    close_then_fail,
+                ),
+                self.assertRaisesRegex(RuntimeError, "emit primary") as caught,
+            ):
+                list(iter_normalized_chunks(config))
+
+            self.assertTrue(
+                any(
+                    "cleanup context" in note and "cleanup secondary" in note
+                    for note in getattr(caught.exception, "__notes__", ())
+                )
+            )
+
+    def test_normalized_source_rejects_source_and_snapshot_tampering(self) -> None:
+        for target in ("source", "snapshot"):
+            with (
+                self.subTest(target=target),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                path = root / "rows.csv"
+                pd.DataFrame(
+                    {"behavior_label": ["benign"] * 3, "x": range(3)}
+                ).to_csv(path, index=False)
+                config = _base_config(root, "csv", "rows.csv")
+                source = open_normalized_source(config)
+                if target == "snapshot":
+                    path = source._plan.files[0].snapshot.path
+                    os.chmod(path, 0o600)
+                original = path.read_bytes()
+                replacement = original.replace(b"benign,1", b"benign,9", 1)
+                self.assertEqual(len(original), len(replacement))
+                path.write_bytes(replacement)
+
+                with self.assertRaisesRegex(RuntimeError, "changed"):
+                    list(source.iter_chunks())
+                source.close()
+
+    def test_normalized_source_uses_and_cleans_private_caller_work_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "work"
+            work_dir.mkdir(mode=0o700)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 3, "x": range(3)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+
+            with open_normalized_source(config, work_dir=work_dir) as source:
+                children = list(work_dir.iterdir())
+                self.assertEqual(len(children), 1)
+                session_dir = children[0]
+                self.assertTrue(session_dir.is_dir())
+                if os.name != "nt":
+                    self.assertEqual(stat.S_IMODE(session_dir.stat().st_mode), 0o700)
+                self.assertEqual(
+                    sum(len(chunk.frame) for chunk in source.iter_chunks()), 3
+                )
+
+            self.assertEqual(list(work_dir.iterdir()), [])
+
+    def test_normalized_source_does_not_retain_emitted_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 100, "x": range(100)}
+            ).to_csv(root / "rows.csv", index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            config["dataset"]["chunk_size"] = 4
+
+            with open_normalized_source(config) as source:
+                iterator = source.iter_chunks()
+                first = next(iterator)
+                frame = first.frame
+                reference = weakref.ref(frame)
+                del first, frame
+                next(iterator)
+                gc.collect()
+                self.assertIsNone(reference())
+                iterator.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle cleanup regression")
+    def test_normalized_source_releases_windows_handles_on_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            source_path = root / "rows.csv"
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 3, "x": range(3)}
+            ).to_csv(source_path, index=False)
+            config = _base_config(root, "csv", "rows.csv")
+
+            source = open_normalized_source(config, work_dir=work_dir)
+            list(source.iter_chunks())
+            source.close()
+            source_path.rename(root / "renamed.csv")
+            work_dir.rmdir()
 
     def test_nbaiot_chunks_match_in_memory_loader(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
