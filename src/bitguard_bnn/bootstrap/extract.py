@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unicodedata
 import uuid
@@ -510,6 +511,27 @@ def _cleanup_staging(staging: Path, expected: os.stat_result) -> None:
     shutil.rmtree(staging)
 
 
+def _cleanup_staging_after_operation(
+    staging: Path, expected: os.stat_result
+) -> None:
+    """Clean staging without replacing an exception already leaving extraction."""
+
+    primary = sys.exception()
+    try:
+        _cleanup_staging(staging, expected)
+    except Exception as cleanup_error:
+        recovery = (
+            "private extraction cleanup failed; retained staging may remain at "
+            f"{staging}. Inspect it and remove it manually after confirming the path "
+            "is safe. Cleanup error: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        if primary is not None:
+            primary.add_note(recovery)
+            return
+        raise ArchiveExtractionError(recovery) from cleanup_error
+
+
 def _publish_directory(
     source: Path,
     source_identity: os.stat_result,
@@ -628,7 +650,7 @@ def extract_zip(
     finally:
         handle.close()
         if staging is not None and staging_identity is not None:
-            _cleanup_staging(staging, staging_identity)
+            _cleanup_staging_after_operation(staging, staging_identity)
 
 
 def parse_7z_listing(output: str) -> tuple[ArchiveEntry, ...]:
@@ -927,4 +949,4 @@ def extract_rar(
             total_bytes=actual,
         )
     finally:
-        _cleanup_staging(staging, staging_identity)
+        _cleanup_staging_after_operation(staging, staging_identity)

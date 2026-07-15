@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import traceback
 import unittest
 import warnings
 import zipfile
@@ -318,6 +319,187 @@ class SafeZipExtractionTest(unittest.TestCase):
                     return
                 with self.assertRaisesRegex(ArchiveExtractionError, "must not already exist"):
                     extract_zip(archive, linked)
+
+
+class StagingCleanupFailureTest(unittest.TestCase):
+    def _capture_source_handles(self):
+        handles = []
+        real_open = extract_module._open_regular_source
+
+        def capture(*args, **kwargs):
+            result = real_open(*args, **kwargs)
+            handles.append(result[0])
+            return result
+
+        return handles, capture
+
+    def test_cleanup_only_failure_reports_retained_staging_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "source.zip"
+            destination = root / "output"
+            _write_zip(archive, [("data.csv", b"x\n1\n")])
+            cleanup_paths: list[Path] = []
+            handles, capture_open = self._capture_source_handles()
+
+            def fail_cleanup(path: Path, expected) -> None:
+                cleanup_paths.append(path)
+                raise PermissionError("staging is locked")
+
+            with (
+                patch.object(
+                    extract_module,
+                    "_open_regular_source",
+                    side_effect=capture_open,
+                ),
+                patch.object(extract_module, "_publish_directory", return_value=None),
+                patch.object(
+                    extract_module, "_cleanup_staging", side_effect=fail_cleanup
+                ),
+                self.assertRaises(ArchiveExtractionError) as raised,
+            ):
+                extract_zip(archive, destination)
+
+        self.assertIn("staging is locked", str(raised.exception))
+        self.assertIn(str(cleanup_paths[0]), str(raised.exception))
+        self.assertIn("remove", str(raised.exception).lower())
+        self.assertTrue(handles)
+        self.assertTrue(all(handle.closed for handle in handles))
+
+    def test_primary_zip_failure_survives_cleanup_failure_with_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "source.zip"
+            destination = root / "output"
+            _write_zip(archive, [("data.csv", b"x\n1\n")])
+            primary = ArchiveExtractionError("primary ZIP failure")
+            cleanup_paths: list[Path] = []
+            handles, capture_open = self._capture_source_handles()
+
+            def fail_member(*args, **kwargs):
+                raise primary
+
+            def fail_cleanup(path: Path, expected) -> None:
+                cleanup_paths.append(path)
+                raise PermissionError("cleanup denied")
+
+            caught: ArchiveExtractionError | None = None
+            trace_names: set[str] = set()
+            with (
+                patch.object(
+                    extract_module,
+                    "_open_regular_source",
+                    side_effect=capture_open,
+                ),
+                patch.object(
+                    extract_module, "_write_zip_member", side_effect=fail_member
+                ),
+                patch.object(
+                    extract_module, "_cleanup_staging", side_effect=fail_cleanup
+                ),
+            ):
+                try:
+                    extract_zip(archive, destination)
+                except ArchiveExtractionError as error:
+                    caught = error
+                    trace_names = {
+                        frame.name for frame in traceback.extract_tb(error.__traceback__)
+                    }
+                else:
+                    self.fail("primary ZIP failure was not raised")
+
+        self.assertIs(caught, primary)
+        self.assertEqual(str(caught), "primary ZIP failure")
+        self.assertIn("fail_member", trace_names)
+        notes = "\n".join(getattr(caught, "__notes__", ()))
+        self.assertIn("cleanup denied", notes)
+        self.assertIn(str(cleanup_paths[0]), notes)
+        self.assertTrue(all(handle.closed for handle in handles))
+
+    def test_base_exceptions_propagate_with_cleanup_recovery_note(self) -> None:
+        for exception_type in (KeyboardInterrupt, SystemExit):
+            with (
+                self.subTest(exception_type=exception_type.__name__),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                archive = root / "source.zip"
+                destination = root / "output"
+                _write_zip(archive, [("data.csv", b"x\n1\n")])
+                primary = exception_type("primary interruption")
+                cleanup_paths: list[Path] = []
+                handles, capture_open = self._capture_source_handles()
+
+                def fail_cleanup(path: Path, expected) -> None:
+                    cleanup_paths.append(path)
+                    raise PermissionError("cleanup interrupted")
+
+                with (
+                    patch.object(
+                        extract_module,
+                        "_open_regular_source",
+                        side_effect=capture_open,
+                    ),
+                    patch.object(
+                        extract_module,
+                        "_write_zip_member",
+                        side_effect=primary,
+                    ),
+                    patch.object(
+                        extract_module,
+                        "_cleanup_staging",
+                        side_effect=fail_cleanup,
+                    ),
+                    self.assertRaises(exception_type) as raised,
+                ):
+                    extract_zip(archive, destination)
+
+                self.assertIs(raised.exception, primary)
+                notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+                self.assertIn("cleanup interrupted", notes)
+                self.assertIn(str(cleanup_paths[0]), notes)
+                self.assertTrue(all(handle.closed for handle in handles))
+
+    def test_primary_rar_failure_survives_cleanup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.rar"
+            source.write_bytes(b"rar")
+            destination = root / "output"
+            cleanup_paths: list[Path] = []
+            handles, capture_open = self._capture_source_handles()
+
+            def fail_cleanup(path: Path, expected) -> None:
+                cleanup_paths.append(path)
+                raise PermissionError("RAR cleanup denied")
+
+            def fail_listing(args, **kwargs):
+                return subprocess.CompletedProcess(args, 17, "", "listing failed")
+
+            with (
+                patch.object(
+                    extract_module,
+                    "_open_regular_source",
+                    side_effect=capture_open,
+                ),
+                patch.object(
+                    extract_module, "_cleanup_staging", side_effect=fail_cleanup
+                ),
+                self.assertRaisesRegex(
+                    ArchiveExtractionError, "listing failed with exit code 17"
+                ) as raised,
+            ):
+                extract_rar(
+                    source,
+                    destination,
+                    which_fn=lambda _: "/tools/7z",
+                    run_fn=fail_listing,
+                )
+
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn("RAR cleanup denied", notes)
+        self.assertIn(str(cleanup_paths[0]), notes)
+        self.assertTrue(all(handle.closed for handle in handles))
 
 
 class RarExtractionTest(unittest.TestCase):
