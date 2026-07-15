@@ -339,8 +339,28 @@ class PriorityRowSketch:
                 "batch shape mismatch: expected "
                 f"({len(uids)}, {self.width}), received {raw.shape}"
             )
-        for index, uid in enumerate(uids):
-            self.update(uid, raw[index])
+        validated: list[tuple[str, tuple[float, ...]]] = []
+        seen: dict[str, tuple[str, ...]] = {}
+        for index, candidate_uid in enumerate(uids):
+            uid = self._validate_uid(candidate_uid)
+            row_values = self._validate_values(raw[index])
+            tokens = _row_tokens(row_values)
+            previous = seen.get(uid)
+            if previous is not None:
+                if previous != tokens:
+                    raise ValueError(f"conflicting duplicate row_uid: {uid}")
+                continue
+            seen[uid] = tokens
+            validated.append((uid, row_values))
+
+        delta = PriorityRowSketch(
+            capacity=self.capacity,
+            seed=self.seed,
+            width=self.width,
+        )
+        for uid, row_values in validated:
+            delta.update(uid, row_values)
+        self.merge(delta)
 
     def _compatibility_key(self) -> tuple[object, ...]:
         return (

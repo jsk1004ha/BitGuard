@@ -8,7 +8,7 @@ import math
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ from ..preprocess import FeaturePreprocessor, IdentityScaler
 from .quantiles import PriorityRowSketch
 
 
-STREAMING_PREPROCESS_VERSION = 1
+STREAMING_PREPROCESS_VERSION = 2
 _PHASE_INSPECT = 1
 _PHASE_ANOVA = 2
 _PHASE_CALIBRATE = 3
@@ -319,6 +319,7 @@ class StreamingFeaturePreprocessor:
         self.selected_features: list[str] = []
         self.selection_scores: NDArray[np.float64] | None = None
         self.feature_costs: NDArray[np.float64] | None = None
+        self._final_result: FeaturePreprocessor | None = None
 
         self._audit_root = Path(tempfile.mkdtemp(prefix="bitguard-preprocess-audit-"))
         self._audit_connection: sqlite3.Connection | None = sqlite3.connect(
@@ -365,12 +366,27 @@ class StreamingFeaturePreprocessor:
             raise ValueError("train batch arrays must have equal row counts")
         if any(str(value) != "train" for value in membership_raw):
             raise ValueError("only effective split=train rows may fit preprocessing")
-        uids = [str(value) for value in uids_raw]
-        if any(not uid for uid in uids):
-            raise ValueError("row_uid values must be non-empty strings")
+        uids: list[str] = []
+        for value in uids_raw:
+            if not isinstance(value, str) or not value:
+                raise ValueError("row_uid values must be non-empty strings")
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("row_uid values must be valid UTF-8") from exc
+            uids.append(value)
         if len(set(uids)) != len(uids):
             raise ValueError("duplicate row_uid within train batch")
-        label_values = labels_raw.astype(str)
+        validated_labels: list[str] = []
+        for value in labels_raw:
+            if not isinstance(value, str) or not value:
+                raise ValueError("behavior labels must be non-empty strings")
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("behavior labels must be valid UTF-8") from exc
+            validated_labels.append(value)
+        label_values = np.asarray(validated_labels, dtype=str)
         if np.any(label_values == "unknown_like"):
             raise ValueError("unknown_like must not appear in streaming training")
         unsupported = sorted(set(label_values).difference(KNOWN_LABELS))
@@ -391,28 +407,54 @@ class StreamingFeaturePreprocessor:
             if duplicate is not None:
                 raise ValueError(f"duplicate row_uid in preprocessing pass {phase}: {uid}")
 
-    def _record_audit(
-        self,
+    @staticmethod
+    def _prepare_audit_records(
         phase: int,
         uids: Sequence[str],
         labels: NDArray[np.str_],
         values: NDArray[np.float64],
-    ) -> None:
-        assert self._audit_connection is not None
-        records = [
+    ) -> list[tuple[int, str, str, str]]:
+        return [
             (phase, uid, str(label), _row_value_digest(str(label), row))
             for uid, label, row in zip(uids, labels, values)
         ]
+
+    def _commit_audited_batch(
+        self,
+        phase: int,
+        records: Sequence[tuple[int, str, str, str]],
+        scientific_commit: Callable[[], None],
+    ) -> None:
+        assert self._audit_connection is not None
         try:
-            with self._audit_connection:
-                self._audit_connection.executemany(
-                    "INSERT INTO pass_rows (phase, row_uid, label, row_digest) "
-                    "VALUES (?, ?, ?, ?)",
-                    records,
-                )
+            self._audit_connection.execute("BEGIN")
+            self._audit_connection.executemany(
+                "INSERT INTO pass_rows (phase, row_uid, label, row_digest) "
+                "VALUES (?, ?, ?, ?)",
+                records,
+            )
+            self._audit_connection.commit()
         except sqlite3.IntegrityError as exc:
+            self._rollback_audit()
             raise ValueError(f"duplicate row_uid in preprocessing pass {phase}") from exc
-        self._phase_rows[phase] += len(uids)
+        except BaseException:
+            self._rollback_audit()
+            raise
+        try:
+            scientific_commit()
+        except BaseException as exc:
+            self._state = "failed"
+            raise RuntimeError(
+                "scientific commit failed after audit commit; builder is failed"
+            ) from exc
+        self._phase_rows[phase] += len(records)
+
+    def _rollback_audit(self) -> None:
+        assert self._audit_connection is not None
+        try:
+            self._audit_connection.rollback()
+        except sqlite3.Error:
+            pass
 
     def _verify_phase(self, phase: int, *, compare_to_inspect: bool) -> str:
         if self._phase_rows[phase] != self.expected_train_rows:
@@ -470,10 +512,25 @@ class StreamingFeaturePreprocessor:
         )
         self._ensure_phase_uids_are_new(_PHASE_INSPECT, uids)
         normalized = matrix.astype(np.float32).astype(np.float64)
-        self.imputation_sketch.update_many(uids, normalized)
+        delta = PriorityRowSketch(
+            capacity=self.quantile_capacity,
+            seed=self.quantile_seed,
+            width=len(self.original_candidate_features),
+        )
+        delta.update_many(uids, normalized)
+        class_delta = {label: 0 for label in KNOWN_LABELS}
         for label in label_values:
-            self._class_counts[str(label)] += 1
-        self._record_audit(_PHASE_INSPECT, uids, label_values, matrix)
+            class_delta[str(label)] += 1
+        records = self._prepare_audit_records(
+            _PHASE_INSPECT, uids, label_values, matrix
+        )
+
+        def commit_science() -> None:
+            self.imputation_sketch.merge(delta)
+            for label, count in class_delta.items():
+                self._class_counts[label] += count
+
+        self._commit_audited_batch(_PHASE_INSPECT, records, commit_science)
 
     def finalize_imputation(self) -> None:
         self._require_state("inspect")
@@ -542,8 +599,20 @@ class StreamingFeaturePreprocessor:
         )
         self._ensure_phase_uids_are_new(_PHASE_ANOVA, uids)
         assert self.anova is not None
-        self.anova.update(self._impute_usable(matrix), label_values)
-        self._record_audit(_PHASE_ANOVA, uids, label_values, matrix)
+        imputed = self._impute_usable(matrix)
+        if not np.isfinite(imputed).all():
+            raise ValueError("ANOVA requires finite values after frozen imputation")
+        delta = ClassSufficientStatistics(
+            self.active_labels, len(self.candidate_features)
+        )
+        delta.update(imputed, label_values)
+        records = self._prepare_audit_records(_PHASE_ANOVA, uids, label_values, matrix)
+
+        def commit_science() -> None:
+            assert self.anova is not None
+            self.anova.merge(delta)
+
+        self._commit_audited_batch(_PHASE_ANOVA, records, commit_science)
 
     def finalize_selection(self) -> None:
         self._require_state("anova")
@@ -627,13 +696,40 @@ class StreamingFeaturePreprocessor:
             and self._selected_moments is not None
         )
         selected = self._impute_usable(matrix)[:, self.selected_indices]
-        self.selected_calibration.update_many(uids, selected)
-        self._selected_moments.update(selected)
+        if not np.isfinite(selected).all():
+            raise ValueError("calibration requires finite values after frozen imputation")
+        selected_delta = PriorityRowSketch(
+            capacity=self.quantile_capacity,
+            seed=self.quantile_seed,
+            width=len(self.selected_indices),
+        )
+        selected_delta.update_many(uids, selected)
+        moments_delta = _MomentAccumulator(len(self.selected_indices))
+        moments_delta.update(selected)
+        benign_delta = PriorityRowSketch(
+            capacity=self.quantile_capacity,
+            seed=self.quantile_seed,
+            width=len(self.selected_indices),
+        )
         benign_mask = label_values == "benign"
         if np.any(benign_mask):
             benign_uids = [uid for uid, keep in zip(uids, benign_mask) if keep]
-            self.benign_calibration.update_many(benign_uids, selected[benign_mask])
-        self._record_audit(_PHASE_CALIBRATE, uids, label_values, matrix)
+            benign_delta.update_many(benign_uids, selected[benign_mask])
+        records = self._prepare_audit_records(
+            _PHASE_CALIBRATE, uids, label_values, matrix
+        )
+
+        def commit_science() -> None:
+            assert (
+                self.selected_calibration is not None
+                and self.benign_calibration is not None
+                and self._selected_moments is not None
+            )
+            self.selected_calibration.merge(selected_delta)
+            self._selected_moments.merge(moments_delta)
+            self.benign_calibration.merge(benign_delta)
+
+        self._commit_audited_batch(_PHASE_CALIBRATE, records, commit_science)
 
     def _hydrate_scaler(self, result: FeaturePreprocessor) -> None:
         assert self.selected_calibration is not None and self._selected_moments is not None
@@ -704,6 +800,8 @@ class StreamingFeaturePreprocessor:
         }
 
     def finalize(self) -> FeaturePreprocessor:
+        if self._state == "cleanup_pending":
+            return self._finish_cleanup()
         self._require_state("calibration")
         self._verify_phase(_PHASE_CALIBRATE, compare_to_inspect=True)
         assert (
@@ -737,29 +835,98 @@ class StreamingFeaturePreprocessor:
             "selected": self._sketch_provenance(self.selected_calibration),
             "benign": self._sketch_provenance(self.benign_calibration),
         }
-        exact_fields = [
+        exact_fields: list[str] = []
+        approximate_fields: list[str] = []
+        field_dependencies: dict[str, list[str]] = {}
+
+        def register_field(
+            field: str,
+            *,
+            exact: bool,
+            dependencies: Sequence[str] = (),
+        ) -> None:
+            field_dependencies[field] = list(dict.fromkeys(dependencies))
+            (exact_fields if exact else approximate_fields).append(field)
+
+        for field in (
             "train_membership_and_pass_identity",
             "finite_missing_counts",
             "class_counts",
-            "anova_sufficient_statistics_after_frozen_imputation",
-            "feature_costs_and_stable_ranking",
-        ]
-        approximate_fields: list[str] = []
-        quantile_fields = [
-            ("imputation_medians", "imputation"),
-            ("benign_center_and_distance_quantile", "benign"),
-        ]
-        scaler_name = str(self.config["preprocess"].get("scaler", "robust"))
-        if scaler_name == "standard":
-            exact_fields.append("standard_scaler_moments")
-        elif scaler_name == "robust":
-            quantile_fields.append(("robust_scaler_quantiles", "selected"))
-        if result.encoder.kind != "none":
-            quantile_fields.append(("encoder_quantile_thresholds", "selected"))
-        for field, sketch_name in quantile_fields:
-            target = exact_fields if sketches[sketch_name]["exact"] else approximate_fields
-            target.append(field)
+        ):
+            register_field(field, exact=True)
+
         missing_seen = bool(np.any(self.imputation_sketch.missing_counts > 0))
+        imputation_exact = bool(sketches["imputation"]["exact"])
+        selected_exact = bool(sketches["selected"]["exact"])
+        benign_exact = bool(sketches["benign"]["exact"])
+        imputed_values_exact = not missing_seen or imputation_exact
+        imputation_dependency = ["imputation_medians"] if missing_seen else []
+
+        register_field(
+            "imputation_medians",
+            exact=imputation_exact,
+            dependencies=["imputation_sketch"],
+        )
+        register_field(
+            "anova_sufficient_statistics_after_frozen_imputation",
+            exact=imputed_values_exact,
+            dependencies=imputation_dependency,
+        )
+        register_field(
+            "feature_costs_and_stable_ranking",
+            exact=imputed_values_exact,
+            dependencies=[
+                "anova_sufficient_statistics_after_frozen_imputation",
+                *imputation_dependency,
+            ],
+        )
+
+        scaler_name = str(self.config["preprocess"].get("scaler", "robust"))
+        scaler_field: str | None = None
+        scaler_exact = True
+        if scaler_name == "standard":
+            scaler_field = "standard_scaler_moments"
+            scaler_exact = imputed_values_exact
+            register_field(
+                scaler_field,
+                exact=scaler_exact,
+                dependencies=imputation_dependency,
+            )
+        elif scaler_name == "robust":
+            scaler_field = "robust_scaler_quantiles"
+            scaler_exact = selected_exact and imputed_values_exact
+            register_field(
+                scaler_field,
+                exact=scaler_exact,
+                dependencies=[
+                    "selected_calibration_sketch",
+                    *imputation_dependency,
+                ],
+            )
+        if result.encoder.kind != "none":
+            register_field(
+                "encoder_quantile_thresholds",
+                exact=selected_exact and scaler_exact and imputed_values_exact,
+                dependencies=[
+                    "selected_calibration_sketch",
+                    *([] if scaler_field is None else [scaler_field]),
+                    *imputation_dependency,
+                ],
+            )
+        register_field(
+            "benign_center_and_distance_quantile",
+            exact=benign_exact and scaler_exact and imputed_values_exact,
+            dependencies=[
+                "benign_calibration_sketch",
+                *(
+                    ["selected_calibration_sketch"]
+                    if scaler_name == "robust"
+                    else []
+                ),
+                *([] if scaler_field is None else [scaler_field]),
+                *imputation_dependency,
+            ],
+        )
         result.fit_provenance = {
             "fit_mode": "streaming_priority_sketch",
             "version": STREAMING_PREPROCESS_VERSION,
@@ -782,18 +949,27 @@ class StreamingFeaturePreprocessor:
             },
             "exact_fields": exact_fields,
             "approximate_fields": approximate_fields,
+            "field_dependencies": field_dependencies,
+            "imputation_replacement_required": missing_seen,
             "anova_imputation_semantics": (
-                "ANOVA is exact for the frozen imputed values; medians are priority-sketch "
-                "approximations when missing values are present."
+                "ANOVA is deterministic for the frozen imputed values and inherits the "
+                "imputation median approximation when missing values are replaced."
                 if missing_seen
                 else "ANOVA is exact; no imputation replacement was required."
             ),
             "validation_calibration_used": False,
         }
         result.fitted = True
-        self._state = "finalized"
+        self._final_result = result
+        self._state = "cleanup_pending"
+        return self._finish_cleanup()
+
+    def _finish_cleanup(self) -> FeaturePreprocessor:
+        if self._state != "cleanup_pending" or self._final_result is None:
+            raise RuntimeError("preprocessing result is not pending audit cleanup")
         self._close_audit()
-        return result
+        self._state = "finalized"
+        return self._final_result
 
     def _close_audit(self) -> None:
         if self._audit_connection is not None:

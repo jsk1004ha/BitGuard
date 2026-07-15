@@ -424,6 +424,25 @@ class PriorityRowSketchTests(unittest.TestCase):
             ordinary.update("new", [2.0])
         self.assertEqual(ordinary.to_bytes(), before)
 
+    def test_update_many_validation_failure_is_transactional_and_retryable(self) -> None:
+        cases = (
+            (["valid", "\ud800"], [[1.0], [2.0]], "UTF-8"),
+            (["duplicate", "duplicate"], [[1.0], [2.0]], "duplicate"),
+        )
+        for uids, values, message in cases:
+            with self.subTest(message=message):
+                sketch = PriorityRowSketch(capacity=1, seed=3, width=1)
+                before = sketch.to_bytes()
+
+                with self.assertRaisesRegex(ValueError, message):
+                    sketch.update_many(uids, values)
+
+                self.assertEqual(sketch.to_bytes(), before)
+                sketch.update_many(["valid", "retry"], [[3.0], [4.0]])
+                expected = PriorityRowSketch(capacity=1, seed=3, width=1)
+                expected.update_many(["valid", "retry"], [[3.0], [4.0]])
+                self.assertEqual(sketch.to_bytes(), expected.to_bytes())
+
     def test_merge_counter_overflow_is_rejected_transactionally(self) -> None:
         left = _max_count_sketch("left")
         right = _max_count_sketch("right")

@@ -3,10 +3,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,7 @@ from sklearn.feature_selection import f_classif
 from sklearn.preprocessing import StandardScaler
 
 from bitguard_bnn.config import DEFAULTS
+from bitguard_bnn.out_of_core import preprocess as out_of_core_preprocess
 from bitguard_bnn.out_of_core.preprocess import (
     ClassSufficientStatistics,
     StreamingFeaturePreprocessor,
@@ -22,6 +25,53 @@ from bitguard_bnn.out_of_core.preprocess import (
 )
 from bitguard_bnn.out_of_core.quantiles import PriorityRowSketch
 from bitguard_bnn.preprocess import FeaturePreprocessor
+
+
+class _FailingAuditConnection:
+    def __init__(self, connection: sqlite3.Connection, fail_on: str) -> None:
+        self.connection = connection
+        self.fail_on = fail_on
+        self.failed = False
+
+    def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self.connection.execute(*args, **kwargs)
+
+    def executemany(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        if self.fail_on == "insert" and not self.failed:
+            self.failed = True
+            raise sqlite3.OperationalError("injected audit insert failure")
+        return self.connection.executemany(*args, **kwargs)
+
+    def commit(self) -> None:
+        if self.fail_on == "commit" and not self.failed:
+            self.failed = True
+            raise sqlite3.OperationalError("injected audit commit failure")
+        self.connection.commit()
+
+    def rollback(self) -> None:
+        self.connection.rollback()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> "_FailingAuditConnection":
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object,
+    ) -> Literal[False]:
+        if exception_type is not None:
+            self.rollback()
+            return False
+        try:
+            self.commit()
+        except Exception:
+            self.rollback()
+            raise
+        return False
 
 
 def _config(
@@ -155,6 +205,52 @@ def _artifact_signature(processor: FeaturePreprocessor) -> str:
         payload[f"scaler_{name}"] = None if value is None else np.asarray(value).tolist()
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _scientific_state(builder: StreamingFeaturePreprocessor) -> tuple[Any, ...]:
+    anova = builder.anova
+    moments = builder._selected_moments
+    return (
+        builder._state,
+        tuple(sorted(builder._phase_rows.items())),
+        tuple(sorted(builder._class_counts.items())),
+        builder.imputation_sketch.to_bytes(),
+        None if anova is None else anova.counts.tobytes(),
+        None if anova is None else anova.means.tobytes(),
+        None if anova is None else anova.m2.tobytes(),
+        None
+        if builder.selected_calibration is None
+        else builder.selected_calibration.to_bytes(),
+        None
+        if builder.benign_calibration is None
+        else builder.benign_calibration.to_bytes(),
+        None if moments is None else moments.count,
+        None if moments is None else moments.mean.tobytes(),
+        None if moments is None else moments.m2.tobytes(),
+    )
+
+
+def _builder_for_method(
+    method: str,
+    frame: pd.DataFrame,
+    features: list[str],
+) -> StreamingFeaturePreprocessor:
+    builder = StreamingFeaturePreprocessor(
+        _config(),
+        candidate_features=features,
+        split_fingerprint="split-v1",
+        expected_train_rows=len(frame),
+        quantile_capacity=3,
+        quantile_seed=17,
+    )
+    indices = np.arange(len(frame))
+    if method != "inspect_batch":
+        _feed(builder, "inspect_batch", frame, features, indices)
+        builder.finalize_imputation()
+    if method == "calibrate_selected_batch":
+        _feed(builder, "accumulate_anova_batch", frame, features, indices)
+        builder.finalize_selection()
+    return builder
 
 
 class OutOfCorePreprocessTests(unittest.TestCase):
@@ -444,6 +540,147 @@ class OutOfCorePreprocessTests(unittest.TestCase):
         self.assertIsNotNone(restored.benign_center)
         self.assertGreater(restored.open_distance_threshold, 0.0)
 
+    def test_invalid_utf8_batch_is_transactional_and_retryable_at_capacity_one(
+        self,
+    ) -> None:
+        frame, features = _frame(3)
+        builder = StreamingFeaturePreprocessor(
+            _config(),
+            candidate_features=features,
+            split_fingerprint="split-v1",
+            expected_train_rows=3,
+            quantile_capacity=1,
+            quantile_seed=17,
+        )
+        before = _scientific_state(builder)
+        values = frame[features].to_numpy()
+        labels = frame["behavior_label"].to_numpy()
+
+        with self.assertRaisesRegex(ValueError, "UTF-8"):
+            builder.inspect_batch(
+                np.asarray(["valid", "also-valid", "\ud800"], dtype=object),
+                values,
+                labels,
+                split_fingerprint="split-v1",
+                feature_names=features,
+                membership=np.asarray(["train", "train", "train"], dtype=object),
+            )
+
+        self.assertEqual(_scientific_state(builder), before)
+        builder.inspect_batch(
+            np.asarray(["valid", "also-valid", "retry"], dtype=object),
+            values,
+            labels,
+            split_fingerprint="split-v1",
+            feature_names=features,
+            membership=np.asarray(["train", "train", "train"], dtype=object),
+        )
+        self.assertEqual(builder.imputation_sketch.total_rows, 3)
+
+    def test_audit_failures_leave_every_phase_scientifically_retryable(self) -> None:
+        frame, features = _frame(12)
+        methods = (
+            "inspect_batch",
+            "accumulate_anova_batch",
+            "calibrate_selected_batch",
+        )
+        for method in methods:
+            for fail_on in ("insert", "commit"):
+                with self.subTest(method=method, fail_on=fail_on):
+                    builder = _builder_for_method(method, frame, features)
+                    assert builder._audit_connection is not None
+                    builder._audit_connection = cast(
+                        Any,
+                        _FailingAuditConnection(builder._audit_connection, fail_on),
+                    )
+                    before = _scientific_state(builder)
+
+                    with self.assertRaisesRegex(
+                        sqlite3.OperationalError, f"audit {fail_on} failure"
+                    ):
+                        _feed(
+                            builder,
+                            method,
+                            frame,
+                            features,
+                            np.arange(len(frame)),
+                        )
+
+                    self.assertEqual(_scientific_state(builder), before)
+                    _feed(
+                        builder,
+                        method,
+                        frame,
+                        features,
+                        np.arange(len(frame)),
+                    )
+
+    def test_post_audit_scientific_failure_poison_state_blocks_retry(self) -> None:
+        frame, features = _frame(3)
+        builder = _builder_for_method("inspect_batch", frame, features)
+        values = frame[features].to_numpy()
+        labels = frame["behavior_label"].to_numpy()
+        arguments = (
+            frame["row_uid"].to_numpy(),
+            values,
+            labels,
+        )
+        keywords = {
+            "split_fingerprint": "split-v1",
+            "feature_names": features,
+            "membership": np.asarray(["train", "train", "train"], dtype=object),
+        }
+
+        with (
+            patch.object(
+                builder.imputation_sketch,
+                "merge",
+                side_effect=RuntimeError("scientific commit failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "scientific commit failed"),
+        ):
+            builder.inspect_batch(*arguments, **keywords)
+
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            builder.inspect_batch(*arguments, **keywords)
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            builder.finalize_imputation()
+
+    def test_finalize_cleanup_failure_is_retryable_without_residual_audit(
+        self,
+    ) -> None:
+        frame, features = _frame(12)
+        builder = _builder_for_method("calibrate_selected_batch", frame, features)
+        _feed(
+            builder,
+            "calibrate_selected_batch",
+            frame,
+            features,
+            np.arange(len(frame)),
+        )
+        audit_root = builder._audit_root
+        real_rmtree = out_of_core_preprocess.shutil.rmtree
+        attempts = 0
+
+        def flaky_rmtree(path: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("injected cleanup failure")
+            real_rmtree(path)
+
+        with patch.object(
+            out_of_core_preprocess.shutil, "rmtree", side_effect=flaky_rmtree
+        ):
+            with self.assertRaisesRegex(OSError, "cleanup failure"):
+                builder.finalize()
+            self.assertTrue(audit_root.exists())
+            result = builder.finalize()
+
+        self.assertTrue(result.fitted)
+        self.assertFalse(audit_root.exists())
+        self.assertEqual(attempts, 2)
+
     def test_state_machine_rejects_nontrain_unknown_duplicate_and_wrong_proof(self) -> None:
         frame, features = _frame(12)
         builder = StreamingFeaturePreprocessor(
@@ -628,6 +865,49 @@ class OutOfCorePreprocessTests(unittest.TestCase):
             sampled_provenance["approximate_fields"],
         )
         self.assertFalse(sampled_provenance["sketches"]["benign"]["exact"])
+
+    def test_provenance_propagates_upstream_sketch_approximation(self) -> None:
+        frame, features = _frame(60)
+        processor, _ = _fit_streaming(
+            frame,
+            features,
+            _config(scaler="robust", encoder="sign"),
+            capacity=30,
+        )
+        provenance = processor.fit_provenance
+        self.assertFalse(provenance["sketches"]["selected"]["exact"])
+        self.assertTrue(provenance["sketches"]["benign"]["exact"])
+        self.assertIn(
+            "benign_center_and_distance_quantile",
+            provenance["approximate_fields"],
+        )
+        self.assertIn(
+            "selected_calibration_sketch",
+            provenance["field_dependencies"][
+                "benign_center_and_distance_quantile"
+            ],
+        )
+
+        missing, features = _frame(60, missing=True)
+        missing_processor, _ = _fit_streaming(
+            missing,
+            features,
+            _config(scaler="standard", encoder="sign"),
+            capacity=30,
+        )
+        missing_provenance = missing_processor.fit_provenance
+        for field in (
+            "anova_sufficient_statistics_after_frozen_imputation",
+            "feature_costs_and_stable_ranking",
+            "standard_scaler_moments",
+            "encoder_quantile_thresholds",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, missing_provenance["approximate_fields"])
+                self.assertIn(
+                    "imputation_medians",
+                    missing_provenance["field_dependencies"][field],
+                )
 
     def test_in_memory_manifest_declares_exact_fit_mode(self) -> None:
         frame, features = _frame(30)
