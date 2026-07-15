@@ -38,6 +38,9 @@ class BootstrapStateStoreTest(unittest.TestCase):
         path.write_bytes(content)
         return path
 
+    def state_temporary_paths(self) -> list[Path]:
+        return sorted(self.root.glob(f"{self.state_path.name}.*.tmp"))
+
     def test_absent_state_starts_empty(self):
         store = BootstrapStateStore(self.state_path)
 
@@ -238,42 +241,153 @@ class BootstrapStateStoreTest(unittest.TestCase):
             store.complete("acquire", "input-a", [output])
 
         self.assertEqual(events, ["file-fsync", "replace", "directory-fsync"])
-        self.assertFalse((self.root / "state.json.tmp").exists())
+        self.assertEqual(self.state_temporary_paths(), [])
+
+    def test_late_substitution_of_predictable_temp_cannot_corrupt_state_commit(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        predictable = self.root / "state.json.tmp"
+        hostile = self.root / "hostile.tmp"
+        hostile_bytes = b"{foreign state"
+        hostile.write_bytes(hostile_bytes)
+        real_close = os.close
+        substituted = False
+
+        def substitute_after_close(descriptor: int) -> None:
+            nonlocal substituted
+            real_close(descriptor)
+            if not substituted:
+                substituted = True
+                os.replace(hostile, predictable)
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.close",
+            side_effect=substitute_after_close,
+        ):
+            store.complete("acquire", "input-a", [output])
+
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages,
+            ("acquire",),
+        )
+        self.assertEqual(predictable.read_bytes(), hostile_bytes)
+        self.assertNotEqual(self.state_path.read_bytes(), hostile_bytes)
 
     def test_state_temp_uses_restrictive_exclusive_nofollow_flags(self):
         output = self.output("archive.zip")
         store = BootstrapStateStore(self.state_path)
-        temporary = self.root / "state.json.tmp"
         real_open = os.open
-        calls: list[tuple[int, int]] = []
+        calls: list[tuple[Path, int, int]] = []
 
         def recording_open(path, flags, mode=0o777):
-            if Path(path) == temporary:
-                calls.append((flags, mode))
+            candidate = Path(path)
+            if (
+                candidate.parent == self.root
+                and candidate.name.startswith(f"{self.state_path.name}.")
+                and candidate.name.endswith(".tmp")
+            ):
+                calls.append((candidate, flags, mode))
             return real_open(path, flags, mode)
 
         with patch("bitguard_bnn.bootstrap.state.os.open", side_effect=recording_open):
             store.complete("acquire", "input-a", [output])
 
         self.assertEqual(len(calls), 1)
-        flags, mode = calls[0]
+        temporary, flags, mode = calls[0]
+        token = temporary.name.removeprefix(f"{self.state_path.name}.").removesuffix(
+            ".tmp"
+        )
+        self.assertRegex(token, r"^[0-9a-f]{32}$")
         required_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
         self.assertEqual(flags & required_flags, required_flags)
         self.assertEqual(mode, 0o600)
         if hasattr(os, "O_NOFOLLOW"):
             self.assertTrue(flags & os.O_NOFOLLOW)
 
-    def test_preexisting_state_temp_collision_is_preserved_without_clobber(self):
+    def test_preexisting_predictable_state_temp_is_ignored_and_preserved(self):
         output = self.output("archive.zip")
         store = BootstrapStateStore(self.state_path)
         temporary = self.root / "state.json.tmp"
         hostile_bytes = b"pre-existing contender"
         temporary.write_bytes(hostile_bytes)
 
-        with self.assertRaisesRegex(BootstrapStateError, "temporary.*exists.*inspect"):
-            store.complete("acquire", "input-a", [output])
+        store.complete("acquire", "input-a", [output])
 
         self.assertEqual(temporary.read_bytes(), hostile_bytes)
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages,
+            ("acquire",),
+        )
+
+    def test_private_state_temp_name_collision_retries_without_clobber(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        collision_token = bootstrap_state.uuid.UUID(int=1)
+        private_token = bootstrap_state.uuid.UUID(int=2)
+        collision = self.root / f"state.json.{collision_token.hex}.tmp"
+        hostile_bytes = b"pre-existing private-name collision"
+        collision.write_bytes(hostile_bytes)
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.uuid.uuid4",
+            side_effect=(collision_token, private_token),
+        ) as token_factory:
+            store.complete("acquire", "input-a", [output])
+
+        self.assertEqual(token_factory.call_count, 2)
+        self.assertEqual(collision.read_bytes(), hostile_bytes)
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages,
+            ("acquire",),
+        )
+        self.assertEqual(self.state_temporary_paths(), [collision])
+
+    def test_private_state_temp_collision_exhaustion_is_bounded_and_actionable(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        collision_token = bootstrap_state.uuid.UUID(int=3)
+        collision = self.root / f"state.json.{collision_token.hex}.tmp"
+        hostile_bytes = b"persistent collision"
+        collision.write_bytes(hostile_bytes)
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.uuid.uuid4",
+            return_value=collision_token,
+        ) as token_factory:
+            with self.assertRaisesRegex(
+                BootstrapStateError,
+                r"unique private.*16.*collisions.*inspect",
+            ):
+                store.complete("acquire", "input-a", [output])
+
+        self.assertEqual(token_factory.call_count, 16)
+        self.assertEqual(collision.read_bytes(), hostile_bytes)
+        self.assertFalse(self.state_path.exists())
+
+    def test_private_state_temp_creation_does_not_retry_non_collision_errors(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        real_open = os.open
+        attempts = 0
+
+        def fail_private_open(path, flags, mode=0o777):
+            nonlocal attempts
+            candidate = Path(path)
+            if candidate.name.startswith("state.json.") and candidate.name.endswith(
+                ".tmp"
+            ):
+                attempts += 1
+                raise PermissionError("simulated denied private temp creation")
+            return real_open(path, flags, mode)
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.open",
+            side_effect=fail_private_open,
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "create.*denied"):
+                store.complete("acquire", "input-a", [output])
+
+        self.assertEqual(attempts, 1)
         self.assertFalse(self.state_path.exists())
 
     def test_restart_invalidates_stage_and_dependants(self):
@@ -298,7 +412,7 @@ class BootstrapStateStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(BootstrapStateError, "canonical stage order"):
             store.invalidate_from("extract", ("acquire", "extract", "inspect"))
 
-    def test_preexisting_state_temp_symlink_is_not_followed_or_removed(self):
+    def test_preexisting_predictable_state_temp_symlink_is_ignored(self):
         output = self.output("archive.zip")
         store = BootstrapStateStore(self.state_path)
         temporary = self.root / "state.json.tmp"
@@ -309,11 +423,14 @@ class BootstrapStateStoreTest(unittest.TestCase):
         except OSError as error:
             self.skipTest(f"symlink creation unavailable: {error}")
 
-        with self.assertRaisesRegex(BootstrapStateError, "temporary.*exists.*inspect"):
-            store.complete("acquire", "input-a", [output])
+        store.complete("acquire", "input-a", [output])
 
         self.assertTrue(temporary.is_symlink())
         self.assertEqual(target.read_bytes(), b"do not modify")
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages,
+            ("acquire",),
+        )
 
     def test_partial_state_writes_are_completed(self):
         output = self.output("archive.zip")
@@ -360,7 +477,53 @@ class BootstrapStateStoreTest(unittest.TestCase):
         self.assertEqual(
             BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
         )
-        self.assertFalse((self.root / "state.json.tmp").exists())
+        self.assertEqual(self.state_temporary_paths(), [])
+
+    def test_post_replace_verification_rejects_foreign_inode(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        foreign = self.root / "foreign-state.json"
+        foreign_bytes = b"foreign replacement"
+        foreign.write_bytes(foreign_bytes)
+        real_replace = Path.replace
+
+        def replace_then_substitute(source: Path, target: Path) -> Path:
+            result = real_replace(source, target)
+            os.replace(foreign, target)
+            return result
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.Path.replace",
+            autospec=True,
+            side_effect=replace_then_substitute,
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "verify.*identity"):
+                store.complete("acquire", "input-a", [output])
+
+        self.assertEqual(store.completed_stages, ())
+        self.assertEqual(self.state_path.read_bytes(), foreign_bytes)
+
+    def test_post_replace_verification_rejects_same_inode_content_change(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        foreign_bytes = b"same inode, foreign content"
+        real_replace = Path.replace
+
+        def replace_then_modify(source: Path, target: Path) -> Path:
+            result = real_replace(source, target)
+            Path(target).write_bytes(foreign_bytes)
+            return result
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.Path.replace",
+            autospec=True,
+            side_effect=replace_then_modify,
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "verify.*content"):
+                store.complete("acquire", "input-a", [output])
+
+        self.assertEqual(store.completed_stages, ())
+        self.assertEqual(self.state_path.read_bytes(), foreign_bytes)
 
     def _assert_descriptor_failure_preserves_previous_state(
         self, operation: str, failure_patch
@@ -370,7 +533,6 @@ class BootstrapStateStoreTest(unittest.TestCase):
         store = BootstrapStateStore(self.state_path)
         store.complete("acquire", "input-a", [archive])
         previous_bytes = self.state_path.read_bytes()
-        temporary = self.root / "state.json.tmp"
         with failure_patch:
             with self.assertRaisesRegex(BootstrapStateError, operation):
                 store.complete("inspect", "input-b", [inspection])
@@ -380,7 +542,7 @@ class BootstrapStateStoreTest(unittest.TestCase):
         self.assertEqual(
             BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
         )
-        self.assertFalse(temporary.exists())
+        self.assertEqual(self.state_temporary_paths(), [])
 
     def test_failed_state_write_preserves_previous_state_and_cleans_temp(self):
         self._assert_descriptor_failure_preserves_previous_state(
@@ -422,7 +584,6 @@ class BootstrapStateStoreTest(unittest.TestCase):
     def test_failed_state_identity_check_fails_closed_and_preserves_temp(self):
         output = self.output("archive.zip")
         store = BootstrapStateStore(self.state_path)
-        temporary = self.root / "state.json.tmp"
 
         with patch(
             "bitguard_bnn.bootstrap.state.os.fstat",
@@ -431,35 +592,53 @@ class BootstrapStateStoreTest(unittest.TestCase):
             with self.assertRaisesRegex(BootstrapStateError, "identity.*inspect"):
                 store.complete("acquire", "input-a", [output])
 
-        self.assertTrue(temporary.exists())
+        temporary_paths = self.state_temporary_paths()
+        self.assertEqual(len(temporary_paths), 1)
+        self.assertTrue(temporary_paths[0].is_file())
         self.assertFalse(self.state_path.exists())
 
     def test_failed_cleanup_does_not_delete_replacement_temp(self):
         output = self.output("archive.zip")
         store = BootstrapStateStore(self.state_path)
-        temporary = self.root / "state.json.tmp"
         hostile = self.root / "hostile.tmp"
         hostile_bytes = b"late contender"
         hostile.write_bytes(hostile_bytes)
+        real_open = os.open
         real_close = os.close
+        created: list[Path] = []
         failed = False
+
+        def record_private_open(path, flags, mode=0o777):
+            candidate = Path(path)
+            if candidate.name.startswith("state.json.") and candidate.name.endswith(
+                ".tmp"
+            ):
+                created.append(candidate)
+            return real_open(path, flags, mode)
 
         def close_replace_then_fail(descriptor: int) -> None:
             nonlocal failed
             real_close(descriptor)
             if not failed:
                 failed = True
-                os.replace(hostile, temporary)
+                os.replace(hostile, created[0])
                 raise OSError("simulated close race")
 
-        with patch(
-            "bitguard_bnn.bootstrap.state.os.close",
-            side_effect=close_replace_then_fail,
+        with (
+            patch(
+                "bitguard_bnn.bootstrap.state.os.open",
+                side_effect=record_private_open,
+            ),
+            patch(
+                "bitguard_bnn.bootstrap.state.os.close",
+                side_effect=close_replace_then_fail,
+            ),
         ):
             with self.assertRaisesRegex(BootstrapStateError, "close"):
                 store.complete("acquire", "input-a", [output])
 
-        self.assertEqual(temporary.read_bytes(), hostile_bytes)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].read_bytes(), hostile_bytes)
         self.assertFalse(self.state_path.exists())
 
 

@@ -30,6 +30,7 @@ STAGE_ORDER = (
     "summarize",
 )
 _DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
+_STATE_TEMP_CREATE_ATTEMPTS = 16
 
 
 class BootstrapStateError(RuntimeError):
@@ -360,20 +361,7 @@ class BootstrapStateStore:
             sort_keys=True,
         ) + "\n"
         encoded = serialized.encode("utf-8")
-        temporary = self.path.with_name(f"{self.path.name}.tmp")
-        try:
-            descriptor = os.open(temporary, _exclusive_write_flags(), 0o600)
-        except FileExistsError as error:
-            raise BootstrapStateError(
-                f"Bootstrap state temporary file {temporary} already exists; it "
-                "was not modified or removed; inspect the competing or interrupted "
-                "writer and remove the file only when safe."
-            ) from error
-        except OSError as error:
-            raise BootstrapStateError(
-                f"Could not create bootstrap state temporary file {temporary}: "
-                f"{error}."
-            ) from error
+        temporary, descriptor = self._create_private_temporary()
 
         identity: tuple[int, int] | None = None
         operation = "identity"
@@ -404,14 +392,14 @@ class BootstrapStateStore:
                     "for inspection because this writer cannot prove it still owns "
                     "the path."
                 ) from failure
-            cleanup_error: BootstrapStateError | None = None
+            failure_cleanup_error: BootstrapStateError | None = None
             try:
                 self._discard_owned_temporary(temporary, identity)
             except BootstrapStateError as error:
-                cleanup_error = error
+                failure_cleanup_error = error
             detail = (
-                f"; safe temporary-file cleanup also failed: {cleanup_error}"
-                if cleanup_error is not None
+                f"; safe temporary-file cleanup also failed: {failure_cleanup_error}"
+                if failure_cleanup_error is not None
                 else ""
             )
             raise BootstrapStateError(
@@ -419,17 +407,23 @@ class BootstrapStateStore:
                 f"{failure}{detail}."
             ) from failure
 
+        if identity is None:
+            raise BootstrapStateError(
+                f"Could not establish the identity of created bootstrap state "
+                f"temporary file {temporary}; the file is preserved for inspection."
+            )
+
         try:
             temporary.replace(self.path)
         except OSError as error:
-            cleanup_error: BootstrapStateError | None = None
+            replace_cleanup_error: BootstrapStateError | None = None
             try:
                 self._discard_owned_temporary(temporary, identity)
             except BootstrapStateError as caught:
-                cleanup_error = caught
+                replace_cleanup_error = caught
             detail = (
-                f"; safe temporary-file cleanup also failed: {cleanup_error}"
-                if cleanup_error is not None
+                f"; safe temporary-file cleanup also failed: {replace_cleanup_error}"
+                if replace_cleanup_error is not None
                 else ""
             )
             raise BootstrapStateError(
@@ -445,6 +439,84 @@ class BootstrapStateStore:
                 f"directory could not be made durable: {error}. The new state may "
                 "already be visible; inspect it before retrying."
             ) from error
+
+        self._verify_committed_state(identity, encoded)
+
+    def _create_private_temporary(self) -> tuple[Path, int]:
+        for _attempt in range(_STATE_TEMP_CREATE_ATTEMPTS):
+            temporary = self.path.with_name(
+                f"{self.path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                descriptor = os.open(temporary, _exclusive_write_flags(), 0o600)
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise BootstrapStateError(
+                    f"Could not create private bootstrap state temporary file "
+                    f"{temporary}: {error}."
+                ) from error
+            return temporary, descriptor
+
+        raise BootstrapStateError(
+            f"Could not create a unique private bootstrap state temporary file "
+            f"for {self.path} after {_STATE_TEMP_CREATE_ATTEMPTS} name collisions; "
+            "existing candidates were preserved; inspect sibling temporary files "
+            "before retrying."
+        )
+
+    def _verify_committed_state(
+        self, expected_identity: tuple[int, int], expected_content: bytes
+    ) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(self.path, flags)
+        except OSError as error:
+            raise BootstrapStateError(
+                f"Bootstrap state {self.path} was replaced, but this writer could "
+                f"not verify the committed state: {error}. The state may already "
+                "be visible; inspect it before retrying."
+            ) from error
+
+        operation = "identity"
+        failure: OSError | None = None
+        committed_identity: tuple[int, int] | None = None
+        chunks: list[bytes] = []
+        try:
+            committed_identity = _stat_identity(os.fstat(descriptor))
+            operation = "content"
+            while chunk := os.read(descriptor, 64 * 1024):
+                chunks.append(chunk)
+        except OSError as error:
+            failure = error
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if failure is None:
+                operation = "close"
+                failure = error
+            else:
+                operation = f"{operation}/close"
+                failure = OSError(f"{failure}; close also failed: {error}")
+
+        if failure is not None:
+            raise BootstrapStateError(
+                f"Bootstrap state {self.path} was replaced, but this writer could "
+                f"not verify its committed {operation}: {failure}. The state may "
+                "already be visible; inspect it before retrying."
+            ) from failure
+        if committed_identity != expected_identity:
+            raise BootstrapStateError(
+                f"Could not verify bootstrap state {self.path}: committed file "
+                "identity does not match the private temporary created by this "
+                "writer. The state is left untouched for inspection."
+            )
+        if b"".join(chunks) != expected_content:
+            raise BootstrapStateError(
+                f"Could not verify bootstrap state {self.path}: committed file "
+                "content does not match the private temporary created by this "
+                "writer. The state is left untouched for inspection."
+            )
 
     def _discard_owned_temporary(
         self, temporary: Path, expected_identity: tuple[int, int]
