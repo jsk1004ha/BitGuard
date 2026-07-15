@@ -187,6 +187,163 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
             )
             self.assertEqual(sum(len(chunk.frame) for chunk in uncapped), 12)
 
+    def test_csv_and_byte_pass_counts_are_independent_of_labels_and_chunks(
+        self,
+    ) -> None:
+        for label_count in (1, 6):
+            for chunk_size in (1, 7):
+                for class_cap, expected_passes in ((None, 2), (2, 3)):
+                    with (
+                        self.subTest(
+                            label_count=label_count,
+                            chunk_size=chunk_size,
+                            class_cap=class_cap,
+                        ),
+                        tempfile.TemporaryDirectory() as directory,
+                    ):
+                        root = Path(directory)
+                        path = root / "rows.csv"
+                        labels = [f"label_{index}" for index in range(label_count)]
+                        pd.DataFrame(
+                            {
+                                "behavior_label": labels * 4,
+                                "timestamp": list(range(label_count * 4)),
+                                "x": list(range(label_count * 4)),
+                            }
+                        ).to_csv(path, index=False)
+                        config = _base_config(root, "csv", "rows.csv")
+                        config["dataset"]["chunk_size"] = chunk_size
+                        config["dataset"]["max_rows_per_class"] = class_cap
+                        csv_calls = 0
+                        hashed_bytes = 0
+                        original_csv = source_module.pd.read_csv
+                        original_read = source_module._HashingReader.read
+
+                        def count_csv(*args, **kwargs):
+                            nonlocal csv_calls
+                            if kwargs.get("chunksize") is not None:
+                                csv_calls += 1
+                            return original_csv(*args, **kwargs)
+
+                        def count_bytes(reader, size: int = -1):
+                            nonlocal hashed_bytes
+                            block = original_read(reader, size)
+                            hashed_bytes += len(block)
+                            return block
+
+                        with (
+                            patch.object(source_module.pd, "read_csv", count_csv),
+                            patch.object(
+                                source_module._HashingReader,
+                                "read",
+                                count_bytes,
+                            ),
+                        ):
+                            list(iter_normalized_chunks(config))
+
+                        self.assertEqual(csv_calls, expected_passes)
+                        self.assertEqual(
+                            hashed_bytes,
+                            path.stat().st_size * expected_passes,
+                        )
+
+    def test_nbaiot_uses_only_plan_and_emit_byte_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset" / "device"
+            dataset.mkdir(parents=True)
+            path = dataset / "benign.csv"
+            pd.DataFrame({"x": list(range(9))}).to_csv(path, index=False)
+            config = _base_config(root, "nbaiot", "dataset")
+            config["dataset"]["chunk_size"] = 2
+            csv_calls = 0
+            hashed_bytes = 0
+            original_csv = source_module.pd.read_csv
+            original_read = source_module._HashingReader.read
+
+            def count_csv(*args, **kwargs):
+                nonlocal csv_calls
+                if kwargs.get("chunksize") is not None:
+                    csv_calls += 1
+                return original_csv(*args, **kwargs)
+
+            def count_bytes(reader, size: int = -1):
+                nonlocal hashed_bytes
+                block = original_read(reader, size)
+                hashed_bytes += len(block)
+                return block
+
+            with (
+                patch.object(source_module.pd, "read_csv", count_csv),
+                patch.object(
+                    source_module._HashingReader,
+                    "read",
+                    count_bytes,
+                ),
+            ):
+                list(iter_normalized_chunks(config))
+
+            self.assertEqual(csv_calls, 2)
+            self.assertEqual(hashed_bytes, path.stat().st_size * 2)
+
+    def test_selection_state_is_not_duplicated_in_plan_dataclasses(self) -> None:
+        self.assertNotIn(
+            "selected_rows", source_module._FilePlan.__dataclass_fields__
+        )
+        self.assertNotIn(
+            "retained_uids", source_module._IterationPlan.__dataclass_fields__
+        )
+        self.assertNotIn(
+            "materialization_order",
+            source_module._IterationPlan.__dataclass_fields__,
+        )
+
+    def test_disk_selection_index_is_removed_after_success_and_error(self) -> None:
+        for fail_during_emit in (False, True):
+            with (
+                self.subTest(fail_during_emit=fail_during_emit),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                path = root / "rows.csv"
+                index_path = root / "selection.sqlite3"
+                pd.DataFrame(
+                    {
+                        "behavior_label": ["benign", "scan_like"] * 5,
+                        "x": list(range(10)),
+                    }
+                ).to_csv(path, index=False)
+                config = _base_config(root, "csv", "rows.csv")
+                config["dataset"]["max_rows_per_file"] = 4
+                patches = [
+                    patch.object(
+                        source_module,
+                        "_new_selection_path",
+                        return_value=index_path,
+                        create=True,
+                    )
+                ]
+                if fail_during_emit:
+                    patches.append(
+                        patch.object(
+                            source_module,
+                            "_iter_planned_chunks",
+                            side_effect=RuntimeError("emit failed"),
+                        )
+                    )
+
+                with patches[0] as path_factory:
+                    if fail_during_emit:
+                        with patches[1], self.assertRaisesRegex(
+                            RuntimeError, "emit failed"
+                        ):
+                            list(iter_normalized_chunks(config))
+                    else:
+                        list(iter_normalized_chunks(config))
+
+                path_factory.assert_called_once_with()
+                self.assertFalse(index_path.exists())
+
     def test_logical_identity_is_stable_when_the_source_tree_moves(self) -> None:
         snapshots: list[tuple[list[int], list[str], list[str]]] = []
         with tempfile.TemporaryDirectory() as directory:

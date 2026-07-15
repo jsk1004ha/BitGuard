@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import heapq
 import hashlib
+import json
 import os
+import sqlite3
 import stat
+import tempfile
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterator
+from typing import Any, BinaryIO, Iterable, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
@@ -68,21 +71,25 @@ class _TimestampPlan:
 
 @dataclass(frozen=True, slots=True)
 class _FilePlan:
+    file_id: int
     path: Path
     relative_path: str
     logical_identity: str
     fingerprint: FileFingerprint
-    selected_rows: frozenset[int] | None
+    row_count: int
+    selected_row_count: int
+    raw_columns: tuple[str, ...]
     schema: _Schema
     timestamp: _TimestampPlan | None
+    numeric_columns: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _IterationPlan:
     source: _SourceSpec
     files: tuple[_FilePlan, ...]
-    retained_uids: frozenset[str] | None
-    materialization_order: tuple[str, ...] | None
+    selection: _SelectionIndex | None
+    class_limited: bool
     feature_columns: tuple[str, ...]
 
 
@@ -331,56 +338,215 @@ def _close_reader(reader: object) -> None:
         close()
 
 
-def _scan_selected_rows(
-    path: Path,
-    relative_path: str,
-    kind: str,
-    pinned: _PinnedStat,
-    *,
-    chunk_size: int,
-    max_rows: int | None,
-    seed: int,
-    budget: _SourceRowBudget,
-) -> tuple[frozenset[int] | None, FileFingerprint, str]:
-    if max_rows is not None and max_rows <= 0:
-        raise ValueError("max_rows must be positive or null")
-    offset = 0
-    csv_pass = _VerifiedCsvPass(
-        path,
-        pinned,
-        chunk_size=chunk_size,
-        phase="source planning",
-        expected_sha256=None,
+def _new_selection_path() -> Path:
+    descriptor, name = tempfile.mkstemp(
+        prefix="bitguard-selection-", suffix=".sqlite3"
     )
-    for chunk in csv_pass:
-        rows = len(chunk)
-        budget.consume(rows)
-        offset += rows
-    fingerprint = csv_pass.fingerprint
-    assert fingerprint is not None
-    identity = logical_source_id(kind, relative_path, fingerprint.sha256)
-    if offset == 0:
-        return frozenset(), fingerprint, identity
-    if max_rows is None or offset <= max_rows:
-        return None, fingerprint, identity
-    retained: list[tuple[int, int]] = []
-    for source_index in range(offset):
-        key = source_sampling_key(seed, identity, source_index)
-        entry = (-key, -source_index)
-        if len(retained) < max_rows:
-            heapq.heappush(retained, entry)
-        elif entry > retained[0]:
-            heapq.heapreplace(retained, entry)
-    return (
-        frozenset(-source_index for _, source_index in retained),
-        fingerprint,
-        identity,
-    )
+    os.close(descriptor)
+    return Path(name)
+
+
+class _SelectionIndex:
+    """Disk-backed row membership and materialization-order index."""
+
+    def __init__(self) -> None:
+        self.path = _new_selection_path()
+        self._connection = sqlite3.connect(self.path)
+        self._closed = False
+        self._connection.executescript(
+            """
+            PRAGMA journal_mode=DELETE;
+            PRAGMA synchronous=OFF;
+            CREATE TABLE file_mode (
+                file_id INTEGER PRIMARY KEY,
+                all_rows INTEGER NOT NULL
+            );
+            CREATE TABLE file_row (
+                file_id INTEGER NOT NULL,
+                row_index INTEGER NOT NULL,
+                numeric_columns TEXT NOT NULL,
+                timestamp_present INTEGER NOT NULL,
+                timestamp_numeric INTEGER NOT NULL,
+                timestamp_value TEXT,
+                PRIMARY KEY (file_id, row_index)
+            ) WITHOUT ROWID;
+            CREATE TABLE selected_file_row (
+                file_id INTEGER NOT NULL,
+                row_index INTEGER NOT NULL,
+                PRIMARY KEY (file_id, row_index)
+            ) WITHOUT ROWID;
+            CREATE TABLE class_candidate (
+                uid TEXT PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                row_index INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                numeric_columns TEXT NOT NULL
+            );
+            CREATE INDEX class_candidate_group
+                ON class_candidate(file_id, label, row_index);
+            CREATE TABLE selected_class_row (
+                uid TEXT PRIMARY KEY,
+                materialization_order INTEGER NOT NULL
+            );
+            """
+        )
+
+    def add_file_facts(
+        self,
+        facts: Iterable[tuple[int, int, str, int, int, str | None]],
+    ) -> None:
+        self._connection.executemany(
+            "INSERT INTO file_row VALUES (?, ?, ?, ?, ?, ?)", facts
+        )
+
+    def select_all_file_rows(self, file_id: int) -> None:
+        self._connection.execute(
+            "INSERT INTO file_mode(file_id, all_rows) VALUES (?, 1)",
+            (file_id,),
+        )
+        self._connection.commit()
+
+    def select_file_rows(self, file_id: int, rows: Iterable[int]) -> None:
+        self._connection.execute(
+            "INSERT INTO file_mode(file_id, all_rows) VALUES (?, 0)",
+            (file_id,),
+        )
+        self._connection.executemany(
+            "INSERT INTO selected_file_row VALUES (?, ?)",
+            ((file_id, int(row)) for row in rows),
+        )
+        self._connection.commit()
+
+    def selected_file_mask(
+        self, file_id: int, positions: Sequence[int]
+    ) -> np.ndarray:
+        if not positions:
+            return np.zeros(0, dtype=bool)
+        mode = self._connection.execute(
+            "SELECT all_rows FROM file_mode WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        if mode is None or bool(mode[0]):
+            return np.ones(len(positions), dtype=bool)
+        selected = {
+            int(row[0])
+            for row in self._connection.execute(
+                "SELECT row_index FROM selected_file_row "
+                "WHERE file_id = ? AND row_index BETWEEN ? AND ?",
+                (file_id, int(positions[0]), int(positions[-1])),
+            )
+        }
+        return np.fromiter(
+            (int(position) in selected for position in positions),
+            dtype=bool,
+            count=len(positions),
+        )
+
+    def selected_facts(
+        self, file_id: int
+    ) -> Iterator[tuple[str, int, int, str | None]]:
+        mode = self._connection.execute(
+            "SELECT all_rows FROM file_mode WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        if mode is None or bool(mode[0]):
+            query = (
+                "SELECT numeric_columns, timestamp_present, "
+                "timestamp_numeric, timestamp_value FROM file_row "
+                "WHERE file_id = ? ORDER BY row_index"
+            )
+        else:
+            query = (
+                "SELECT f.numeric_columns, f.timestamp_present, "
+                "f.timestamp_numeric, f.timestamp_value FROM file_row AS f "
+                "JOIN selected_file_row AS s USING(file_id, row_index) "
+                "WHERE f.file_id = ? ORDER BY f.row_index"
+            )
+        yield from self._connection.execute(query, (file_id,))
+
+    def discard_file_facts(self, file_id: int) -> None:
+        self._connection.execute(
+            "DELETE FROM file_row WHERE file_id = ?", (file_id,)
+        )
+        self._connection.commit()
+
+    def add_class_candidates(
+        self, rows: Iterable[tuple[str, int, int, str, str]]
+    ) -> None:
+        self._connection.executemany(
+            "INSERT INTO class_candidate VALUES (?, ?, ?, ?, ?)", rows
+        )
+        self._connection.commit()
+
+    def iter_class_candidates(
+        self, file_id: int, label: str
+    ) -> Iterator[tuple[str, str]]:
+        yield from self._connection.execute(
+            "SELECT uid, numeric_columns FROM class_candidate "
+            "WHERE file_id = ? AND label = ? ORDER BY row_index",
+            (file_id, label),
+        )
+
+    def set_selected_class_rows(self, ordered_uids: Iterable[str]) -> None:
+        self._connection.executemany(
+            "INSERT INTO selected_class_row VALUES (?, ?)",
+            ((uid, ordinal) for ordinal, uid in enumerate(ordered_uids)),
+        )
+        self._connection.commit()
+
+    def selected_class_mask(self, uids: Sequence[str]) -> np.ndarray:
+        selected: set[str] = set()
+        for start in range(0, len(uids), 500):
+            batch = list(uids[start : start + 500])
+            placeholders = ",".join("?" for _ in batch)
+            selected.update(
+                str(row[0])
+                for row in self._connection.execute(
+                    f"SELECT uid FROM selected_class_row WHERE uid IN ({placeholders})",
+                    batch,
+                )
+            )
+        return np.fromiter(
+            (str(uid) in selected for uid in uids),
+            dtype=bool,
+            count=len(uids),
+        )
+
+    def selected_class_facts(self) -> Iterator[tuple[int, str]]:
+        yield from self._connection.execute(
+            "SELECT c.file_id, c.numeric_columns FROM class_candidate AS c "
+            "JOIN selected_class_row AS s USING(uid) "
+            "ORDER BY c.file_id, c.row_index"
+        )
+
+    def materialization_order(self, uids: Sequence[str]) -> dict[str, int]:
+        order: dict[str, int] = {}
+        for start in range(0, len(uids), 500):
+            batch = list(uids[start : start + 500])
+            placeholders = ",".join("?" for _ in batch)
+            order.update(
+                (str(uid), int(position))
+                for uid, position in self._connection.execute(
+                    "SELECT uid, materialization_order FROM selected_class_row "
+                    f"WHERE uid IN ({placeholders})",
+                    batch,
+                )
+            )
+        return order
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._connection.close()
+        self.path.unlink(missing_ok=True)
+        Path(f"{self.path}-journal").unlink(missing_ok=True)
+        Path(f"{self.path}-wal").unlink(missing_ok=True)
+        Path(f"{self.path}-shm").unlink(missing_ok=True)
 
 
 def _iter_selected_raw(
     plan: _FilePlan,
     chunk_size: int,
+    selection: _SelectionIndex | None,
     *,
     include_empty: bool = False,
 ) -> Iterator[tuple[int, pd.DataFrame]]:
@@ -398,11 +564,9 @@ def _iter_selected_raw(
         offset += len(chunk)
         frame = chunk.copy()
         frame["__source_row_index"] = positions
-        if plan.selected_rows is not None:
-            mask = np.fromiter(
-                (int(position) in plan.selected_rows for position in positions),
-                dtype=bool,
-                count=len(positions),
+        if selection is not None:
+            mask = selection.selected_file_mask(
+                plan.file_id, positions.astype(int).tolist()
             )
             frame = frame.loc[mask].copy()
         if include_empty or not frame.empty:
@@ -445,42 +609,214 @@ def _schema_for(
     )
 
 
-def _plan_schema_and_timestamp(
+def _raw_feature_columns(
     kind: str,
-    plan: _FilePlan,
-    cfg: dict[str, Any],
-    chunk_size: int,
-) -> tuple[_Schema, _TimestampPlan | None]:
-    schema: _Schema | None = None
-    numeric_count = 0
-    timestamp_count = 0
-    first_timestamp: object | None = None
-    for _, frame in _iter_selected_raw(plan, chunk_size, include_empty=True):
-        if schema is None:
-            schema = _schema_for(kind, frame, cfg, plan.path)
-        if frame.empty:
-            continue
-        if schema.timestamp is None:
-            continue
-        values = frame[schema.timestamp]
-        converted = pd.to_numeric(values, errors="coerce")
-        numeric_count += int(converted.notna().sum())
-        timestamp_count += len(values)
-        if first_timestamp is None:
-            non_missing = values[values.notna()]
-            if not non_missing.empty:
-                first_timestamp = non_missing.iloc[0]
-    assert schema is not None
+    schema: _Schema,
+    raw_columns: Sequence[str],
+    drop_columns: set[str],
+) -> tuple[str, ...]:
+    metadata_sources: set[str] = set()
+    if kind != "nbaiot":
+        metadata_sources = {
+            column
+            for column in (
+                schema.label,
+                schema.raw_attack,
+                schema.device,
+                schema.timestamp,
+            )
+            if column is not None
+        }
+    excluded = META_COLUMNS | drop_columns | metadata_sources
+    return tuple(column for column in raw_columns if column not in excluded)
+
+
+def _timestamp_plan(
+    schema: _Schema,
+    *,
+    numeric_count: int,
+    timestamp_count: int,
+    first_timestamp: str | None,
+) -> _TimestampPlan | None:
     if schema.timestamp is None:
-        return schema, None
+        return None
     numeric_mode = timestamp_count > 0 and numeric_count / timestamp_count >= 0.95
     datetime_format: str | None = None
     if not numeric_mode and first_timestamp is not None:
-        if isinstance(first_timestamp, str):
-            datetime_format = guess_datetime_format(first_timestamp)
+        datetime_format = guess_datetime_format(first_timestamp)
         if datetime_format is None:
             datetime_format = "mixed"
-    return schema, _TimestampPlan(numeric_mode, datetime_format)
+    return _TimestampPlan(numeric_mode, datetime_format)
+
+
+def _selected_fact_summary(
+    facts: Iterable[tuple[str, int, int, str | None]],
+) -> tuple[tuple[str, ...], int, int, str | None]:
+    numeric_order: list[str] = []
+    numeric_seen: set[str] = set()
+    timestamp_count = 0
+    timestamp_numeric = 0
+    first_timestamp: str | None = None
+    for encoded, present, numeric, value in facts:
+        for column in json.loads(encoded):
+            if column not in numeric_seen:
+                numeric_seen.add(column)
+                numeric_order.append(str(column))
+        timestamp_count += int(present)
+        timestamp_numeric += int(numeric)
+        if first_timestamp is None and value is not None:
+            first_timestamp = str(value)
+    return (
+        tuple(numeric_order),
+        timestamp_numeric,
+        timestamp_count,
+        first_timestamp,
+    )
+
+
+def _plan_file(
+    *,
+    file_id: int,
+    path: Path,
+    relative_path: str,
+    source: _SourceSpec,
+    cfg: dict[str, Any],
+    chunk_size: int,
+    max_rows: int | None,
+    seed: int,
+    budget: _SourceRowBudget,
+    selection: _SelectionIndex | None,
+    drop_columns: set[str],
+) -> _FilePlan:
+    pinned = _pinned_stat(path)
+    schema: _Schema | None = None
+    raw_columns: tuple[str, ...] = ()
+    feature_columns: tuple[str, ...] = ()
+    numeric_seen: set[str] = set()
+    numeric_order: list[str] = []
+    timestamp_count = 0
+    timestamp_numeric = 0
+    first_timestamp: str | None = None
+    offset = 0
+    csv_pass = _VerifiedCsvPass(
+        path,
+        pinned,
+        chunk_size=chunk_size,
+        phase="source planning",
+        expected_sha256=None,
+    )
+    for chunk in csv_pass:
+        if schema is None:
+            schema = _schema_for(source.kind, chunk, cfg, path)
+            raw_columns = tuple(str(column) for column in chunk.columns)
+            feature_columns = _raw_feature_columns(
+                source.kind, schema, raw_columns, drop_columns
+            )
+        rows = len(chunk)
+        budget.consume(rows)
+        if rows == 0:
+            continue
+        positions = range(offset, offset + rows)
+        offset += rows
+        numeric_by_row: list[list[str]] = [[] for _ in range(rows)]
+        for column in feature_columns:
+            mask = pd.to_numeric(chunk[column], errors="coerce").notna().to_numpy()
+            if bool(mask.any()) and max_rows is None and column not in numeric_seen:
+                numeric_seen.add(column)
+                numeric_order.append(column)
+            if max_rows is not None:
+                for row_offset in np.flatnonzero(mask):
+                    numeric_by_row[int(row_offset)].append(column)
+        timestamp_present = np.zeros(rows, dtype=np.int8)
+        timestamp_is_numeric = np.zeros(rows, dtype=np.int8)
+        timestamp_values: list[str | None] = [None] * rows
+        if schema.timestamp is not None:
+            values = chunk[schema.timestamp]
+            converted = pd.to_numeric(values, errors="coerce")
+            timestamp_present.fill(1)
+            timestamp_is_numeric = converted.notna().to_numpy(dtype=np.int8)
+            non_missing = values.notna().to_numpy()
+            for row_offset in np.flatnonzero(non_missing):
+                timestamp_values[int(row_offset)] = str(values.iloc[int(row_offset)])
+            if max_rows is None:
+                timestamp_count += rows
+                timestamp_numeric += int(timestamp_is_numeric.sum())
+                if first_timestamp is None:
+                    first = next(
+                        (value for value in timestamp_values if value is not None),
+                        None,
+                    )
+                    first_timestamp = first
+        if max_rows is not None:
+            assert selection is not None
+            selection.add_file_facts(
+                (
+                    file_id,
+                    int(row_index),
+                    json.dumps(numeric_by_row[row_offset], separators=(",", ":")),
+                    int(timestamp_present[row_offset]),
+                    int(timestamp_is_numeric[row_offset]),
+                    timestamp_values[row_offset],
+                )
+                for row_offset, row_index in enumerate(positions)
+            )
+    fingerprint = csv_pass.fingerprint
+    assert fingerprint is not None
+    assert schema is not None
+    identity = logical_source_id(source.kind, relative_path, fingerprint.sha256)
+    selected_count = offset
+    if selection is not None:
+        if max_rows is None or offset <= max_rows:
+            selection.select_all_file_rows(file_id)
+        else:
+            retained: list[tuple[int, int]] = []
+            for source_index in range(offset):
+                key = source_sampling_key(seed, identity, source_index)
+                entry = (-key, -source_index)
+                if len(retained) < max_rows:
+                    heapq.heappush(retained, entry)
+                elif entry > retained[0]:
+                    heapq.heapreplace(retained, entry)
+            selection.select_file_rows(
+                file_id, (-source_index for _, source_index in retained)
+            )
+            selected_count = max_rows
+    if max_rows is not None:
+        assert selection is not None
+        (
+            selected_numeric,
+            timestamp_numeric,
+            timestamp_count,
+            first_timestamp,
+        ) = _selected_fact_summary(selection.selected_facts(file_id))
+        numeric_seen = set(selected_numeric)
+        numeric_order = [
+            column for column in feature_columns if column in numeric_seen
+        ]
+        selection.discard_file_facts(file_id)
+    else:
+        numeric_order = [
+            column for column in feature_columns if column in numeric_seen
+        ]
+    timestamp = _timestamp_plan(
+        schema,
+        numeric_count=timestamp_numeric,
+        timestamp_count=timestamp_count,
+        first_timestamp=first_timestamp,
+    )
+    return _FilePlan(
+        file_id=file_id,
+        path=path,
+        relative_path=relative_path,
+        logical_identity=identity,
+        fingerprint=fingerprint,
+        row_count=offset,
+        selected_row_count=selected_count,
+        raw_columns=raw_columns,
+        schema=schema,
+        timestamp=timestamp,
+        numeric_columns=tuple(numeric_order),
+    )
 
 
 def _coerce_planned_timestamp(
@@ -611,9 +947,14 @@ def _normalize_frame(
 
 
 def _iter_file_normalized(
-    plan: _FilePlan, source: _SourceSpec, chunk_size: int
+    plan: _FilePlan,
+    source: _SourceSpec,
+    chunk_size: int,
+    selection: _SelectionIndex | None,
 ) -> Iterator[NormalizedChunk]:
-    for source_row_start, frame in _iter_selected_raw(plan, chunk_size):
+    for source_row_start, frame in _iter_selected_raw(
+        plan, chunk_size, selection
+    ):
         yield NormalizedChunk(
             _normalize_frame(frame, plan, source),
             plan.relative_path,
@@ -621,40 +962,112 @@ def _iter_file_normalized(
         )
 
 
-def _select_class_uids(
+def _ordered_feature_columns(
+    files: tuple[_FilePlan, ...],
+    selected_file_ids: set[int],
+    numeric_columns: set[str],
+    source_kind: str,
+    drop_columns: set[str],
+) -> tuple[str, ...]:
+    column_order: list[str] = []
+    seen: set[str] = set()
+    for plan in files:
+        if plan.file_id not in selected_file_ids:
+            continue
+        for column in _raw_feature_columns(
+            source_kind, plan.schema, plan.raw_columns, drop_columns
+        ):
+            if column not in seen:
+                seen.add(column)
+                column_order.append(column)
+    features = tuple(
+        column for column in column_order if column in numeric_columns
+    )
+    if not features:
+        raise ValueError("no numeric feature columns were found")
+    return features
+
+
+def _select_class_rows(
     files: tuple[_FilePlan, ...],
     source: _SourceSpec,
+    selection: _SelectionIndex,
     *,
     chunk_size: int,
-    limit: int | None,
+    limit: int,
     seed: int,
-) -> tuple[frozenset[str] | None, tuple[str, ...] | None]:
-    if limit is None:
-        return None, None
-    if limit <= 0:
-        raise ValueError("max_rows_per_class must be positive or null")
+    drop_columns: set[str],
+) -> tuple[str, ...]:
     rng = np.random.default_rng(seed)
     heaps: dict[str, list[tuple[float, int, str]]] = {}
     ordinals: dict[str, int] = {}
     for plan in files:
         label_order: list[str] = []
         seen: set[str] = set()
-        for chunk in _iter_file_normalized(plan, source, chunk_size):
-            for label in chunk.frame["behavior_label"].astype(str):
+        candidates: list[tuple[str, int, int, str, str]] = []
+        feature_columns = _raw_feature_columns(
+            source.kind, plan.schema, plan.raw_columns, drop_columns
+        )
+        for chunk in _iter_file_normalized(
+            plan, source, chunk_size, selection
+        ):
+            frame = chunk.frame
+            numeric_by_row: list[list[str]] = [[] for _ in range(len(frame))]
+            for column in feature_columns:
+                mask = pd.to_numeric(frame[column], errors="coerce").notna().to_numpy()
+                for row_offset in np.flatnonzero(mask):
+                    numeric_by_row[int(row_offset)].append(column)
+            labels = frame["behavior_label"].astype(str).tolist()
+            for label in labels:
                 if label not in seen:
                     seen.add(label)
                     label_order.append(label)
+            candidates.extend(
+                (
+                    str(uid),
+                    plan.file_id,
+                    int(row_index),
+                    label,
+                    json.dumps(
+                        numeric_by_row[row_offset], separators=(",", ":")
+                    ),
+                )
+                for row_offset, (uid, row_index, label) in enumerate(
+                    zip(
+                        frame["row_uid"].astype(str),
+                        frame["sequence_index"].astype(int),
+                        labels,
+                    )
+                )
+            )
+            if len(candidates) >= 1_000:
+                selection.add_class_candidates(candidates)
+                candidates.clear()
+        if candidates:
+            selection.add_class_candidates(candidates)
         for label in label_order:
-            for chunk in _iter_file_normalized(plan, source, chunk_size):
-                group = chunk.frame.loc[
-                    chunk.frame["behavior_label"].astype(str).eq(label)
-                ]
-                if group.empty:
+            batch: list[tuple[str, str]] = []
+            for candidate in selection.iter_class_candidates(plan.file_id, label):
+                batch.append(candidate)
+                if len(batch) < chunk_size:
                     continue
-                keys = rng.random(len(group))
+                keys = rng.random(len(batch))
                 heap = heaps.setdefault(label, [])
                 ordinal = ordinals.get(label, 0)
-                for key, uid in zip(keys, group["row_uid"].astype(str)):
+                for key, (uid, _) in zip(keys, batch):
+                    entry = (-float(key), -ordinal, uid)
+                    ordinal += 1
+                    if len(heap) < limit:
+                        heapq.heappush(heap, entry)
+                    elif entry > heap[0]:
+                        heapq.heapreplace(heap, entry)
+                ordinals[label] = ordinal
+                batch.clear()
+            if batch:
+                keys = rng.random(len(batch))
+                heap = heaps.setdefault(label, [])
+                ordinal = ordinals.get(label, 0)
+                for key, (uid, _) in zip(keys, batch):
                     entry = (-float(key), -ordinal, uid)
                     ordinal += 1
                     if len(heap) < limit:
@@ -669,50 +1082,21 @@ def _select_class_uids(
         else:
             retained = sorted(heap, key=lambda item: (-item[0], -item[1]))
         ordered_uids.extend(entry[2] for entry in retained)
-    materialization_order = tuple(ordered_uids)
-    return frozenset(materialization_order), materialization_order
-
-
-def _filter_retained(
-    frame: pd.DataFrame, retained_uids: frozenset[str] | None
-) -> pd.DataFrame:
-    if retained_uids is None:
-        return frame
-    return frame.loc[frame["row_uid"].isin(retained_uids)].copy()
-
-
-def _plan_features(
-    files: tuple[_FilePlan, ...],
-    source: _SourceSpec,
-    retained_uids: frozenset[str] | None,
-    *,
-    chunk_size: int,
-    drop_columns: set[str],
-) -> tuple[str, ...]:
-    column_order: list[str] = []
-    numeric: dict[str, bool] = {}
-    row_count = 0
-    excluded = META_COLUMNS | drop_columns
-    for plan in files:
-        for chunk in _iter_file_normalized(plan, source, chunk_size):
-            frame = _filter_retained(chunk.frame, retained_uids)
-            if frame.empty:
-                continue
-            row_count += len(frame)
-            for column in frame.columns:
-                if column not in column_order:
-                    column_order.append(column)
-                if column in excluded or numeric.get(column, False):
-                    continue
-                numeric[column] = bool(
-                    pd.to_numeric(frame[column], errors="coerce").notna().any()
-                )
-    if row_count == 0:
+    if not ordered_uids:
         raise ValueError("dataset contains no rows")
-    features = tuple(column for column in column_order if numeric.get(column, False))
-    if not features:
-        raise ValueError("no numeric feature columns were found")
-    return features
+    selection.set_selected_class_rows(ordered_uids)
+    selected_files: set[int] = set()
+    numeric_columns: set[str] = set()
+    for file_id, encoded in selection.selected_class_facts():
+        selected_files.add(int(file_id))
+        numeric_columns.update(str(column) for column in json.loads(encoded))
+    return _ordered_feature_columns(
+        files,
+        selected_files,
+        numeric_columns,
+        source.kind,
+        drop_columns,
+    )
 
 
 def _build_iteration_plan(
@@ -731,70 +1115,91 @@ def _build_iteration_plan(
     budget = _SourceRowBudget(max_loaded_rows)
     class_limit = cfg.get("max_rows_per_class") if apply_sampling_caps else None
     class_limit = int(class_limit) if class_limit is not None else None
+    if max_rows is not None and max_rows <= 0:
+        raise ValueError("max_rows must be positive or null")
+    selection = (
+        _SelectionIndex()
+        if max_rows is not None or class_limit is not None
+        else None
+    )
     file_plans: list[_FilePlan] = []
-    has_rows = False
-    for path, relative_path in zip(source.files, source.relative_paths):
-        pinned = _pinned_stat(path)
-        selected_rows, fingerprint, identity = _scan_selected_rows(
-            path,
-            relative_path,
-            source.kind,
-            pinned,
-            chunk_size=chunk_size,
-            max_rows=max_rows,
-            seed=int(config["experiment"]["seed"]),
-            budget=budget,
-        )
-        file_plan = _FilePlan(
-            path,
-            relative_path,
-            identity,
-            fingerprint,
-            selected_rows,
-            _Schema(),
-            None,
-        )
-        schema, timestamp = _plan_schema_and_timestamp(
-            source.kind, file_plan, cfg, chunk_size
-        )
-        file_plans.append(replace(file_plan, schema=schema, timestamp=timestamp))
-        has_rows = has_rows or selected_rows != frozenset()
-    files = tuple(file_plans)
-    if not has_rows:
+    drop_columns = set(cfg.get("drop_columns", []))
+    try:
+        for file_id, (path, relative_path) in enumerate(
+            zip(source.files, source.relative_paths)
+        ):
+            file_plans.append(
+                _plan_file(
+                    file_id=file_id,
+                    path=path,
+                    relative_path=relative_path,
+                    source=source,
+                    cfg=cfg,
+                    chunk_size=chunk_size,
+                    max_rows=max_rows,
+                    seed=int(config["experiment"]["seed"]),
+                    budget=budget,
+                    selection=selection,
+                    drop_columns=drop_columns,
+                )
+            )
+        files = tuple(file_plans)
+        selected_files = {
+            plan.file_id for plan in files if plan.selected_row_count > 0
+        }
         if class_limit is not None:
             if class_limit <= 0:
                 raise ValueError("max_rows_per_class must be positive or null")
-            raise ValueError("dataset contains no rows")
-        raise ValueError("no numeric feature columns were found")
-    retained_uids, materialization_order = _select_class_uids(
-        files,
-        source,
-        chunk_size=chunk_size,
-        limit=class_limit,
-        seed=int(config["experiment"]["seed"]),
-    )
-    features = _plan_features(
-        files,
-        source,
-        retained_uids,
-        chunk_size=chunk_size,
-        drop_columns=set(cfg.get("drop_columns", [])),
-    )
-    return _IterationPlan(
-        source,
-        files,
-        retained_uids,
-        materialization_order,
-        features,
-    )
+            if not selected_files:
+                raise ValueError("dataset contains no rows")
+            assert selection is not None
+            features = _select_class_rows(
+                files,
+                source,
+                selection,
+                chunk_size=chunk_size,
+                limit=class_limit,
+                seed=int(config["experiment"]["seed"]),
+                drop_columns=drop_columns,
+            )
+        else:
+            numeric_columns = {
+                column for plan in files for column in plan.numeric_columns
+            }
+            features = _ordered_feature_columns(
+                files,
+                selected_files,
+                numeric_columns,
+                source.kind,
+                drop_columns,
+            )
+        return _IterationPlan(
+            source=source,
+            files=files,
+            selection=selection,
+            class_limited=class_limit is not None,
+            feature_columns=features,
+        )
+    except BaseException:
+        if selection is not None:
+            selection.close()
+        raise
 
 
 def _iter_planned_file_chunks(
     config: dict[str, Any], plan: _IterationPlan, file_plan: _FilePlan
 ) -> Iterator[NormalizedChunk]:
     chunk_size = int(config["dataset"]["chunk_size"])
-    for chunk in _iter_file_normalized(file_plan, plan.source, chunk_size):
-        frame = _filter_retained(chunk.frame, plan.retained_uids)
+    for chunk in _iter_file_normalized(
+        file_plan, plan.source, chunk_size, plan.selection
+    ):
+        frame = chunk.frame
+        if plan.class_limited:
+            assert plan.selection is not None
+            mask = plan.selection.selected_class_mask(
+                frame["row_uid"].astype(str).tolist()
+            )
+            frame = frame.loc[mask].copy()
         if frame.empty:
             continue
         for column in plan.feature_columns:
@@ -825,7 +1230,11 @@ def iter_normalized_chunks(
     """Yield normalized dataset chunks without concatenating source frames."""
 
     plan = _build_iteration_plan(config, path_override, apply_sampling_caps)
-    yield from _iter_planned_chunks(config, plan)
+    try:
+        yield from _iter_planned_chunks(config, plan)
+    finally:
+        if plan.selection is not None:
+            plan.selection.close()
 
 
 def load_normalized_dataset(
@@ -837,89 +1246,78 @@ def load_normalized_dataset(
     """Materialize normalized chunks at the legacy in-memory compatibility boundary."""
 
     plan = _build_iteration_plan(config, path_override, True, dataset_type)
-    frames: list[pd.DataFrame] = []
-    for file_plan in plan.files:
-        if (
-            file_plan.selected_rows == frozenset()
-            and plan.materialization_order is None
-        ):
-            header: pd.DataFrame | None = None
-            header_pass = _VerifiedCsvPass(
-                file_plan.path,
-                file_plan.fingerprint,
-                chunk_size=int(config["dataset"]["chunk_size"]),
-                phase="header-only materialization",
-                expected_sha256=file_plan.fingerprint.sha256,
+    try:
+        frames: list[pd.DataFrame] = []
+        for file_plan in plan.files:
+            if file_plan.selected_row_count == 0 and not plan.class_limited:
+                header = pd.DataFrame(columns=file_plan.raw_columns)
+                frames.append(_normalize_frame(header, file_plan, plan.source))
+            frames.extend(
+                chunk.frame
+                for chunk in _iter_planned_file_chunks(config, plan, file_plan)
             )
-            for frame in header_pass:
-                header = frame.iloc[0:0].copy()
-            assert header is not None
-            frames.append(_normalize_frame(header, file_plan, plan.source))
-            continue
-        frames.extend(
-            chunk.frame
-            for chunk in _iter_planned_file_chunks(config, plan, file_plan)
-        )
-    if not frames:
-        raise ValueError("dataset contains no rows")
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="The behavior of DataFrame concatenation with empty or all-NA",
-            category=FutureWarning,
-        )
-        combined = pd.concat(frames, ignore_index=True)
-    if plan.materialization_order is not None:
-        order = {
-            uid: position
-            for position, uid in enumerate(plan.materialization_order)
+        if not frames:
+            raise ValueError("dataset contains no rows")
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The behavior of DataFrame concatenation with empty or all-NA",
+                category=FutureWarning,
+            )
+            combined = pd.concat(frames, ignore_index=True)
+        if plan.class_limited:
+            assert plan.selection is not None
+            uids = combined["row_uid"].astype(str).tolist()
+            order = plan.selection.materialization_order(uids)
+            combined["__materialization_order"] = combined["row_uid"].map(order)
+            combined = combined.sort_values(
+                "__materialization_order", kind="stable"
+            ).drop(columns="__materialization_order")
+        combined = combined.sample(
+            frac=1, random_state=int(config["experiment"]["seed"])
+        ).reset_index(drop=True)
+        cfg = config["dataset"]
+        features = numeric_features(combined, cfg.get("drop_columns", []))
+        source = plan.source
+        digests = {
+            file_plan.relative_path: file_plan.fingerprint.sha256
+            for file_plan in plan.files
         }
-        combined["__materialization_order"] = combined["row_uid"].map(order)
-        combined = combined.sort_values(
-            "__materialization_order", kind="stable"
-        ).drop(columns="__materialization_order")
-    combined = combined.sample(
-        frac=1, random_state=int(config["experiment"]["seed"])
-    ).reset_index(drop=True)
-    cfg = config["dataset"]
-    features = numeric_features(combined, cfg.get("drop_columns", []))
-    source = plan.source
-    digests = {
-        file_plan.relative_path: file_plan.fingerprint.sha256
-        for file_plan in plan.files
-    }
-    provenance: dict[str, Any] = {
-        "type": source.kind,
-        "files": len(source.files),
-        "sha256": digests,
-        "source_identity": {
-            "algorithm": "bitguard.logical-source.v1",
-            "row_uid_algorithm": "bitguard.row-uid.v2",
-            "sampling_algorithm": "bitguard.source-sampling.v1",
-            "files": [
+        provenance: dict[str, Any] = {
+            "type": source.kind,
+            "files": len(source.files),
+            "sha256": digests,
+            "source_identity": {
+                "algorithm": "bitguard.logical-source.v1",
+                "row_uid_algorithm": "bitguard.row-uid.v2",
+                "sampling_algorithm": "bitguard.source-sampling.v1",
+                "files": [
+                    {
+                        "relative_path": file_plan.relative_path,
+                        "byte_size": file_plan.fingerprint.byte_size,
+                        "content_sha256": file_plan.fingerprint.sha256,
+                        "logical_source_id": file_plan.logical_identity,
+                    }
+                    for file_plan in plan.files
+                ],
+            },
+            "has_wall_clock_time": (
+                False
+                if source.kind == "nbaiot"
+                else bool(combined["timestamp"].notna().any())
+            ),
+        }
+        if source.kind == "nbaiot":
+            provenance.update(
                 {
-                    "relative_path": file_plan.relative_path,
-                    "byte_size": file_plan.fingerprint.byte_size,
-                    "content_sha256": file_plan.fingerprint.sha256,
-                    "logical_source_id": file_plan.logical_identity,
+                    "root": str(source.anchor),
+                    "notes": "N-BaIoT sequence_index is not a wall-clock timestamp.",
+                    "label_overrides": source.label_overrides,
                 }
-                for file_plan in plan.files
-            ],
-        },
-        "has_wall_clock_time": (
-            False
-            if source.kind == "nbaiot"
-            else bool(combined["timestamp"].notna().any())
-        ),
-    }
-    if source.kind == "nbaiot":
-        provenance.update(
-            {
-                "root": str(source.anchor),
-                "notes": "N-BaIoT sequence_index is not a wall-clock timestamp.",
-                "label_overrides": source.label_overrides,
-            }
-        )
-    elif source.kind == "botiot":
-        provenance["label_overrides"] = source.label_overrides
-    return LoadedDataset(combined, features, provenance)
+            )
+        elif source.kind == "botiot":
+            provenance["label_overrides"] = source.label_overrides
+        return LoadedDataset(combined, features, provenance)
+    finally:
+        if plan.selection is not None:
+            plan.selection.close()
