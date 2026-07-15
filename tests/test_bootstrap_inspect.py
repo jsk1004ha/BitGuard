@@ -79,6 +79,93 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertEqual(report.unique_devices, 2)
             self.assertEqual(report.device_samples, (("10.0.0.1", 1), ("10.0.0.2", 1)))
 
+    def test_botiot_classifies_realistic_columns_without_rejecting_strings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "flows.csv"
+            path.write_text(
+                "category,subcategory,saddr,stime,pkSeqID,seq,proto,daddr,sport,dport,"
+                "smac,dmac,bytes,rate,mixed,description\n"
+                "Normal,Normal,10.0.0.1,1.5,1,2,tcp,10.0.0.2,1234,80,aa,bb,100,2.0,7,ok\n"
+                "DDoS,TCP,10.0.0.3,2.5,3,4,udp,10.0.0.4,53,9999,cc,dd,200,3.0,unknown,bad\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset("botiot", root, chunk_size=1)
+
+            self.assertEqual(report.accepted_rows, 2)
+            self.assertEqual(report.rejected_rows, 0)
+            self.assertEqual(report.feature_columns, ("bytes", "mixed", "rate"))
+            self.assertEqual(report.unusable_columns, ("description", "proto"))
+            self.assertEqual(
+                report.excluded_columns,
+                (
+                    "category",
+                    "daddr",
+                    "dmac",
+                    "dport",
+                    "pkSeqID",
+                    "saddr",
+                    "seq",
+                    "smac",
+                    "sport",
+                    "stime",
+                    "subcategory",
+                ),
+            )
+            self.assertEqual(
+                report.files[0].unusable_columns, ("description", "proto")
+            )
+            self.assertEqual(
+                report.as_dict()["unusable_columns"], ["description", "proto"]
+            )
+
+    def test_drop_columns_override_is_casefolded_and_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory,saddr,stime,proto,bytes,café,rate\n"
+                "Normal,Normal,10.0.0.1,1,tcp,100,3,2.0\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                drop_columns=(
+                    " PrOtO ",
+                    "BYTES",
+                    "cafe\N{COMBINING ACUTE ACCENT}",
+                ),
+            )
+
+            self.assertEqual(report.feature_columns, ("rate",))
+            self.assertEqual(report.unusable_columns, ())
+            self.assertIn("bytes", report.excluded_columns)
+            self.assertIn("café", report.excluded_columns)
+            self.assertIn("proto", report.excluded_columns)
+
+            for invalid in ("proto", b"proto", True, ("proto", "PROTO"), ("",)):
+                with self.subTest(invalid=invalid):
+                    with self.assertRaisesRegex(ValueError, "drop_columns"):
+                        inspect_csv_dataset("botiot", root, drop_columns=invalid)  # type: ignore[arg-type]
+
+    def test_feature_schemas_are_compared_after_streaming_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = "category,subcategory,saddr,stime,proto,x\n"
+            (root / "one.csv").write_text(
+                metadata + "Normal,Normal,device-a,1,tcp,1\n", encoding="utf-8"
+            )
+            (root / "two.csv").write_text(
+                metadata + "Normal,Normal,device-b,2,17,2\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(SchemaInspectionError, "feature schema mismatch"):
+                inspect_csv_dataset("botiot", root)
+
     def test_required_columns_and_compatible_feature_schema_are_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -101,35 +188,33 @@ class SchemaInspectionTest(unittest.TestCase):
             with self.assertRaisesRegex(SchemaInspectionError, "empty CSV"):
                 inspect_csv_dataset("nbaiot", root)
 
-    def test_unparseable_numeric_row_fails_by_default_with_reason(self) -> None:
+    def test_numeric_candidates_match_coercing_adapter_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "device" ).mkdir()
             (root / "device" / "benign.csv").write_text(
                 "x,y\n1,2\nnot-a-number,4\n5,inf\n", encoding="utf-8"
             )
-            with self.assertRaisesRegex(
-                SchemaInspectionError, "2 rejected rows.*non_numeric_feature"
-            ):
-                inspect_csv_dataset("nbaiot", root, chunk_size=1)
-
-            report = inspect_csv_dataset(
-                "nbaiot", root, chunk_size=1, fail_on_rejected=False
-            )
+            report = inspect_csv_dataset("nbaiot", root, chunk_size=1)
             self.assertEqual(report.total_rows, 3)
-            self.assertEqual(report.accepted_rows, 1)
-            self.assertEqual(report.rejected_rows, 2)
-            self.assertEqual(
-                report.rejected_reasons,
-                (("non_finite_feature", 1), ("non_numeric_feature", 1)),
-            )
-            self.assertEqual(len(report.rejected_samples), 2)
+            self.assertEqual(report.accepted_rows, 3)
+            self.assertEqual(report.rejected_rows, 0)
+            self.assertEqual(report.feature_columns, ("x", "y"))
+            self.assertEqual(report.unusable_columns, ())
 
-    def test_all_missing_numeric_feature_is_unusable(self) -> None:
+    def test_all_missing_candidate_is_reported_as_unusable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "rows.csv").write_text("x,y\n1,\n2,NA\n", encoding="utf-8")
-            with self.assertRaisesRegex(SchemaInspectionError, "no finite values.*y"):
+            report = inspect_csv_dataset("nbaiot", root)
+            self.assertEqual(report.feature_columns, ("x",))
+            self.assertEqual(report.unusable_columns, ("y",))
+
+    def test_no_numeric_feature_columns_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rows.csv").write_text("x,y\nleft,right\n", encoding="utf-8")
+            with self.assertRaisesRegex(SchemaInspectionError, "no numeric feature columns"):
                 inspect_csv_dataset("nbaiot", root)
 
     def test_bad_label_device_and_timestamp_are_rejected(self) -> None:

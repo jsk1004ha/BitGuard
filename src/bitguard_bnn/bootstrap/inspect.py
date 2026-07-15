@@ -46,6 +46,9 @@ class FileSchemaReport:
     accepted_rows: int
     rejected_rows: int
     columns: tuple[str, ...]
+    feature_columns: tuple[str, ...]
+    unusable_columns: tuple[str, ...]
+    excluded_columns: tuple[str, ...]
     class_counts: tuple[tuple[str, int], ...]
 
     def as_dict(self) -> dict[str, object]:
@@ -55,6 +58,9 @@ class FileSchemaReport:
             "accepted_rows": self.accepted_rows,
             "rejected_rows": self.rejected_rows,
             "columns": list(self.columns),
+            "feature_columns": list(self.feature_columns),
+            "unusable_columns": list(self.unusable_columns),
+            "excluded_columns": list(self.excluded_columns),
             "class_counts": dict(self.class_counts),
         }
 
@@ -65,6 +71,8 @@ class SchemaInspectionReport:
     root: str
     files: tuple[FileSchemaReport, ...]
     feature_columns: tuple[str, ...]
+    unusable_columns: tuple[str, ...]
+    excluded_columns: tuple[str, ...]
     total_rows: int
     accepted_rows: int
     rejected_rows: int
@@ -80,6 +88,8 @@ class SchemaInspectionReport:
             "root": self.root,
             "files": [item.as_dict() for item in self.files],
             "feature_columns": list(self.feature_columns),
+            "unusable_columns": list(self.unusable_columns),
+            "excluded_columns": list(self.excluded_columns),
             "total_rows": self.total_rows,
             "accepted_rows": self.accepted_rows,
             "rejected_rows": self.rejected_rows,
@@ -96,6 +106,19 @@ _MISSING_NUMERIC = {"", "na", "n/a", "nan", "null", "none", "?"}
 _DEFAULT_REQUIRED = {
     "nbaiot": (),
     "botiot": ("category", "subcategory", "saddr", "stime"),
+}
+_DEFAULT_DROP_COLUMNS = {
+    "nbaiot": (),
+    "botiot": (
+        "pkSeqID",
+        "seq",
+        "saddr",
+        "daddr",
+        "sport",
+        "dport",
+        "smac",
+        "dmac",
+    ),
 }
 _CSV_FIELD_LIMIT_LOCK = threading.RLock()
 
@@ -334,7 +357,7 @@ def _header_mapping(header: Sequence[str], path: Path) -> dict[str, str]:
 
 
 def _column_key(column: str) -> str:
-    return unicodedata.normalize("NFC", column).casefold()
+    return unicodedata.normalize("NFC", column.strip()).casefold()
 
 
 def _find(mapping: dict[str, str], preferred: str | None, candidates: Iterable[str]) -> str | None:
@@ -345,17 +368,15 @@ def _find(mapping: dict[str, str], preferred: str | None, candidates: Iterable[s
     return None
 
 
-def _numeric_reason(value: str) -> str | None:
+def _numeric_convertible(value: str) -> bool:
     token = value.strip().casefold()
     if token in _MISSING_NUMERIC:
-        return None
+        return False
     try:
-        number = float(token)
+        float(token)
     except ValueError:
-        return "non_numeric_feature"
-    if not math.isfinite(number):
-        return "non_finite_feature"
-    return None
+        return False
+    return True
 
 
 def _timestamp_valid(value: str) -> bool:
@@ -376,7 +397,8 @@ def _timestamp_valid(value: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class _Schema:
     header: tuple[str, ...]
-    features: tuple[str, ...]
+    candidates: tuple[str, ...]
+    excluded: tuple[str, ...]
     label: str | None
     raw_label: str | None
     device: str | None
@@ -387,6 +409,7 @@ def _schema_for(
     dataset: str,
     header: Sequence[str],
     required: Sequence[str],
+    drop_columns: Sequence[str],
     path: Path,
 ) -> _Schema:
     mapping = _header_mapping(header, path)
@@ -399,21 +422,33 @@ def _schema_for(
         raise SchemaInspectionError(
             f"missing required columns in {path}: {sorted(missing, key=str.casefold)}"
         )
-    if dataset == "nbaiot":
-        features = tuple(sorted(header, key=str.casefold))
-        return _Schema(tuple(header), features, None, None, None, None)
-
-    label = _find(mapping, None, ("category", "label", "attack"))
-    raw_label = _find(mapping, None, ("subcategory", "attack", "category", "label"))
-    device = _find(mapping, None, ("saddr", "srcip", "device_id"))
-    timestamp = _find(mapping, None, ("stime", "timestamp", "time"))
+    label = None
+    raw_label = None
+    device = None
+    timestamp = None
+    if dataset == "botiot":
+        label = _find(mapping, None, ("category", "label", "attack"))
+        raw_label = _find(mapping, None, ("subcategory", "attack", "category", "label"))
+        device = _find(mapping, None, ("saddr", "srcip", "device_id"))
+        timestamp = _find(mapping, None, ("stime", "timestamp", "time"))
     metadata = {item for item in (label, raw_label, device, timestamp) if item is not None}
-    features = tuple(
-        sorted((column for column in header if column not in metadata), key=str.casefold)
+    drop_keys = {_column_key(column) for column in drop_columns}
+    dropped = {column for column in header if _column_key(column) in drop_keys}
+    excluded = metadata | dropped
+    candidates = tuple(
+        sorted((column for column in header if column not in excluded), key=str.casefold)
     )
-    if not features:
+    if not candidates:
         raise SchemaInspectionError(f"no numeric feature columns remain in {path}")
-    return _Schema(tuple(header), features, label, raw_label, device, timestamp)
+    return _Schema(
+        tuple(header),
+        candidates,
+        tuple(sorted(excluded, key=str.casefold)),
+        label,
+        raw_label,
+        device,
+        timestamp,
+    )
 
 
 def _nbaiot_metadata(root: Path, path: Path) -> tuple[str, str]:
@@ -468,11 +503,23 @@ def _row_reason(
             f"CSV logical record exceeds max_record_chars={max_record_chars}"
         )
     values = dict(zip(schema.header, row))
-    for feature in schema.features:
-        reason = _numeric_reason(values[feature])
-        if reason is not None:
-            return reason, values
     return None, values
+
+
+def _validated_column_option(
+    name: str,
+    value: Sequence[str] | None,
+    default: Sequence[str],
+) -> tuple[str, ...]:
+    selected: object = default if value is None else value
+    if isinstance(selected, (str, bytes, bool)) or not isinstance(selected, Sequence):
+        raise ValueError(f"{name} must be a sequence of column names")
+    if any(not isinstance(item, str) or not item.strip() for item in selected):
+        raise ValueError(f"{name} must contain only non-empty strings")
+    normalized = tuple(item.strip() for item in selected)
+    if len({_column_key(item) for item in normalized}) != len(normalized):
+        raise ValueError(f"{name} must not contain case-folded duplicates")
+    return normalized
 
 
 def _next_chunk(
@@ -497,6 +544,7 @@ def _inspect_csv_dataset_unlocked(
     source: str | os.PathLike[str],
     *,
     required_columns: Sequence[str] | None = None,
+    drop_columns: Sequence[str] | None = None,
     chunk_size: int = 10_000,
     max_record_chars: int = 1 << 20,
     fail_on_rejected: bool = True,
@@ -516,27 +564,27 @@ def _inspect_csv_dataset_unlocked(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
-    if isinstance(required_columns, (str, bytes)):
-        raise ValueError("required_columns must be a sequence of column names")
     if not isinstance(fail_on_rejected, bool):
         raise ValueError("fail_on_rejected must be a boolean")
-    required = (
-        tuple(required_columns)
-        if required_columns is not None
-        else _DEFAULT_REQUIRED[normalized_dataset]
+    required = _validated_column_option(
+        "required_columns",
+        required_columns,
+        _DEFAULT_REQUIRED[normalized_dataset],
     )
-    if any(not isinstance(item, str) or not item.strip() for item in required):
-        raise ValueError("required_columns must contain only non-empty strings")
-    if len({_column_key(item) for item in required}) != len(required):
-        raise ValueError("required_columns must not contain case-folded duplicates")
+    dropped = _validated_column_option(
+        "drop_columns",
+        drop_columns,
+        _DEFAULT_DROP_COLUMNS[normalized_dataset],
+    )
     root, paths = _discover_csvs(Path(source))
     canonical_features: tuple[str, ...] | None = None
+    unusable_columns: dict[str, str] = {}
+    excluded_columns: dict[str, str] = {}
     file_reports: list[FileSchemaReport] = []
     total_rows = 0
     accepted_rows = 0
     rejection_counts: Counter[str] = Counter()
     class_counts: Counter[str] = Counter()
-    finite_feature_counts: Counter[str] = Counter()
     samples: list[RejectedRowSample] = []
 
     with tempfile.TemporaryDirectory(prefix="bitguard-schema-") as temp_directory:
@@ -550,6 +598,7 @@ def _inspect_csv_dataset_unlocked(
                 file_accepted = 0
                 file_rejections: Counter[str] = Counter()
                 file_classes: Counter[str] = Counter()
+                file_numeric_keys: set[str] = set()
                 try:
                     bounded_lines = _BoundedLines(handle, max_record_chars)
                     reader = csv.reader(bounded_lines, strict=True)
@@ -558,16 +607,9 @@ def _inspect_csv_dataset_unlocked(
                     except StopIteration as error:
                         raise SchemaInspectionError(f"empty CSV: {path}") from error
                     bounded_lines.reset_record()
-                    schema = _schema_for(normalized_dataset, header, required, path)
-                    if canonical_features is None:
-                        canonical_features = schema.features
-                    elif {_column_key(item) for item in schema.features} != {
-                        _column_key(item) for item in canonical_features
-                    }:
-                        raise SchemaInspectionError(
-                            f"feature schema mismatch in {path}: "
-                            f"expected={list(canonical_features)}, observed={list(schema.features)}"
-                        )
+                    schema = _schema_for(
+                        normalized_dataset, header, required, dropped, path
+                    )
 
                     logical_row = 1
                     while True:
@@ -584,6 +626,9 @@ def _inspect_csv_dataset_unlocked(
                             )
                             if reason is None:
                                 assert values is not None
+                                for candidate in schema.candidates:
+                                    if _numeric_convertible(values[candidate]):
+                                        file_numeric_keys.add(_column_key(candidate))
                                 metadata = _row_metadata(
                                     normalized_dataset, values, schema, root, path
                                 )
@@ -596,10 +641,6 @@ def _inspect_csv_dataset_unlocked(
                                     file_classes[label] += 1
                                     class_counts[label] += 1
                                     chunk_devices[device] += 1
-                                    for feature in schema.features:
-                                        token = values[feature].strip().casefold()
-                                        if token not in _MISSING_NUMERIC:
-                                            finite_feature_counts[_column_key(feature)] += 1
                             if reason is not None:
                                 file_rejections[reason] += 1
                                 rejection_counts[reason] += 1
@@ -608,6 +649,29 @@ def _inspect_csv_dataset_unlocked(
                                         RejectedRowSample(relative, logical_row, reason)
                                     )
                         devices.add(chunk_devices)
+                    file_features = tuple(
+                        column
+                        for column in schema.candidates
+                        if _column_key(column) in file_numeric_keys
+                    )
+                    file_unusable = tuple(
+                        column
+                        for column in schema.candidates
+                        if _column_key(column) not in file_numeric_keys
+                    )
+                    if not file_features:
+                        raise SchemaInspectionError(
+                            f"no numeric feature columns found in {path}"
+                        )
+                    if canonical_features is None:
+                        canonical_features = file_features
+                    elif {_column_key(item) for item in file_features} != {
+                        _column_key(item) for item in canonical_features
+                    }:
+                        raise SchemaInspectionError(
+                            f"feature schema mismatch in {path}: "
+                            f"expected={list(canonical_features)}, observed={list(file_features)}"
+                        )
                 except (csv.Error, UnicodeError) as error:
                     raise SchemaInspectionError(f"cannot parse CSV {path}: {error}") from error
                 finally:
@@ -622,9 +686,16 @@ def _inspect_csv_dataset_unlocked(
                         accepted_rows=file_accepted,
                         rejected_rows=sum(file_rejections.values()),
                         columns=tuple(header),
+                        feature_columns=file_features,
+                        unusable_columns=file_unusable,
+                        excluded_columns=schema.excluded,
                         class_counts=tuple(sorted(file_classes.items())),
                     )
                 )
+                for column in file_unusable:
+                    unusable_columns.setdefault(_column_key(column), column)
+                for column in schema.excluded:
+                    excluded_columns.setdefault(_column_key(column), column)
 
             if total_rows == 0:
                 raise SchemaInspectionError("CSV dataset contains headers but no data rows")
@@ -637,21 +708,17 @@ def _inspect_csv_dataset_unlocked(
                     f"schema inspection found {rejected_rows} rejected rows: {reasons}"
                 )
             assert canonical_features is not None
-            unusable = [
-                feature
-                for feature in canonical_features
-                if not finite_feature_counts[_column_key(feature)]
-            ]
-            if accepted_rows and unusable:
-                raise SchemaInspectionError(
-                    "numeric feature columns contain no finite values: "
-                    f"{sorted(unusable, key=str.casefold)}"
-                )
             return SchemaInspectionReport(
                 dataset=normalized_dataset,
                 root=str(root),
                 files=tuple(file_reports),
                 feature_columns=canonical_features,
+                unusable_columns=tuple(
+                    sorted(unusable_columns.values(), key=str.casefold)
+                ),
+                excluded_columns=tuple(
+                    sorted(excluded_columns.values(), key=str.casefold)
+                ),
                 total_rows=total_rows,
                 accepted_rows=accepted_rows,
                 rejected_rows=rejected_rows,
@@ -670,6 +737,7 @@ def inspect_csv_dataset(
     source: str | os.PathLike[str],
     *,
     required_columns: Sequence[str] | None = None,
+    drop_columns: Sequence[str] | None = None,
     chunk_size: int = 10_000,
     max_record_chars: int = 1 << 20,
     fail_on_rejected: bool = True,
@@ -693,6 +761,7 @@ def inspect_csv_dataset(
                 dataset,
                 source,
                 required_columns=required_columns,
+                drop_columns=drop_columns,
                 chunk_size=chunk_size,
                 max_record_chars=max_record_chars,
                 fail_on_rejected=fail_on_rejected,
