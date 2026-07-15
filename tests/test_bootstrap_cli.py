@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import os
@@ -14,8 +15,13 @@ from dataclasses import FrozenInstanceError
 from io import StringIO
 from pathlib import Path
 
-from bitguard_bnn.bootstrap.cli import options_from_namespace, parse_bootstrap_options
+from bitguard_bnn.bootstrap.cli import (
+    add_bootstrap_arguments,
+    options_from_namespace,
+    parse_bootstrap_options,
+)
 from bitguard_bnn.bootstrap.registry import load_registry
+from bitguard_bnn.bootstrap.state import STAGE_ORDER
 from bitguard_bnn.cli import _build_parser, main
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -120,6 +126,15 @@ class BootstrapRegistryTest(unittest.TestCase):
 
 
 class BootstrapOptionsTest(unittest.TestCase):
+    def test_restart_stage_choices_use_canonical_state_order(self):
+        parser = argparse.ArgumentParser()
+        add_bootstrap_arguments(parser)
+        restart_action = next(
+            action for action in parser._actions if action.dest == "restart_stage"
+        )
+
+        self.assertIs(restart_action.choices, STAGE_ORDER)
+
     def test_full_all_requires_botiot_source_and_license(self):
         with self.assertRaisesRegex(ValueError, "botiot-source"):
             parse_bootstrap_options(["--full", "--dataset", "all"])

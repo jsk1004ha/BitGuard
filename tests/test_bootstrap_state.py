@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import bitguard_bnn.bootstrap.state as bootstrap_state
 from bitguard_bnn.bootstrap.state import (
     LOCK_FORMAT_VERSION,
     STATE_FORMAT_VERSION,
@@ -21,32 +22,6 @@ from bitguard_bnn.bootstrap.state import (
 
 
 FIXED_TIME = datetime(2026, 7, 14, 4, 30, tzinfo=timezone.utc)
-
-
-class _FailingTextStream:
-    def __init__(self, stream, operation: str) -> None:
-        self._stream = stream
-        self._operation = operation
-
-    def __enter__(self):
-        self._stream.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        return self._stream.__exit__(exc_type, exc, traceback)
-
-    def write(self, value: str) -> int:
-        if self._operation == "write":
-            raise OSError("simulated state write failure")
-        return self._stream.write(value)
-
-    def flush(self) -> None:
-        if self._operation == "flush":
-            raise OSError("simulated state flush failure")
-        self._stream.flush()
-
-    def fileno(self) -> int:
-        return self._stream.fileno()
 
 
 class BootstrapStateStoreTest(unittest.TestCase):
@@ -192,107 +167,114 @@ class BootstrapStateStoreTest(unittest.TestCase):
                 with self.assertRaisesRegex(BootstrapStateError, "state"):
                     BootstrapStateStore(self.state_path)
 
-    def test_persistence_flushes_and_atomically_replaces_sibling_temp_file(self):
+    def test_state_rejects_control_characters_in_stored_output_paths(self):
+        for unsafe_path in ("archive\x00.zip", "archive\n.zip", "archive\x7f.zip"):
+            with self.subTest(path=unsafe_path):
+                self.state_path.write_text(
+                    json.dumps(
+                        {
+                            "version": STATE_FORMAT_VERSION,
+                            "stages": {
+                                "acquire": {
+                                    "input_signature": "input-a",
+                                    "outputs": [
+                                        {
+                                            "path": unsafe_path,
+                                            "size": 1,
+                                            "sha256": "0" * 64,
+                                        }
+                                    ],
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(BootstrapStateError, "unsafe.*path"):
+                    BootstrapStateStore(self.state_path)
+
+    def test_path_resolution_value_error_is_wrapped_as_state_error(self):
+        store = BootstrapStateStore(self.state_path)
+        output = self.output("archive.zip")
+
+        with patch.object(
+            Path,
+            "resolve",
+            autospec=True,
+            side_effect=ValueError("embedded null character"),
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "regular file"):
+                store.complete("acquire", "input-a", [output])
+
+    def test_persistence_fsyncs_file_then_replaces_then_fsyncs_parent(self):
         output = self.output("archive.zip")
         store = BootstrapStateStore(self.state_path)
+        events: list[str] = []
+        real_fsync = os.fsync
+        real_replace = Path.replace
 
         with (
             patch(
                 "bitguard_bnn.bootstrap.state.Path.replace",
                 autospec=True,
-                side_effect=lambda source, target: os.replace(source, target),
-            ) as replace,
+                side_effect=lambda source, target: (
+                    events.append("replace"),
+                    real_replace(source, target),
+                )[1],
+            ),
             patch(
                 "bitguard_bnn.bootstrap.state.os.fsync",
-                wraps=os.fsync,
-            ) as fsync,
+                side_effect=lambda descriptor: (
+                    events.append("file-fsync"),
+                    real_fsync(descriptor),
+                )[1],
+            ),
+            patch(
+                "bitguard_bnn.bootstrap.state._fsync_parent_directory",
+                side_effect=lambda _path: events.append("directory-fsync"),
+            ),
         ):
             store.complete("acquire", "input-a", [output])
 
-        replace.assert_called_once_with(self.root / "state.json.tmp", self.state_path)
-        fsync.assert_called_once()
+        self.assertEqual(events, ["file-fsync", "replace", "directory-fsync"])
         self.assertFalse((self.root / "state.json.tmp").exists())
 
-    def test_failed_atomic_replace_preserves_previous_state_and_cleans_temp(self):
-        archive = self.output("archive.zip")
-        inspection = self.output("inspection.json")
+    def test_state_temp_uses_restrictive_exclusive_nofollow_flags(self):
+        output = self.output("archive.zip")
         store = BootstrapStateStore(self.state_path)
-        store.complete("acquire", "input-a", [archive])
-        previous_bytes = self.state_path.read_bytes()
-
-        with patch(
-            "bitguard_bnn.bootstrap.state.Path.replace",
-            side_effect=OSError("simulated replace failure"),
-        ):
-            with self.assertRaisesRegex(BootstrapStateError, "persist"):
-                store.complete("inspect", "input-b", [inspection])
-
-        self.assertEqual(self.state_path.read_bytes(), previous_bytes)
-        self.assertEqual(store.completed_stages, ("acquire",))
-        self.assertEqual(
-            BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
-        )
-        self.assertFalse((self.root / "state.json.tmp").exists())
-
-    def _assert_temp_stream_failure_preserves_previous_state(
-        self, operation: str
-    ) -> None:
-        archive = self.output("archive.zip")
-        inspection = self.output("inspection.json")
-        store = BootstrapStateStore(self.state_path)
-        store.complete("acquire", "input-a", [archive])
-        previous_bytes = self.state_path.read_bytes()
         temporary = self.root / "state.json.tmp"
-        real_open = Path.open
+        real_open = os.open
+        calls: list[tuple[int, int]] = []
 
-        def open_with_failure(path, *args, **kwargs):
-            stream = real_open(path, *args, **kwargs)
-            if path == temporary:
-                return _FailingTextStream(stream, operation)
-            return stream
+        def recording_open(path, flags, mode=0o777):
+            if Path(path) == temporary:
+                calls.append((flags, mode))
+            return real_open(path, flags, mode)
 
-        with patch.object(
-            Path,
-            "open",
-            autospec=True,
-            side_effect=open_with_failure,
-        ):
-            with self.assertRaisesRegex(BootstrapStateError, "persist"):
-                store.complete("inspect", "input-b", [inspection])
+        with patch("bitguard_bnn.bootstrap.state.os.open", side_effect=recording_open):
+            store.complete("acquire", "input-a", [output])
 
-        self.assertEqual(self.state_path.read_bytes(), previous_bytes)
-        self.assertEqual(store.completed_stages, ("acquire",))
-        self.assertEqual(
-            BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
-        )
-        self.assertFalse(temporary.exists())
+        self.assertEqual(len(calls), 1)
+        flags, mode = calls[0]
+        required_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        self.assertEqual(flags & required_flags, required_flags)
+        self.assertEqual(mode, 0o600)
+        if hasattr(os, "O_NOFOLLOW"):
+            self.assertTrue(flags & os.O_NOFOLLOW)
 
-    def test_failed_state_write_preserves_previous_state_and_cleans_temp(self):
-        self._assert_temp_stream_failure_preserves_previous_state("write")
-
-    def test_failed_state_flush_preserves_previous_state_and_cleans_temp(self):
-        self._assert_temp_stream_failure_preserves_previous_state("flush")
-
-    def test_failed_state_fsync_preserves_previous_state_and_cleans_temp(self):
-        archive = self.output("archive.zip")
-        inspection = self.output("inspection.json")
+    def test_preexisting_state_temp_collision_is_preserved_without_clobber(self):
+        output = self.output("archive.zip")
         store = BootstrapStateStore(self.state_path)
-        store.complete("acquire", "input-a", [archive])
-        previous_bytes = self.state_path.read_bytes()
+        temporary = self.root / "state.json.tmp"
+        hostile_bytes = b"pre-existing contender"
+        temporary.write_bytes(hostile_bytes)
 
-        with patch(
-            "bitguard_bnn.bootstrap.state.os.fsync",
-            side_effect=OSError("simulated state fsync failure"),
-        ):
-            with self.assertRaisesRegex(BootstrapStateError, "persist"):
-                store.complete("inspect", "input-b", [inspection])
+        with self.assertRaisesRegex(BootstrapStateError, "temporary.*exists.*inspect"):
+            store.complete("acquire", "input-a", [output])
 
-        self.assertEqual(self.state_path.read_bytes(), previous_bytes)
-        self.assertEqual(store.completed_stages, ("acquire",))
-        self.assertEqual(
-            BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
-        )
-        self.assertFalse((self.root / "state.json.tmp").exists())
+        self.assertEqual(temporary.read_bytes(), hostile_bytes)
+        self.assertFalse(self.state_path.exists())
 
     def test_restart_invalidates_stage_and_dependants(self):
         store = BootstrapStateStore(self.state_path)
@@ -316,6 +298,222 @@ class BootstrapStateStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(BootstrapStateError, "canonical stage order"):
             store.invalidate_from("extract", ("acquire", "extract", "inspect"))
 
+    def test_preexisting_state_temp_symlink_is_not_followed_or_removed(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        temporary = self.root / "state.json.tmp"
+        target = self.root / "hostile-target"
+        target.write_bytes(b"do not modify")
+        try:
+            temporary.symlink_to(target)
+        except OSError as error:
+            self.skipTest(f"symlink creation unavailable: {error}")
+
+        with self.assertRaisesRegex(BootstrapStateError, "temporary.*exists.*inspect"):
+            store.complete("acquire", "input-a", [output])
+
+        self.assertTrue(temporary.is_symlink())
+        self.assertEqual(target.read_bytes(), b"do not modify")
+
+    def test_partial_state_writes_are_completed(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        real_write = os.write
+        write_sizes: list[int] = []
+
+        def partial_write(descriptor: int, data: bytes) -> int:
+            chunk = data[:7]
+            write_sizes.append(len(chunk))
+            return real_write(descriptor, chunk)
+
+        with patch("bitguard_bnn.bootstrap.state.os.write", side_effect=partial_write):
+            store.complete("acquire", "input-a", [output])
+
+        self.assertGreater(len(write_sizes), 1)
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages,
+            ("acquire",),
+        )
+
+    def test_zero_progress_state_write_preserves_previous_state_and_cleans_temp(self):
+        self._assert_descriptor_failure_preserves_previous_state(
+            "write",
+            patch("bitguard_bnn.bootstrap.state.os.write", return_value=0),
+        )
+
+    def test_failed_atomic_replace_preserves_previous_state_and_cleans_temp(self):
+        archive = self.output("archive.zip")
+        inspection = self.output("inspection.json")
+        store = BootstrapStateStore(self.state_path)
+        store.complete("acquire", "input-a", [archive])
+        previous_bytes = self.state_path.read_bytes()
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.Path.replace",
+            side_effect=OSError("simulated replace failure"),
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "persist"):
+                store.complete("inspect", "input-b", [inspection])
+
+        self.assertEqual(self.state_path.read_bytes(), previous_bytes)
+        self.assertEqual(store.completed_stages, ("acquire",))
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
+        )
+        self.assertFalse((self.root / "state.json.tmp").exists())
+
+    def _assert_descriptor_failure_preserves_previous_state(
+        self, operation: str, failure_patch
+    ) -> None:
+        archive = self.output("archive.zip")
+        inspection = self.output("inspection.json")
+        store = BootstrapStateStore(self.state_path)
+        store.complete("acquire", "input-a", [archive])
+        previous_bytes = self.state_path.read_bytes()
+        temporary = self.root / "state.json.tmp"
+        with failure_patch:
+            with self.assertRaisesRegex(BootstrapStateError, operation):
+                store.complete("inspect", "input-b", [inspection])
+
+        self.assertEqual(self.state_path.read_bytes(), previous_bytes)
+        self.assertEqual(store.completed_stages, ("acquire",))
+        self.assertEqual(
+            BootstrapStateStore(self.state_path).completed_stages, ("acquire",)
+        )
+        self.assertFalse(temporary.exists())
+
+    def test_failed_state_write_preserves_previous_state_and_cleans_temp(self):
+        self._assert_descriptor_failure_preserves_previous_state(
+            "write",
+            patch(
+                "bitguard_bnn.bootstrap.state.os.write",
+                side_effect=OSError("simulated state write failure"),
+            ),
+        )
+
+    def test_failed_state_fsync_preserves_previous_state_and_cleans_temp(self):
+        self._assert_descriptor_failure_preserves_previous_state(
+            "fsync",
+            patch(
+                "bitguard_bnn.bootstrap.state.os.fsync",
+                side_effect=OSError("simulated state fsync failure"),
+            ),
+        )
+
+    def test_failed_state_close_preserves_previous_state_and_cleans_temp(self):
+        real_close = os.close
+        failed = False
+
+        def close_then_fail_once(descriptor: int) -> None:
+            nonlocal failed
+            real_close(descriptor)
+            if not failed:
+                failed = True
+                raise OSError("simulated state close failure")
+
+        self._assert_descriptor_failure_preserves_previous_state(
+            "close",
+            patch(
+                "bitguard_bnn.bootstrap.state.os.close",
+                side_effect=close_then_fail_once,
+            ),
+        )
+
+    def test_failed_state_identity_check_fails_closed_and_preserves_temp(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        temporary = self.root / "state.json.tmp"
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.fstat",
+            side_effect=OSError("simulated state fstat failure"),
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "identity.*inspect"):
+                store.complete("acquire", "input-a", [output])
+
+        self.assertTrue(temporary.exists())
+        self.assertFalse(self.state_path.exists())
+
+    def test_failed_cleanup_does_not_delete_replacement_temp(self):
+        output = self.output("archive.zip")
+        store = BootstrapStateStore(self.state_path)
+        temporary = self.root / "state.json.tmp"
+        hostile = self.root / "hostile.tmp"
+        hostile_bytes = b"late contender"
+        hostile.write_bytes(hostile_bytes)
+        real_close = os.close
+        failed = False
+
+        def close_replace_then_fail(descriptor: int) -> None:
+            nonlocal failed
+            real_close(descriptor)
+            if not failed:
+                failed = True
+                os.replace(hostile, temporary)
+                raise OSError("simulated close race")
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.close",
+            side_effect=close_replace_then_fail,
+        ):
+            with self.assertRaisesRegex(BootstrapStateError, "close"):
+                store.complete("acquire", "input-a", [output])
+
+        self.assertEqual(temporary.read_bytes(), hostile_bytes)
+        self.assertFalse(self.state_path.exists())
+
+
+class ParentDirectoryFsyncTest(unittest.TestCase):
+    def test_posix_parent_directory_is_opened_fsynced_and_closed(self):
+        parent = Path("parent")
+        expected_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        with (
+            patch.object(bootstrap_state, "_DIRECTORY_FSYNC_SUPPORTED", True),
+            patch("bitguard_bnn.bootstrap.state.os.open", return_value=71) as open_,
+            patch("bitguard_bnn.bootstrap.state.os.fsync") as fsync,
+            patch("bitguard_bnn.bootstrap.state.os.close") as close,
+        ):
+            bootstrap_state._fsync_parent_directory(parent / "state.json")
+
+        open_.assert_called_once_with(parent, expected_flags)
+        fsync.assert_called_once_with(71)
+        close.assert_called_once_with(71)
+
+    def test_parent_directory_open_fsync_and_close_failures_are_not_swallowed(self):
+        cases = ("open", "fsync", "close")
+        for operation in cases:
+            with self.subTest(operation=operation):
+                with (
+                    patch.object(bootstrap_state, "_DIRECTORY_FSYNC_SUPPORTED", True),
+                    patch(
+                        "bitguard_bnn.bootstrap.state.os.open",
+                        return_value=72,
+                        side_effect=OSError("open failed") if operation == "open" else None,
+                    ),
+                    patch(
+                        "bitguard_bnn.bootstrap.state.os.fsync",
+                        side_effect=OSError("fsync failed") if operation == "fsync" else None,
+                    ),
+                    patch(
+                        "bitguard_bnn.bootstrap.state.os.close",
+                        side_effect=OSError("close failed") if operation == "close" else None,
+                    ) as close,
+                ):
+                    with self.assertRaisesRegex(OSError, operation):
+                        bootstrap_state._fsync_parent_directory(Path("parent/state.json"))
+                if operation == "fsync":
+                    close.assert_called_once_with(72)
+
+    def test_windows_directory_fsync_unavailability_is_explicit_noop(self):
+        with (
+            patch.object(bootstrap_state, "_DIRECTORY_FSYNC_SUPPORTED", False),
+            patch("bitguard_bnn.bootstrap.state.os.open") as open_,
+            patch("bitguard_bnn.bootstrap.state.os.fsync") as fsync,
+        ):
+            bootstrap_state._fsync_parent_directory(Path("parent/state.json"))
+
+        open_.assert_not_called()
+        fsync.assert_not_called()
 
 class BootstrapWriterLockTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -384,6 +582,170 @@ class BootstrapWriterLockTest(unittest.TestCase):
             self.assertEqual(metadata["nonce"], "new-owner")
 
         self.assertFalse(self.lock_path.exists())
+
+    def test_fstat_failure_closes_descriptor_and_preserves_unverified_lock(self):
+        lock = self.lock()
+        real_close = os.close
+
+        with (
+            patch(
+                "bitguard_bnn.bootstrap.state.os.fstat",
+                side_effect=OSError("simulated lock fstat failure"),
+            ),
+            patch(
+                "bitguard_bnn.bootstrap.state.os.close",
+                side_effect=real_close,
+            ) as close,
+        ):
+            with self.assertRaisesRegex(
+                BootstrapLockError, "identity.*inspection"
+            ):
+                lock.acquire()
+
+        close.assert_called_once()
+        self.assertTrue(self.lock_path.exists())
+        self.assertFalse(lock.release())
+
+    def test_partial_lock_writes_are_completed(self):
+        lock = self.lock()
+        real_write = os.write
+        writes = 0
+
+        def partial_write(descriptor: int, data: bytes) -> int:
+            nonlocal writes
+            writes += 1
+            return real_write(descriptor, data[:5])
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.write",
+            side_effect=partial_write,
+        ):
+            lock.acquire()
+
+        self.assertGreater(writes, 1)
+        self.assertTrue(lock.release())
+
+    def test_zero_progress_lock_write_closes_and_cleans_created_lock(self):
+        lock = self.lock()
+        real_close = os.close
+
+        with (
+            patch("bitguard_bnn.bootstrap.state.os.write", return_value=0),
+            patch(
+                "bitguard_bnn.bootstrap.state.os.close",
+                side_effect=real_close,
+            ) as close,
+        ):
+            with self.assertRaisesRegex(BootstrapLockError, "write.*no progress"):
+                lock.acquire()
+
+        self.assertGreaterEqual(close.call_count, 1)
+        self.assertFalse(self.lock_path.exists())
+        self.assertFalse(lock.release())
+
+    def test_lock_fsync_failure_closes_and_cleans_created_lock(self):
+        lock = self.lock()
+        real_close = os.close
+
+        with (
+            patch(
+                "bitguard_bnn.bootstrap.state.os.fsync",
+                side_effect=OSError("simulated lock fsync failure"),
+            ),
+            patch(
+                "bitguard_bnn.bootstrap.state.os.close",
+                side_effect=real_close,
+            ) as close,
+        ):
+            with self.assertRaisesRegex(BootstrapLockError, "fsync"):
+                lock.acquire()
+
+        self.assertGreaterEqual(close.call_count, 1)
+        self.assertFalse(self.lock_path.exists())
+        self.assertFalse(lock.release())
+
+    def test_lock_close_failure_does_not_mark_owned_and_cleans_created_lock(self):
+        lock = self.lock()
+        real_close = os.close
+        failed = False
+
+        def close_then_fail_once(descriptor: int) -> None:
+            nonlocal failed
+            real_close(descriptor)
+            if not failed:
+                failed = True
+                raise OSError("simulated lock close failure")
+
+        with patch(
+            "bitguard_bnn.bootstrap.state.os.close",
+            side_effect=close_then_fail_once,
+        ):
+            with self.assertRaisesRegex(BootstrapLockError, "close"):
+                lock.acquire()
+
+        self.assertFalse(self.lock_path.exists())
+        self.assertFalse(lock.release())
+
+    def test_lock_cleanup_failure_is_reported_without_raw_oserror(self):
+        lock = self.lock()
+
+        with (
+            patch(
+                "bitguard_bnn.bootstrap.state.os.write",
+                side_effect=OSError("simulated lock write failure"),
+            ),
+            patch.object(
+                lock,
+                "_discard_created_lock",
+                side_effect=BootstrapLockError("simulated safe cleanup failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                BootstrapLockError, "write.*safe cleanup.*failed"
+            ):
+                lock.acquire()
+
+        self.assertTrue(self.lock_path.exists())
+        self.assertFalse(lock.release())
+
+    def test_lock_quarantine_close_failure_is_wrapped_as_cleanup_error(self):
+        lock = self.lock()
+        real_close = os.close
+        close_count = 0
+
+        def fail_reservation_close(descriptor: int) -> None:
+            nonlocal close_count
+            close_count += 1
+            real_close(descriptor)
+            if close_count == 2:
+                raise OSError("simulated quarantine close failure")
+
+        with (
+            patch(
+                "bitguard_bnn.bootstrap.state.os.write",
+                side_effect=OSError("simulated lock write failure"),
+            ),
+            patch(
+                "bitguard_bnn.bootstrap.state.os.close",
+                side_effect=fail_reservation_close,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                BootstrapLockError, "safe cleanup.*quarantine.*close"
+            ):
+                lock.acquire()
+
+        self.assertTrue(self.lock_path.exists())
+        self.assertFalse(lock.release())
+
+    def test_same_lock_object_can_release_repeatedly_and_reacquire(self):
+        lock = self.lock()
+
+        lock.acquire()
+        self.assertTrue(lock.release())
+        self.assertFalse(lock.release())
+        lock.acquire()
+        self.assertTrue(lock.release())
 
     def test_active_same_host_lock_is_refused(self):
         self.write_lock(pid=303)

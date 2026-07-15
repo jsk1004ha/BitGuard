@@ -4,21 +4,11 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+from .state import STAGE_ORDER
 from .types import BootstrapOptions
 
 DATASETS = ("nbaiot", "botiot")
 COMPUTE_PROFILES = ("auto", "cpu", "cu118", "cu124")
-STAGES = (
-    "preflight",
-    "environment",
-    "acquire",
-    "extract",
-    "inspect",
-    "shard",
-    "validate",
-    "train",
-    "summarize",
-)
 
 
 def add_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
@@ -36,7 +26,7 @@ def add_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--compute", choices=COMPUTE_PROFILES, default="auto")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--install-system-tools", action="store_true")
-    parser.add_argument("--restart-stage", choices=STAGES)
+    parser.add_argument("--restart-stage", choices=STAGE_ORDER)
 
 
 def _selected_datasets(full: bool, requested: list[str] | None) -> tuple[str, ...]:

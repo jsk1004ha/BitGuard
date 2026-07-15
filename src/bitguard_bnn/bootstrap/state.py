@@ -29,6 +29,7 @@ STAGE_ORDER = (
     "train",
     "summarize",
 )
+_DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
 
 
 class BootstrapStateError(RuntimeError):
@@ -37,6 +38,48 @@ class BootstrapStateError(RuntimeError):
 
 class BootstrapLockError(RuntimeError):
     """Exclusive bootstrap writer ownership cannot be established safely."""
+
+
+def _exclusive_write_flags() -> int:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    return flags | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _write_all(descriptor: int, payload: bytes, subject: str) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError(f"{subject} write made no progress")
+        offset += written
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    """Durably commit a replaced directory entry where the platform permits it."""
+
+    # CPython on Windows cannot open directories through os.open, so there is no
+    # standard-library directory descriptor that can be passed to os.fsync.
+    if not _DIRECTORY_FSYNC_SUPPORTED:
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path.parent, flags)
+    sync_error: OSError | None = None
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        sync_error = error
+    try:
+        os.close(descriptor)
+    except OSError as close_error:
+        if sync_error is not None:
+            raise OSError(
+                f"directory fsync failed: {sync_error}; directory close failed: "
+                f"{close_error}"
+            ) from sync_error
+        raise
+    if sync_error is not None:
+        raise sync_error
 
 
 class BootstrapStateStore:
@@ -141,7 +184,7 @@ class BootstrapStateStore:
             candidate = self.root / candidate
         try:
             resolved = candidate.resolve(strict=True)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             raise BootstrapStateError(
                 f"Bootstrap output {candidate} must exist and be a regular file."
             ) from error
@@ -286,6 +329,7 @@ class BootstrapStateStore:
             or any(part in {"", ".", ".."} for part in relative.parts)
             or "\\" in path
             or ":" in path
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in path)
         ):
             raise BootstrapStateError(
                 f"Bootstrap state stage {stage!r} has an unsafe relative state path."
@@ -315,26 +359,196 @@ class BootstrapStateStore:
             indent=2,
             sort_keys=True,
         ) + "\n"
+        encoded = serialized.encode("utf-8")
         temporary = self.path.with_name(f"{self.path.name}.tmp")
         try:
-            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-                stream.write(serialized)
-                stream.flush()
-                os.fsync(stream.fileno())
-            temporary.replace(self.path)
+            descriptor = os.open(temporary, _exclusive_write_flags(), 0o600)
+        except FileExistsError as error:
+            raise BootstrapStateError(
+                f"Bootstrap state temporary file {temporary} already exists; it "
+                "was not modified or removed; inspect the competing or interrupted "
+                "writer and remove the file only when safe."
+            ) from error
         except OSError as error:
-            cleanup_error: OSError | None = None
+            raise BootstrapStateError(
+                f"Could not create bootstrap state temporary file {temporary}: "
+                f"{error}."
+            ) from error
+
+        identity: tuple[int, int] | None = None
+        operation = "identity"
+        failure: OSError | None = None
+        try:
+            identity = _stat_identity(os.fstat(descriptor))
+            operation = "write"
+            _write_all(descriptor, encoded, "state temporary file")
+            operation = "fsync"
+            os.fsync(descriptor)
+        except OSError as error:
+            failure = error
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if failure is None:
+                operation = "close"
+                failure = error
+            else:
+                operation = f"{operation}/close"
+                failure = OSError(f"{failure}; close also failed: {error}")
+
+        if failure is not None:
+            if identity is None:
+                raise BootstrapStateError(
+                    f"Could not establish the identity of created bootstrap state "
+                    f"temporary file {temporary}: {failure}; the file is preserved "
+                    "for inspection because this writer cannot prove it still owns "
+                    "the path."
+                ) from failure
+            cleanup_error: BootstrapStateError | None = None
             try:
-                temporary.unlink(missing_ok=True)
-            except OSError as caught:
-                cleanup_error = caught
+                self._discard_owned_temporary(temporary, identity)
+            except BootstrapStateError as error:
+                cleanup_error = error
             detail = (
-                f"; temporary-file cleanup also failed: {cleanup_error}"
-                if cleanup_error
+                f"; safe temporary-file cleanup also failed: {cleanup_error}"
+                if cleanup_error is not None
                 else ""
             )
             raise BootstrapStateError(
-                f"Could not persist bootstrap state {self.path}: {error}{detail}."
+                f"Could not persist bootstrap state {self.path} during {operation}: "
+                f"{failure}{detail}."
+            ) from failure
+
+        try:
+            temporary.replace(self.path)
+        except OSError as error:
+            cleanup_error: BootstrapStateError | None = None
+            try:
+                self._discard_owned_temporary(temporary, identity)
+            except BootstrapStateError as caught:
+                cleanup_error = caught
+            detail = (
+                f"; safe temporary-file cleanup also failed: {cleanup_error}"
+                if cleanup_error is not None
+                else ""
+            )
+            raise BootstrapStateError(
+                f"Could not persist bootstrap state {self.path} during replace: "
+                f"{error}{detail}."
+            ) from error
+
+        try:
+            _fsync_parent_directory(self.path)
+        except OSError as error:
+            raise BootstrapStateError(
+                f"Bootstrap state {self.path} was replaced, but its parent "
+                f"directory could not be made durable: {error}. The new state may "
+                "already be visible; inspect it before retrying."
+            ) from error
+
+    def _discard_owned_temporary(
+        self, temporary: Path, expected_identity: tuple[int, int]
+    ) -> None:
+        quarantine = self._reserve_state_quarantine(temporary)
+        try:
+            os.replace(temporary, quarantine)
+        except FileNotFoundError:
+            try:
+                quarantine.unlink()
+            except OSError as error:
+                raise BootstrapStateError(
+                    f"Created state temporary {temporary} disappeared, and reserved "
+                    f"quarantine {quarantine} could not be cleaned: {error}."
+                ) from error
+            return
+        except OSError as error:
+            try:
+                quarantine.unlink()
+            except OSError as cleanup_error:
+                raise BootstrapStateError(
+                    f"Cannot quarantine state temporary {temporary}: {error}; "
+                    f"reserved quarantine {quarantine} also could not be cleaned: "
+                    f"{cleanup_error}."
+                ) from error
+            raise BootstrapStateError(
+                f"Cannot quarantine state temporary {temporary}: {error}."
+            ) from error
+
+        try:
+            quarantined_identity = _stat_identity(
+                quarantine.stat(follow_symlinks=False)
+            )
+        except OSError as error:
+            self._restore_state_quarantine(
+                quarantine, temporary, "unverifiable temporary cleanup"
+            )
+            raise BootstrapStateError(
+                f"Cannot verify quarantined state temporary {quarantine}: {error}; "
+                "it was restored without deletion."
+            ) from error
+
+        if quarantined_identity != expected_identity:
+            self._restore_state_quarantine(
+                quarantine, temporary, "changed temporary cleanup candidate"
+            )
+            return
+
+        try:
+            quarantine.unlink()
+        except OSError as error:
+            self._restore_state_quarantine(
+                quarantine, temporary, "failed temporary cleanup"
+            )
+            raise BootstrapStateError(
+                f"Cannot clean created state temporary {temporary}: {error}; it "
+                "was restored without deletion."
+            ) from error
+
+    @staticmethod
+    def _reserve_state_quarantine(temporary: Path) -> Path:
+        for _attempt in range(16):
+            quarantine = temporary.with_name(
+                f".{temporary.name}.{uuid.uuid4().hex}.quarantine"
+            )
+            try:
+                descriptor = os.open(quarantine, _exclusive_write_flags(), 0o600)
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise BootstrapStateError(
+                    f"Cannot reserve a quarantine for state temporary {temporary}: "
+                    f"{error}."
+                ) from error
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise BootstrapStateError(
+                    f"Cannot close reserved state quarantine {quarantine}: {error}; "
+                    "inspect and remove it only when safe."
+                ) from error
+            return quarantine
+        raise BootstrapStateError(
+            f"Cannot reserve a unique quarantine for state temporary {temporary}; "
+            "inspect sibling quarantine files before retrying."
+        )
+
+    @staticmethod
+    def _restore_state_quarantine(
+        quarantine: Path, temporary: Path, reason: str
+    ) -> None:
+        try:
+            os.link(quarantine, temporary, follow_symlinks=False)
+        except OSError as error:
+            raise BootstrapStateError(
+                f"Cannot safely restore state temporary {temporary} after {reason}: "
+                f"{error}; quarantine {quarantine} is preserved for inspection."
+            ) from error
+        try:
+            quarantine.unlink()
+        except OSError as error:
+            raise BootstrapStateError(
+                f"State temporary {temporary} was restored after {reason}, but "
+                f"quarantine {quarantine} could not be removed: {error}."
             ) from error
 
 
@@ -411,31 +625,47 @@ class BootstrapWriterLock:
                 f"Cannot create bootstrap writer lock {self.path}: {error}."
             ) from error
 
-        identity = _stat_identity(os.fstat(descriptor))
+        identity: tuple[int, int] | None = None
+        operation = "identity"
+        failure: OSError | None = None
         try:
-            offset = 0
-            while offset < len(serialized):
-                written = os.write(descriptor, serialized[offset:])
-                if written <= 0:
-                    raise OSError("lock write made no progress")
-                offset += written
+            identity = _stat_identity(os.fstat(descriptor))
+            operation = "write"
+            _write_all(descriptor, serialized, "lock")
+            operation = "fsync"
             os.fsync(descriptor)
         except OSError as error:
-            try:
-                os.close(descriptor)
-            finally:
-                try:
-                    self._discard_created_lock(identity)
-                except BootstrapLockError as cleanup_error:
-                    raise BootstrapLockError(
-                        f"Cannot write bootstrap writer lock {self.path}: {error}; "
-                        f"safe cleanup also failed: {cleanup_error}"
-                    ) from error
-            raise BootstrapLockError(
-                f"Cannot write bootstrap writer lock {self.path}: {error}."
-            ) from error
-        else:
+            failure = error
+        try:
             os.close(descriptor)
+        except OSError as error:
+            if failure is None:
+                operation = "close"
+                failure = error
+            else:
+                operation = f"{operation}/close"
+                failure = OSError(f"{failure}; close also failed: {error}")
+
+        if failure is not None:
+            self._clear_ownership()
+            if identity is None:
+                raise BootstrapLockError(
+                    f"Cannot establish the identity of created bootstrap writer "
+                    f"lock {self.path}: {failure}; the created lock is preserved "
+                    "and requires inspection because this process cannot prove it "
+                    "still owns the path."
+                ) from failure
+            try:
+                self._discard_created_lock(identity)
+            except BootstrapLockError as cleanup_error:
+                raise BootstrapLockError(
+                    f"Cannot {operation} bootstrap writer lock {self.path}: "
+                    f"{failure}; safe cleanup also failed: {cleanup_error}"
+                ) from failure
+            raise BootstrapLockError(
+                f"Cannot {operation} bootstrap writer lock {self.path}: {failure}."
+            ) from failure
+
         self._owned_metadata = metadata
         self._owned_identity = identity
         return self
@@ -665,7 +895,13 @@ class BootstrapWriterLock:
                     f"Cannot reserve a sibling quarantine for bootstrap writer lock "
                     f"{self.path}: {error}."
                 ) from error
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise BootstrapLockError(
+                    f"Cannot close reserved sibling quarantine {quarantine}: "
+                    f"{error}; inspect and remove it only when safe."
+                ) from error
             return quarantine
         raise BootstrapLockError(
             f"Cannot reserve a unique sibling quarantine for bootstrap writer lock "
