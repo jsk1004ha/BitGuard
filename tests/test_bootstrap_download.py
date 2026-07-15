@@ -168,6 +168,83 @@ class DownloadFileTest(unittest.TestCase):
         self.assertFalse(result.resumed)
         self.assertTrue(result.restarted)
 
+    def test_restart_validates_opened_inode_before_truncating(self) -> None:
+        prefix = PAYLOAD[:79]
+        winner = b"foreign replacement must remain byte-identical"
+        displaced = self.root / "displaced-original.partial"
+        replacement = self.root / "foreign-replacement.partial"
+        self.partial.write_bytes(prefix)
+        replacement.write_bytes(winner)
+        real_open = download_module.os.open
+        substituted = False
+
+        def substitute_before_open(path: object, flags: int, mode: int = 0o777) -> int:
+            nonlocal substituted
+            if (
+                not substituted
+                and Path(path) == self.partial
+                and flags & os.O_WRONLY
+            ):
+                substituted = True
+                self.partial.replace(displaced)
+                replacement.replace(self.partial)
+            return real_open(path, flags, mode)
+
+        with _RangeServer(mode="ignore-range") as server:
+            with patch.object(download_module.os, "open", side_effect=substitute_before_open):
+                with self.assertRaisesRegex(DownloadError, "changed|identity"):
+                    download_file(server.url, self.destination)
+
+        self.assertTrue(substituted)
+        self.assertEqual(self.partial.read_bytes(), winner)
+        self.assertEqual(displaced.read_bytes(), prefix)
+        self.assertFalse(self.destination.exists())
+
+    def test_restart_does_not_follow_a_partial_symlink_substitution(self) -> None:
+        prefix = PAYLOAD[:67]
+        winner = b"outside file must never be truncated"
+        outside = self.root / "outside-restart-target"
+        probe = self.root / "symlink-privilege-probe"
+        outside.write_bytes(winner)
+        try:
+            probe.symlink_to(outside)
+            probe.unlink()
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+
+        displaced = self.root / "displaced-symlink-original.partial"
+        self.partial.write_bytes(prefix)
+        real_open = download_module.os.open
+        substituted = False
+
+        def substitute_symlink_before_open(
+            path: object, flags: int, mode: int = 0o777
+        ) -> int:
+            nonlocal substituted
+            if (
+                not substituted
+                and Path(path) == self.partial
+                and flags & os.O_WRONLY
+            ):
+                substituted = True
+                self.partial.replace(displaced)
+                self.partial.symlink_to(outside)
+            return real_open(path, flags, mode)
+
+        with _RangeServer(mode="ignore-range") as server:
+            with patch.object(
+                download_module.os,
+                "open",
+                side_effect=substitute_symlink_before_open,
+            ):
+                with self.assertRaises(DownloadError):
+                    download_file(server.url, self.destination)
+
+        self.assertTrue(substituted)
+        self.assertEqual(outside.read_bytes(), winner)
+        self.assertEqual(displaced.read_bytes(), prefix)
+        self.assertFalse(self.destination.exists())
+
     def test_invalid_content_range_never_appends_or_publishes(self) -> None:
         prefix = PAYLOAD[:53]
         self.partial.write_bytes(prefix)
@@ -270,12 +347,41 @@ class DownloadFileTest(unittest.TestCase):
         self.assertEqual(set(reads), {64})
         self.assertEqual(self.destination.read_bytes(), PAYLOAD)
 
+    def test_path_substitution_after_streaming_is_not_hashed_or_published(self) -> None:
+        winner = b"F" * len(PAYLOAD)
+        replacement = self.root / "post-stream-replacement"
+        displaced = self.root / "completed-owned-partial"
+        replacement.write_bytes(winner)
+        real_stream_response = download_module._stream_response
+
+        def substitute_after_stream(*args: object, **kwargs: object):
+            result = real_stream_response(*args, **kwargs)
+            self.partial.replace(displaced)
+            replacement.replace(self.partial)
+            return result
+
+        with _RangeServer() as server:
+            with patch.object(
+                download_module,
+                "_stream_response",
+                side_effect=substitute_after_stream,
+            ):
+                with self.assertRaisesRegex(DownloadError, "changed|identity"):
+                    download_file(server.url, self.destination)
+
+        self.assertEqual(self.partial.read_bytes(), winner)
+        self.assertEqual(displaced.read_bytes(), PAYLOAD)
+        self.assertFalse(self.destination.exists())
+
     def test_concurrent_final_is_never_overwritten(self) -> None:
         winner = b"other verified writer"
+        real_link = download_module.os.link
 
         def concurrent_publish(source: object, target: object) -> None:
-            Path(target).write_bytes(winner)
-            raise FileExistsError(str(target))
+            if Path(target) == self.destination:
+                Path(target).write_bytes(winner)
+                raise FileExistsError(str(target))
+            real_link(source, target)
 
         with _RangeServer() as server:
             with patch.object(download_module.os, "link", side_effect=concurrent_publish):
@@ -284,6 +390,32 @@ class DownloadFileTest(unittest.TestCase):
 
         self.assertEqual(self.destination.read_bytes(), winner)
         self.assertEqual(self.partial.read_bytes(), PAYLOAD)
+
+    def test_publish_never_links_a_substituted_partial_inode(self) -> None:
+        winner = b"P" * len(PAYLOAD)
+        replacement = self.root / "publish-replacement"
+        displaced = self.root / "verified-owned-partial"
+        replacement.write_bytes(winner)
+        real_link = download_module.os.link
+        substituted = False
+
+        def substitute_before_link(source: object, target: object) -> None:
+            nonlocal substituted
+            if not substituted and Path(source) == self.partial:
+                substituted = True
+                self.partial.replace(displaced)
+                replacement.replace(self.partial)
+            real_link(source, target)
+
+        with _RangeServer() as server:
+            with patch.object(download_module.os, "link", side_effect=substitute_before_link):
+                with self.assertRaisesRegex(DownloadError, "changed|identity"):
+                    download_file(server.url, self.destination)
+
+        self.assertTrue(substituted)
+        self.assertEqual(self.partial.read_bytes(), winner)
+        self.assertEqual(displaced.read_bytes(), PAYLOAD)
+        self.assertFalse(self.destination.exists())
 
     def test_valid_416_complete_partial_publishes_and_incomplete_retries_once(self) -> None:
         self.partial.write_bytes(PAYLOAD)
@@ -398,6 +530,39 @@ class SourceManifestTest(unittest.TestCase):
                 with self.assertRaisesRegex(SourceManifestError, "symlink"):
                     self.official_manifest()
             link.unlink()
+
+    def test_ancestor_directory_swap_before_hashing_is_rejected(self) -> None:
+        external = self.root.parent / "external-source"
+        external.mkdir()
+        (external / "a.csv").write_bytes(b"external-a")
+        (external / "b.csv").write_bytes(b"external-b")
+        probe = self.root.parent / "directory-symlink-probe"
+        try:
+            probe.symlink_to(external, target_is_directory=True)
+            probe.unlink()
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+
+        real_enumerate = manifest_module._enumerate_files
+        original_nested = self.root / "nested"
+        displaced_nested = self.root / "nested-before-swap"
+
+        def swap_ancestor_after_enumeration(root: Path):
+            records = real_enumerate(root)
+            original_nested.replace(displaced_nested)
+            original_nested.symlink_to(external, target_is_directory=True)
+            return records
+
+        with patch.object(
+            manifest_module,
+            "_enumerate_files",
+            side_effect=swap_ancestor_after_enumeration,
+        ):
+            with self.assertRaisesRegex(
+                SourceManifestError,
+                "ancestor|directory|changed|symlink",
+            ):
+                self.official_manifest()
 
     def test_official_nbaiot_metadata_and_url_are_validated(self) -> None:
         spec = self.registry["nbaiot"]

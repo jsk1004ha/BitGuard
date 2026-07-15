@@ -229,33 +229,128 @@ def _validate_acquisition_metadata(
 
 
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
-    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+    )
 
 
-def _hash_file(path: Path) -> str:
+def _directory_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectoryPin:
+    path: Path
+    identity: tuple[int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _EnumeratedFile:
+    relative_path: str
+    path: Path
+    identity: tuple[int, int, int, int]
+    ancestors: tuple[_DirectoryPin, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceEnumeration:
+    files: tuple[_EnumeratedFile, ...]
+    root: _DirectoryPin
+
+
+def _lstat_directory(path: Path, *, subject: str) -> os.stat_result:
+    try:
+        current = path.lstat()
+    except OSError as error:
+        raise SourceManifestError(
+            f"Cannot inspect {subject} directory {path}: {error}."
+        ) from error
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+        raise SourceManifestError(
+            f"{subject.capitalize()} directory {path} became a symlink or non-directory."
+        )
+    return current
+
+
+def _validate_ancestor_chain(
+    ancestors: tuple[_DirectoryPin, ...], relative_path: str
+) -> None:
+    for ancestor in ancestors:
+        current = _lstat_directory(ancestor.path, subject="source ancestor")
+        if _directory_identity(current) != ancestor.identity:
+            raise SourceManifestError(
+                f"Source ancestor directory {ancestor.path} changed identity while "
+                f"processing {relative_path}."
+            )
+
+
+def _validate_enumerated_file(record: _EnumeratedFile, *, phase: str) -> None:
+    try:
+        current = record.path.lstat()
+    except OSError as error:
+        raise SourceManifestError(
+            f"Source file {record.relative_path} changed {phase}: {error}."
+        ) from error
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+        raise SourceManifestError(
+            f"Source file {record.relative_path} became a symlink or non-regular file {phase}."
+        )
+    if _file_identity(current) != record.identity:
+        raise SourceManifestError(
+            f"Source file {record.relative_path} changed identity {phase}."
+        )
+
+
+def _hash_file(
+    path: Path,
+) -> tuple[str, tuple[int, int, int, int]]:
     digest = hashlib.sha256()
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
         with os.fdopen(descriptor, "rb", buffering=0) as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            opened_before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened_before.st_mode):
                 raise SourceManifestError(f"Source file {path} is not regular.")
+            opened_identity = _file_identity(opened_before)
             while True:
                 chunk = stream.read(_HASH_CHUNK_SIZE)
                 if not chunk:
                     break
                 digest.update(chunk)
+            if _file_identity(os.fstat(stream.fileno())) != opened_identity:
+                raise SourceManifestError(f"Source file {path} changed while hashing.")
     except SourceManifestError:
         raise
     except OSError as error:
         raise SourceManifestError(f"Cannot hash source file {path}: {error}.") from error
-    return digest.hexdigest()
+    return digest.hexdigest(), opened_identity
 
 
-def _enumerate_files(root: Path) -> tuple[tuple[str, Path], ...]:
-    collected: list[tuple[str, Path]] = []
+def _enumerate_files(root: Path) -> _SourceEnumeration:
+    collected: list[_EnumeratedFile] = []
 
-    def visit(directory: Path, parts: tuple[str, ...]) -> None:
+    def visit(
+        directory: Path,
+        parts: tuple[str, ...],
+        parents: tuple[_DirectoryPin, ...],
+        expected_identity: tuple[int, int, int] | None = None,
+    ) -> _DirectoryPin:
+        directory_stat = _lstat_directory(directory, subject="source ancestor")
+        directory_identity = _directory_identity(directory_stat)
+        if expected_identity is not None and directory_identity != expected_identity:
+            raise SourceManifestError(
+                f"Source ancestor directory {directory} changed before enumeration."
+            )
+        current_pin = _DirectoryPin(directory, directory_identity)
+        ancestors = (*parents, current_pin)
         try:
             with os.scandir(directory) as iterator:
                 entries = sorted(iterator, key=lambda entry: entry.name)
@@ -266,13 +361,29 @@ def _enumerate_files(root: Path) -> tuple[tuple[str, Path], ...]:
         for entry in entries:
             relative_parts = (*parts, entry.name)
             relative = PurePosixPath(*relative_parts).as_posix()
-            if entry.is_symlink():
-                raise SourceManifestError(f"Source tree contains forbidden symlink {relative}.")
+            entry_path = directory / entry.name
             try:
-                if entry.is_dir(follow_symlinks=False):
-                    visit(Path(entry.path), relative_parts)
-                elif entry.is_file(follow_symlinks=False):
-                    collected.append((relative, Path(entry.path)))
+                entry_stat = entry_path.lstat()
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise SourceManifestError(
+                        f"Source tree contains forbidden symlink {relative}."
+                    )
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    visit(
+                        entry_path,
+                        relative_parts,
+                        ancestors,
+                        _directory_identity(entry_stat),
+                    )
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    collected.append(
+                        _EnumeratedFile(
+                            relative_path=relative,
+                            path=entry_path,
+                            identity=_file_identity(entry_stat),
+                            ancestors=ancestors,
+                        )
+                    )
                 else:
                     raise SourceManifestError(
                         f"Source tree entry {relative} is not a regular file or directory."
@@ -282,13 +393,16 @@ def _enumerate_files(root: Path) -> tuple[tuple[str, Path], ...]:
                     f"Cannot inspect source entry {relative}: {error}."
                 ) from error
 
-    visit(root, ())
-    normalized = tuple(relative for relative, _path in collected)
+        _validate_ancestor_chain((current_pin,), directory.as_posix())
+        return current_pin
+
+    root_pin = visit(root, (), ())
+    normalized = tuple(record.relative_path for record in collected)
     if len(normalized) != len(set(normalized)):
         raise SourceManifestError("Source tree contains duplicate normalized relative paths.")
     if normalized != tuple(sorted(normalized)):
-        collected.sort(key=lambda item: item[0])
-    return tuple(collected)
+        collected.sort(key=lambda record: record.relative_path)
+    return _SourceEnumeration(tuple(collected), root_pin)
 
 
 def _manifest_content_digest(value: Mapping[str, object]) -> str:
@@ -321,24 +435,31 @@ def build_source_manifest(
     if stat.S_ISLNK(root_lstat.st_mode) or not stat.S_ISDIR(root_lstat.st_mode):
         raise SourceManifestError("Source root must be a regular non-symlink directory.")
     root = raw_root.resolve(strict=True)
+    resolved_root_stat = _lstat_directory(root, subject="source root")
+    if _directory_identity(resolved_root_stat) != _directory_identity(root_lstat):
+        raise SourceManifestError("Source root changed identity while it was resolved.")
+    enumeration = _enumerate_files(root)
+    if enumeration.root.identity != _directory_identity(root_lstat):
+        raise SourceManifestError("Source root changed identity during enumeration.")
     records: list[SourceFileRecord] = []
-    for relative, path in _enumerate_files(root):
-        try:
-            before = path.stat(follow_symlinks=False)
-        except OSError as error:
-            raise SourceManifestError(f"Cannot stat source file {relative}: {error}.") from error
-        if not stat.S_ISREG(before.st_mode):
-            raise SourceManifestError(f"Source file {relative} is not regular.")
-        digest = _hash_file(path)
-        try:
-            after = path.stat(follow_symlinks=False)
-        except OSError as error:
+    for source_file in enumeration.files:
+        _validate_ancestor_chain(source_file.ancestors, source_file.relative_path)
+        _validate_enumerated_file(source_file, phase="before hashing")
+        digest, opened_identity = _hash_file(source_file.path)
+        if opened_identity != source_file.identity:
             raise SourceManifestError(
-                f"Source file {relative} changed while hashing: {error}."
-            ) from error
-        if _file_identity(before) != _file_identity(after):
-            raise SourceManifestError(f"Source file {relative} changed while hashing.")
-        records.append(SourceFileRecord(relative, before.st_size, digest))
+                f"Source file {source_file.relative_path} opened a different inode while hashing."
+            )
+        _validate_ancestor_chain(source_file.ancestors, source_file.relative_path)
+        _validate_enumerated_file(source_file, phase="after hashing")
+        records.append(
+            SourceFileRecord(
+                source_file.relative_path,
+                source_file.identity[2],
+                digest,
+            )
+        )
+    _validate_ancestor_chain((enumeration.root,), root.as_posix())
     total_bytes = sum(record.byte_size for record in records)
     provisional = SourceManifest(
         dataset_name=spec.name,

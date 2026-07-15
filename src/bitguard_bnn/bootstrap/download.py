@@ -7,6 +7,7 @@ import http.client
 import os
 import re
 import stat
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,12 @@ class DownloadResult:
             "source_url": self.source_url,
             "final_response_url": self.final_response_url,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamResult:
+    received: int
+    identity: tuple[int, int]
 
 
 def sanitize_url(value: str) -> str:
@@ -112,26 +119,48 @@ def _lstat_regular(path: Path, *, allow_absent: bool) -> os.stat_result | None:
     return value
 
 
-def _hash_file(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> tuple[int, str]:
+def _file_identity(value: os.stat_result) -> tuple[int, int]:
+    return (value.st_dev, value.st_ino)
+
+
+def _require_path_identity(
+    path: Path, expected: tuple[int, int], *, subject: str
+) -> os.stat_result:
+    current = _lstat_regular(path, allow_absent=False)
+    assert current is not None
+    if _file_identity(current) != expected:
+        raise DownloadError(
+            f"{subject} {path} changed identity; refusing to hash or publish another file."
+        )
+    return current
+
+
+def _hash_file(
+    path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE
+) -> tuple[int, str, tuple[int, int]]:
     digest = hashlib.sha256()
     size = 0
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
         with os.fdopen(descriptor, "rb", buffering=0) as stream:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            opened_stat = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened_stat.st_mode):
                 raise DownloadError(f"Download path {path} is no longer a regular file.")
+            opened_identity = _file_identity(opened_stat)
             while True:
                 chunk = stream.read(chunk_size)
                 if not chunk:
                     break
                 size += len(chunk)
                 digest.update(chunk)
+            if _file_identity(os.fstat(stream.fileno())) != opened_identity:
+                raise DownloadError(f"Download path {path} changed identity while hashing.")
     except DownloadError:
         raise
     except OSError as error:
         raise DownloadError(f"Cannot hash download file {path}: {error}.") from error
-    return size, digest.hexdigest()
+    return size, digest.hexdigest(), opened_identity
 
 
 def _parse_content_length(headers: Any) -> int | None:
@@ -202,29 +231,34 @@ def _open_partial(path: Path, *, append: bool, known_stat: os.stat_result | None
     flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     if append:
         flags |= os.O_APPEND
-    else:
-        flags |= os.O_TRUNC
     if known_stat is None:
         flags |= os.O_CREAT | os.O_EXCL
+    descriptor: int | None = None
     try:
         descriptor = os.open(path, flags, 0o600)
         opened_stat = os.fstat(descriptor)
         if not stat.S_ISREG(opened_stat.st_mode):
             raise DownloadError(f"Partial download {path} is not a regular file.")
-        if known_stat is not None and (
-            opened_stat.st_dev,
-            opened_stat.st_ino,
-        ) != (known_stat.st_dev, known_stat.st_ino):
+        if known_stat is not None and _file_identity(opened_stat) != _file_identity(
+            known_stat
+        ):
             raise DownloadError(f"Partial download {path} changed before it was opened.")
-        return os.fdopen(descriptor, "ab" if append else "wb", buffering=0)
+        if not append:
+            os.ftruncate(descriptor, 0)
+        identity = _file_identity(opened_stat)
+        stream = os.fdopen(descriptor, "ab" if append else "wb", buffering=0)
+        descriptor = None
+        return stream, identity
     except DownloadError:
-        try:
-            os.close(descriptor)
-        except (OSError, UnboundLocalError):
-            pass
         raise
     except OSError as error:
         raise DownloadError(f"Cannot safely open partial download {path}: {error}.") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _stream_response(
@@ -234,9 +268,11 @@ def _stream_response(
     append: bool,
     known_stat: os.stat_result | None,
     chunk_size: int,
-) -> int:
+) -> _StreamResult:
     received = 0
-    stream = _open_partial(partial, append=append, known_stat=known_stat)
+    stream, opened_identity = _open_partial(
+        partial, append=append, known_stat=known_stat
+    )
     failure: BaseException | None = None
     try:
         while True:
@@ -253,6 +289,10 @@ def _stream_response(
             received += len(chunk)
         stream.flush()
         os.fsync(stream.fileno())
+        if _file_identity(os.fstat(stream.fileno())) != opened_identity:
+            raise DownloadError(
+                f"Partial download {partial} changed identity while streaming."
+            )
     except Exception as error:
         failure = error
         try:
@@ -274,24 +314,78 @@ def _stream_response(
             f"The download response ended unsuccessfully; resumable content remains at "
             f"{partial}: {failure}."
         ) from failure
-    return received
+    return _StreamResult(received=received, identity=opened_identity)
 
 
-def _publish_partial(partial: Path, destination: Path) -> None:
-    partial_stat = _lstat_regular(partial, allow_absent=False)
-    assert partial_stat is not None
+def _unlink_private_candidate(candidate: Path, expected: tuple[int, int]) -> None:
     try:
-        os.link(partial, destination)
+        current = candidate.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise DownloadError(f"Cannot inspect private publish link {candidate}: {error}.") from error
+    if _file_identity(current) != expected:
+        raise DownloadError(
+            f"Private publish link {candidate} changed identity and was preserved."
+        )
+    try:
+        candidate.unlink()
+    except OSError as error:
+        raise DownloadError(f"Cannot remove private publish link {candidate}: {error}.") from error
+
+
+def _pin_partial_for_publication(
+    partial: Path, expected: tuple[int, int]
+) -> Path:
+    for _attempt in range(16):
+        candidate = partial.with_name(f".{partial.name}.{uuid.uuid4().hex}.publish")
+        try:
+            os.link(partial, candidate)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise DownloadError(
+                f"Cannot pin verified partial {partial} for publication: {error}."
+            ) from error
+        candidate_stat = _lstat_regular(candidate, allow_absent=False)
+        assert candidate_stat is not None
+        candidate_identity = _file_identity(candidate_stat)
+        if candidate_identity != expected:
+            _unlink_private_candidate(candidate, candidate_identity)
+            raise DownloadError(
+                f"Verified partial {partial} changed identity before publication; "
+                "the replacement was not published."
+            )
+        return candidate
+    raise DownloadError(f"Cannot reserve a private publish link for {partial}.")
+
+
+def _publish_partial(
+    partial: Path, destination: Path, expected_identity: tuple[int, int]
+) -> None:
+    _require_path_identity(partial, expected_identity, subject="Verified partial")
+    candidate = _pin_partial_for_publication(partial, expected_identity)
+    try:
+        os.link(candidate, destination)
     except FileExistsError as error:
+        _unlink_private_candidate(candidate, expected_identity)
         raise DownloadError(
             f"Download destination {destination} already exists, possibly from a concurrent "
             f"publisher; the verified partial remains at {partial}."
         ) from error
     except OSError as error:
+        _unlink_private_candidate(candidate, expected_identity)
         raise DownloadError(
             f"Cannot atomically publish verified partial {partial} without overwriting "
             f"{destination}: {error}."
         ) from error
+    final_stat = _lstat_regular(destination, allow_absent=False)
+    assert final_stat is not None
+    if _file_identity(final_stat) != expected_identity:
+        raise DownloadError(
+            f"Download destination {destination} was not linked from the verified identity; "
+            f"private link {candidate} was preserved for inspection."
+        )
     try:
         _fsync_parent_directory(destination)
     except OSError as error:
@@ -301,17 +395,8 @@ def _publish_partial(partial: Path, destination: Path) -> None:
         ) from error
 
     try:
-        current = partial.lstat()
-        final = destination.lstat()
-        identity = (partial_stat.st_dev, partial_stat.st_ino)
-        if (current.st_dev, current.st_ino) != identity or (
-            final.st_dev,
-            final.st_ino,
-        ) != identity:
-            raise DownloadError(
-                f"Download {destination} was published, but owned partial {partial} changed; "
-                "it was preserved for inspection."
-            )
+        _unlink_private_candidate(candidate, expected_identity)
+        _require_path_identity(partial, expected_identity, subject="Owned partial")
         partial.unlink()
         _fsync_parent_directory(destination)
     except DownloadError:
@@ -350,7 +435,12 @@ def download_file(
                 f"Download destination {target} already exists; provide a persisted expected "
                 "hash before trusting or reusing it."
             )
-        size, digest = _hash_file(target, chunk_size)
+        size, digest, hashed_identity = _hash_file(target, chunk_size)
+        if hashed_identity != _file_identity(final_stat):
+            raise DownloadError(
+                f"Existing download {target} changed identity before it could be reused."
+            )
+        _require_path_identity(target, hashed_identity, subject="Existing download")
         if digest != expected_sha256:
             raise DownloadError(
                 f"Existing download {target} does not match the expected SHA-256 and will "
@@ -374,6 +464,7 @@ def download_file(
     response_url: str | None = None
     expected_total: int | None = None
     resumed = False
+    verified_identity = _file_identity(partial_stat) if partial_stat is not None else None
 
     while True:
         request_offset = 0 if retry_without_range else offset
@@ -434,17 +525,19 @@ def download_file(
                     expected_body = _parse_content_length(response.headers)
                     expected_total = expected_body
                     append = False
-                received = _stream_response(
+                stream_result = _stream_response(
                     response,
                     partial,
                     append=append,
                     known_stat=partial_stat,
                     chunk_size=chunk_size,
                 )
-                if expected_body is not None and received != expected_body:
+                verified_identity = stream_result.identity
+                if expected_body is not None and stream_result.received != expected_body:
                     raise DownloadError(
                         f"HTTP response length mismatch for {safe_source}: expected "
-                        f"{expected_body} bytes but received {received}; resumable content "
+                        f"{expected_body} bytes but received {stream_result.received}; "
+                        "resumable content "
                         f"remains at {partial}."
                     )
             break
@@ -456,20 +549,28 @@ def download_file(
                 f"remains at {partial}: {type(error).__name__}."
             ) from error
 
-    partial_stat = _lstat_regular(partial, allow_absent=False)
-    assert partial_stat is not None
+    if verified_identity is None:
+        raise DownloadError(f"Partial download {partial} has no verified file identity.")
+    partial_stat = _require_path_identity(
+        partial, verified_identity, subject="Completed partial"
+    )
     if expected_total is not None and partial_stat.st_size != expected_total:
         raise DownloadError(
             f"Complete partial size mismatch for {safe_source}: expected {expected_total} bytes "
             f"but have {partial_stat.st_size}; the partial was not published."
         )
-    size, digest = _hash_file(partial, chunk_size)
+    size, digest, hashed_identity = _hash_file(partial, chunk_size)
+    if hashed_identity != verified_identity:
+        raise DownloadError(
+            f"Completed partial {partial} changed identity before hashing."
+        )
+    _require_path_identity(partial, verified_identity, subject="Hashed partial")
     if expected_sha256 is not None and digest != expected_sha256:
         raise DownloadError(
             f"Downloaded content SHA-256 does not match the expected SHA-256; verified "
             f"publication was refused and {partial} remains resumable."
         )
-    _publish_partial(partial, target)
+    _publish_partial(partial, target, verified_identity)
     return DownloadResult(
         destination=str(target),
         byte_size=size,
