@@ -13,6 +13,7 @@ from unittest.mock import patch
 import yaml
 import pandas as pd
 import numpy as np
+import pyarrow.parquet as pq
 
 from bitguard_bnn.bootstrap.inspect import inspect_csv_dataset
 from bitguard_bnn.bootstrap.manifest import build_source_manifest, write_source_manifest
@@ -65,6 +66,20 @@ def _write_botiot(root: Path) -> None:
             f"{'Normal' if benign else 'DDoS'},"
             f"{'Normal' if benign else 'TCP'},10.0.0.{index % 4 + 1},"
             f"{index + 0.5},{100 + index},{1.0 + index / 10}\n"
+        )
+    (root / "flows.csv").write_text("".join(rows), encoding="utf-8")
+
+
+def _write_botiot_with_validation_only_boolean(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    rows = ["category,subcategory,saddr,stime,bytes,rate\n"]
+    for index in range(40):
+        benign = index % 2 == 0
+        rate = "" if index < 28 else str(1000.0 + index)
+        rows.append(
+            f"{'Normal' if benign else 'DDoS'},"
+            f"{'Normal' if benign else 'TCP'},10.0.0.{index % 4 + 1},"
+            f"{index + 0.5},{100 + index},{rate}\n"
         )
     (root / "flows.csv").write_text("".join(rows), encoding="utf-8")
 
@@ -221,6 +236,88 @@ class FullDatasetPreparationTests(unittest.TestCase):
                 shard.write_bytes(original[:-1] + bytes([original[-1] ^ 0xFF]))
                 with self.assertRaisesRegex(RuntimeError, "checksum"):
                     verify_prepared_dataset(first.descriptor_path)
+
+    def test_boolean_availability_comes_from_source_not_train_usable_features(self) -> None:
+        from bitguard_bnn.out_of_core.prepare import (
+            prepare_full_dataset,
+            verify_prepared_dataset,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw"
+            _write_botiot_with_validation_only_boolean(raw)
+            source_manifest, schema_report = _source_contract("botiot", raw, root)
+            template = root / "configs" / "full" / "botiot.yaml"
+            template.parent.mkdir(parents=True)
+            payload = yaml.safe_load(
+                (
+                    Path(__file__).resolve().parents[1]
+                    / "configs"
+                    / "full"
+                    / "botiot.yaml"
+                ).read_text(encoding="utf-8")
+            )
+            payload["dataset"]["record_batch_rows"] = 4
+            payload["dataset"]["shard_target_rows"] = 3
+            payload["dataset"]["quantile_sketch_capacity"] = 64
+            payload["preprocess"].update(
+                {
+                    "feature_budget": 1,
+                    "selection": "expert",
+                    "expert_features": ["bytes"],
+                }
+            )
+            payload["cascade"].update(
+                {
+                    "boolean_fast_path_enabled": True,
+                    "boolean_fast_path_features": ["rate", "absent_feature"],
+                }
+            )
+            template.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+            prepared = prepare_full_dataset(
+                template,
+                raw_root=raw,
+                source_manifest_path=source_manifest,
+                schema_report_path=schema_report,
+                output_dir=root / "prepared",
+                descriptor_path=root / "control" / "botiot.json",
+                work_dir=root / "work",
+            )
+            manifest = json.loads(
+                Path(prepared.shard_manifest_path).read_text(encoding="utf-8")
+            )
+            expected_boolean = {
+                "configured_features": ["rate", "absent_feature"],
+                "available_features": ["rate"],
+                "missing_features": ["absent_feature"],
+            }
+            self.assertEqual(manifest["selected_features"], ["bytes"])
+            self.assertEqual(manifest["materialized_features"], ["bytes", "rate"])
+            self.assertEqual(manifest["boolean_fast_path"], expected_boolean)
+            feature = json.loads(
+                Path(prepared.feature_manifest_path).read_text(encoding="utf-8")
+            )
+            self.assertEqual(feature["source_feature_order"], ["bytes", "rate"])
+            self.assertEqual(feature["boolean_fast_path"], expected_boolean)
+            from bitguard_bnn.preprocess import FeaturePreprocessor
+
+            processor = FeaturePreprocessor.load(prepared.preprocessor_path)
+            self.assertNotIn("rate", processor.candidate_features)
+            heldout = [
+                Path(prepared.shard_manifest_path).parent / entry["path"]
+                for entry in manifest["entries"]
+                if entry["split"] in {"validation", "test"}
+            ]
+            rates = np.concatenate(
+                [
+                    pq.read_table(path, columns=["rate"])["rate"].to_numpy()
+                    for path in heldout
+                ]
+            )
+            self.assertTrue(np.isfinite(rates).all())
+            self.assertEqual(prepared, verify_prepared_dataset(prepared.descriptor_path))
 
     def test_fixed_descriptor_rejects_conflicting_work_identity(self) -> None:
         from bitguard_bnn.out_of_core.prepare import prepare_full_dataset

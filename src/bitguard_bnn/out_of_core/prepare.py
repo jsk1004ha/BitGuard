@@ -41,9 +41,9 @@ from bitguard_bnn.out_of_core.source import (
 from bitguard_bnn.preprocess import FeaturePreprocessor
 
 
-PREPARED_DATASET_SCHEMA = "bitguard.prepared-dataset.v3"
-FEATURE_ARTIFACT_SCHEMA = "bitguard.streaming-feature-artifact.v2"
-PREPARATION_ALGORITHM = "bitguard.full-dataset-preparation.v3"
+PREPARED_DATASET_SCHEMA = "bitguard.prepared-dataset.v4"
+FEATURE_ARTIFACT_SCHEMA = "bitguard.streaming-feature-artifact.v3"
+PREPARATION_ALGORITHM = "bitguard.full-dataset-preparation.v4"
 
 _PARTITIONS = ("train", "validation", "test")
 _MEMBERSHIP_COLUMNS = ("row_uid", "split", "behavior_label")
@@ -623,6 +623,7 @@ def _feature_artifact(
         "split_fingerprint": split_fingerprint,
         "preprocessor_sha256": preprocessor_sha256,
         "feature_manifest": processor.feature_manifest(),
+        "source_feature_order": list(materialization["source_feature_order"]),
         "materialized_features": list(materialization["materialized_features"]),
         "boolean_fast_path": {
             "configured_features": list(materialization["configured_features"]),
@@ -636,7 +637,9 @@ def _feature_artifact(
 
 
 def _materialization_contract(
-    processor: FeaturePreprocessor, config: Mapping[str, Any]
+    processor: FeaturePreprocessor,
+    config: Mapping[str, Any],
+    source_features: Sequence[str],
 ) -> dict[str, list[str]]:
     configured = (
         [str(name) for name in config["cascade"].get("boolean_fast_path_features", ())]
@@ -647,12 +650,21 @@ def _materialization_contract(
         raise ValueError(
             "cascade.boolean_fast_path_features must contain unique non-empty names"
         )
-    candidates = set(processor.candidate_features)
-    available = [name for name in configured if name in candidates]
-    missing = [name for name in configured if name not in candidates]
+    source_feature_order = [str(name) for name in source_features]
+    if (
+        any(not name for name in source_feature_order)
+        or len(set(source_feature_order)) != len(source_feature_order)
+    ):
+        raise RuntimeError("normalized source feature order is invalid")
+    source_feature_set = set(source_feature_order)
+    if not set(processor.candidate_features).issubset(source_feature_set):
+        raise RuntimeError("preprocessor candidates are absent from normalized source")
+    available = [name for name in configured if name in source_feature_set]
+    missing = [name for name in configured if name not in source_feature_set]
     materialized = list(processor.selected_features)
     materialized.extend(name for name in available if name not in materialized)
     return {
+        "source_feature_order": source_feature_order,
         "materialized_features": materialized,
         "configured_features": configured,
         "available_features": available,
@@ -745,7 +757,7 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
         raise RuntimeError("prepared resolved config shard manifest mismatch")
     if Path(prepared.output_dir).resolve() != Path(prepared.shard_manifest_path).resolve().parent:
         raise RuntimeError("prepared output directory mismatch")
-    _validate_source_contract_against_disk(prepared)
+    _source_manifest, source_schema = _validate_source_contract_against_disk(prepared)
 
     split = SplitPlan(
         strategy=str(config["split"]["strategy"]),
@@ -775,7 +787,8 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
     if _sha256_file(preprocessor_path) != prepared.preprocessor_sha256:
         raise RuntimeError("prepared preprocessor checksum mismatch")
     processor = FeaturePreprocessor.load(preprocessor_path)
-    materialization = _materialization_contract(processor, config)
+    source_features = tuple(str(name) for name in source_schema["feature_columns"])
+    materialization = _materialization_contract(processor, config, source_features)
     feature_payload = _read_json(
         Path(prepared.feature_manifest_path), "feature manifest"
     )
@@ -791,6 +804,8 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
         or feature_payload.get("preprocessor_sha256") != prepared.preprocessor_sha256
         or canonical_json_bytes(feature_payload.get("feature_manifest"))
         != canonical_json_bytes(processor.feature_manifest())
+        or feature_payload.get("source_feature_order")
+        != materialization["source_feature_order"]
         or feature_payload.get("scientific_fingerprint")
         != _feature_artifact(
             processor,
@@ -982,11 +997,15 @@ def prepare_full_dataset(
                 source_proof_fingerprint=source.proof.fingerprint,
                 split_fingerprint=split.fingerprint,
                 preprocessor_sha256=preprocessor_sha,
-                materialization=_materialization_contract(processor, config),
+                materialization=_materialization_contract(
+                    processor, config, source.proof.feature_names
+                ),
             )
             _publish_json_immutable(feature_manifest_path, feature_payload)
             preprocessing_fingerprint = str(feature_payload["fingerprint"])
-            materialization = _materialization_contract(processor, config)
+            materialization = _materialization_contract(
+                processor, config, source.proof.feature_names
+            )
             shards = write_parquet_shards(
                 source.iter_chunks(),
                 split,
