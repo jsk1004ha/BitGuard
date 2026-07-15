@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import heapq
+import json
 import os
 import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterator, Mapping, Sequence
@@ -23,12 +25,32 @@ import pyarrow.parquet as pq
 import torch
 
 from bitguard_bnn.out_of_core.prepare import PreparedDataset, verify_prepared_dataset
-from bitguard_bnn.out_of_core.shard import load_shard_manifest
+from bitguard_bnn.out_of_core.manifest import stable_fingerprint
+from bitguard_bnn.out_of_core.shard import SHARD_MANIFEST_SCHEMA
 from bitguard_bnn.preprocess import FeaturePreprocessor
 
 
 DATASET_ALGORITHM = "bitguard.deterministic-parquet-dataset.v1"
 _PARTITIONS = frozenset({"train", "validation", "test"})
+_MANIFEST_SEMANTIC_FIELDS = (
+    "schema_version",
+    "dataset",
+    "preprocessing_fingerprint",
+    "split_fingerprint",
+    "selected_features",
+    "materialized_features",
+    "boolean_fast_path",
+    "counts",
+    "class_counts",
+    "source_coverage",
+    "coverage",
+    "shard_contract",
+    "schema",
+    "schema_fingerprint",
+    "algorithm_versions",
+    "entries",
+    "resource_usage",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,11 +70,29 @@ class DataCursor:
 
 
 @dataclass(frozen=True, slots=True)
+class _PinnedFileIdentity:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    modified_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class _ShardEntry:
     path: str
     fingerprint: str
     rows: int
     label: str
+    row_group_rows: tuple[int, ...] = ()
+    identity: _PinnedFileIdentity | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RowGroupChunk:
+    position: int
+    row_groups: tuple[int, ...]
+    rows: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +204,128 @@ def _is_link_like(path: Path) -> bool:
     return bool(callable(is_junction) and is_junction())
 
 
+def _file_identity(value: os.stat_result) -> _PinnedFileIdentity:
+    return _PinnedFileIdentity(
+        device=int(value.st_dev),
+        inode=int(value.st_ino),
+        mode=stat.S_IFMT(value.st_mode),
+        size=int(value.st_size),
+        modified_ns=int(value.st_mtime_ns),
+    )
+
+
+def _is_reparse_stat(value: os.stat_result) -> bool:
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & flag)
+
+
+@contextmanager
+def _open_pinned_regular(
+    path: Path, subject: str
+) -> Iterator[tuple[BinaryIO, _PinnedFileIdentity]]:
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(f"unable to inspect {subject}: {path}") from exc
+    if (
+        _is_link_like(path)
+        or _is_reparse_stat(before)
+        or not stat.S_ISREG(before.st_mode)
+    ):
+        raise RuntimeError(f"unsafe linked or non-regular {subject}: {path}")
+    try:
+        handle = path.open("rb")
+    except OSError as exc:
+        raise RuntimeError(f"unable to open {subject}: {path}") from exc
+    try:
+        actual = os.fstat(handle.fileno())
+        after = os.lstat(path)
+        identities = (_file_identity(before), _file_identity(actual), _file_identity(after))
+        if (
+            not stat.S_ISREG(actual.st_mode)
+            or _is_reparse_stat(after)
+            or _is_link_like(path)
+            or identities[0] != identities[1]
+            or identities[1] != identities[2]
+        ):
+            raise RuntimeError(f"{subject} changed while it was opened: {path}")
+        yield handle, identities[1]
+    finally:
+        handle.close()
+
+
+def _load_pinned_manifest(prepared: PreparedDataset) -> dict[str, Any]:
+    path = Path(prepared.shard_manifest_path)
+    root = Path(prepared.output_dir)
+    if (
+        _is_link_like(root)
+        or not root.is_dir()
+        or Path(os.path.abspath(path.parent)) != Path(os.path.abspath(root))
+    ):
+        raise RuntimeError("unsafe prepared shard manifest root")
+    with _open_pinned_regular(path, "prepared shard manifest") as (handle, _):
+        encoded = handle.read()
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unable to decode prepared shard manifest") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != SHARD_MANIFEST_SCHEMA:
+        raise RuntimeError("unsupported prepared shard manifest schema")
+    try:
+        semantics = {name: payload[name] for name in _MANIFEST_SEMANTIC_FIELDS}
+        actual = stable_fingerprint(semantics)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("invalid prepared shard manifest semantics") from exc
+    if (
+        payload.get("fingerprint") != actual
+        or actual != prepared.shard_fingerprint
+    ):
+        raise RuntimeError("prepared shard manifest fingerprint mismatch")
+    return payload
+
+
+def _inspect_verified_shard(
+    path: Path, expected_sha256: str
+) -> tuple[_PinnedFileIdentity, tuple[int, ...]]:
+    with _open_pinned_regular(path, "prepared shard") as (handle, identity):
+        if _sha256_handle(handle) != expected_sha256:
+            raise RuntimeError(f"prepared shard checksum mismatch: {path}")
+        handle.seek(0)
+        parquet = pq.ParquetFile(handle)
+        row_groups = tuple(
+            int(parquet.metadata.row_group(index).num_rows)
+            for index in range(parquet.metadata.num_row_groups)
+        )
+    if not row_groups or any(rows <= 0 for rows in row_groups):
+        raise RuntimeError(f"prepared shard has invalid row groups: {path}")
+    return identity, row_groups
+
+
+def _iter_row_group_chunks(
+    entry: _ShardEntry, buffer_rows: int
+) -> Iterator[_RowGroupChunk]:
+    group: list[int] = []
+    rows = 0
+    position = 0
+    for index, group_rows in enumerate(entry.row_group_rows):
+        if group_rows > buffer_rows:
+            raise RuntimeError("prepared row group exceeds shuffle_buffer_rows")
+        if group and rows + group_rows > buffer_rows:
+            yield _RowGroupChunk(position, tuple(group), rows)
+            position += 1
+            group = []
+            rows = 0
+        group.append(index)
+        rows += group_rows
+    if group:
+        yield _RowGroupChunk(position, tuple(group), rows)
+
+
+def _row_group_chunk_count(entry: _ShardEntry, buffer_rows: int) -> int:
+    return sum(1 for _ in _iter_row_group_chunks(entry, buffer_rows))
+
+
 def _buffer_seed(seed: int, epoch: int, fingerprint: str, index: int) -> int:
     material = f"{seed}\0{epoch}\0{fingerprint}\0{index}".encode("utf-8")
     return int.from_bytes(hashlib.sha256(material).digest()[:16], "little")
@@ -232,31 +394,74 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             raise ValueError(f"unsupported prepared split: {split}")
         if isinstance(batch_size, bool) or int(batch_size) < 2:
             raise ValueError("batch_size must be at least two")
-        buffer_rows = int(batch_size) if shuffle_buffer_rows is None else shuffle_buffer_rows
-        if isinstance(buffer_rows, bool) or int(buffer_rows) <= 0:
+        if (
+            shuffle_buffer_rows is not None
+            and (
+                isinstance(shuffle_buffer_rows, bool)
+                or int(shuffle_buffer_rows) <= 0
+            )
+        ):
             raise ValueError("shuffle_buffer_rows must be positive")
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("seed must be a non-negative integer")
 
-        manifest = load_shard_manifest(prepared.shard_manifest_path)
-        root = Path(prepared.shard_manifest_path).resolve().parent
+        manifest = _load_pinned_manifest(prepared)
+        try:
+            record_batch_rows = int(manifest["shard_contract"]["record_batch_rows"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("invalid prepared shard record-batch contract") from exc
+        if record_batch_rows <= 0:
+            raise RuntimeError("invalid prepared shard record-batch contract")
+        buffer_rows = (
+            max(int(batch_size), record_batch_rows)
+            if shuffle_buffer_rows is None
+            else int(shuffle_buffer_rows)
+        )
+        root = Path(prepared.output_dir)
+        if _is_link_like(root) or not root.is_dir():
+            raise RuntimeError("unsafe prepared shard output root")
         entries: list[_ShardEntry] = []
         for value in manifest["entries"]:
             if not isinstance(value, Mapping) or value.get("split") != split:
                 continue
             relative = str(value["path"])
             pure = PurePosixPath(relative)
-            path = root.joinpath(*pure.parts).resolve(strict=True)
+            if (
+                not relative
+                or "\\" in relative
+                or pure.is_absolute()
+                or pure.as_posix() != relative
+                or any(part in {"", ".", ".."} for part in pure.parts)
+            ):
+                raise RuntimeError("non-canonical prepared shard path")
+            candidate = root.joinpath(*pure.parts)
+            current = root
+            for part in pure.parts[:-1]:
+                current /= part
+                if _is_link_like(current) or not current.is_dir():
+                    raise RuntimeError("unsafe prepared shard parent path")
+            path = candidate.resolve(strict=True)
             try:
-                path.relative_to(root)
+                path.relative_to(root.resolve(strict=True))
             except ValueError as exc:
                 raise RuntimeError("prepared shard path escapes its output root") from exc
+            identity, row_group_rows = _inspect_verified_shard(
+                path, str(value["sha256"])
+            )
+            if sum(row_group_rows) != int(value["rows"]):
+                raise RuntimeError("prepared shard row-group coverage mismatch")
+            if max(row_group_rows) > buffer_rows:
+                raise ValueError(
+                    "shuffle_buffer_rows must be at least the largest prepared row group"
+                )
             entries.append(
                 _ShardEntry(
                     path=str(path),
                     fingerprint=str(value["sha256"]),
                     rows=int(value["rows"]),
                     label=str(value["label"]),
+                    row_group_rows=row_group_rows,
+                    identity=identity,
                 )
             )
         expected = int(getattr(prepared, f"{split}_count"))
@@ -290,6 +495,16 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
         self.row_count = expected
         self.epoch = 0
         self.cursor: DataCursor | None = None
+        self._max_pending_chunks_observed = 0
+        self._worker_ids_observed: set[int] = set()
+
+    @property
+    def max_pending_chunks_observed(self) -> int:
+        return self._max_pending_chunks_observed
+
+    @property
+    def worker_ids_observed(self) -> tuple[int, ...]:
+        return tuple(sorted(self._worker_ids_observed))
 
     def set_epoch(self, epoch: int, cursor: DataCursor | None = None) -> None:
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
@@ -320,15 +535,20 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             position += 1
         return tuple(ordered)
 
-    def _iter_shard_chunks(
+    def _iter_assigned_shard_chunks(
         self,
         processor: FeaturePreprocessor,
         entry: _ShardEntry,
         shard_position: int,
+        base_ordinal: int,
+        worker_id: int,
+        worker_count: int,
     ) -> Iterator[dict[str, Any]]:
+        chunk_count = _row_group_chunk_count(entry, self.shuffle_buffer_rows)
+        first_owned = (worker_id - (base_ordinal % worker_count)) % worker_count
+        if first_owned >= chunk_count:
+            return
         path = Path(entry.path)
-        if _is_link_like(path) or not path.is_file():
-            raise RuntimeError(f"unsafe prepared shard during iteration: {path}")
         metadata_columns = (
             "row_uid",
             "source_file",
@@ -339,34 +559,31 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             "timestamp",
         )
         columns = [*metadata_columns, *self.materialized_features]
-        with path.open("rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                raise RuntimeError(f"prepared shard is not a regular file: {path}")
-            if _sha256_handle(handle) != entry.fingerprint:
+        with _open_pinned_regular(path, "prepared shard") as (handle, identity):
+            if entry.identity is None or identity != entry.identity:
                 raise RuntimeError(
-                    f"prepared shard checksum mismatch during iteration: {path}"
+                    f"prepared shard identity changed during iteration: {path}"
                 )
-            handle.seek(0)
             parquet = pq.ParquetFile(handle)
-            batches = iter(
-                parquet.iter_batches(
-                    batch_size=self.shuffle_buffer_rows,
+            for chunk in _iter_row_group_chunks(entry, self.shuffle_buffer_rows):
+                ordinal = base_ordinal + chunk.position
+                if ordinal % worker_count != worker_id:
+                    continue
+                table = parquet.read_row_groups(
+                    list(chunk.row_groups),
                     columns=columns,
                     use_threads=False,
                 )
-            )
-            current = next(batches, None)
-            chunk_position = 0
-            while current is not None:
-                following = next(batches, None)
-                frame = current.to_pandas()
+                if table.num_rows != chunk.rows:
+                    raise RuntimeError("prepared row-group chunk coverage mismatch")
+                frame = table.to_pandas()
                 order = np.random.Generator(
                     np.random.PCG64(
                         _buffer_seed(
                             self.seed,
                             self.epoch,
                             entry.fingerprint,
-                            chunk_position,
+                            chunk.position,
                         )
                     )
                 ).permutation(len(frame))
@@ -384,9 +601,11 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
                     for name in self.boolean_features
                 }
                 yield {
+                    "_chunk_ordinal": ordinal,
+                    "_worker_id": worker_id,
                     "_shard_position": shard_position,
-                    "_chunk_position": chunk_position,
-                    "_last_chunk": following is None,
+                    "_chunk_position": chunk.position,
+                    "_last_chunk": chunk.position == chunk_count - 1,
                     "features": encoded,
                     "unencoded": unencoded,
                     "labels": labels,
@@ -394,8 +613,6 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
                     "metadata": metadata,
                     "boolean_raw": boolean_raw,
                 }
-                current = following
-                chunk_position += 1
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         worker = torch.utils.data.get_worker_info()
@@ -422,12 +639,29 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             raise RuntimeError("frozen preprocessor no longer matches shard features")
         resume = _resume_layout(self)
         start_position = resume.start_shard_position
+        ordinal = 0
         for position, entry in enumerate(self.permuted_shards()):
             if position < start_position:
                 continue
-            if position % worker_count != worker_id:
-                continue
-            yield from self._iter_shard_chunks(processor, entry, position)
+            chunk_count = _row_group_chunk_count(entry, self.shuffle_buffer_rows)
+            yield from self._iter_assigned_shard_chunks(
+                processor,
+                entry,
+                position,
+                ordinal,
+                worker_id,
+                worker_count,
+            )
+            ordinal += chunk_count
+
+
+def _total_chunk_count(
+    dataset: ParquetTrainingDataset, start_position: int
+) -> int:
+    return sum(
+        _row_group_chunk_count(entry, dataset.shuffle_buffer_rows)
+        for entry in dataset.permuted_shards()[start_position:]
+    )
 
 
 def _ordered_chunks(
@@ -436,37 +670,43 @@ def _ordered_chunks(
     start_position = _resume_layout(dataset).start_shard_position
     if start_position == len(dataset.entries):
         return
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=None,
-        num_workers=num_workers,
-        collate_fn=_identity,
-        persistent_workers=False,
-    )
-    pending: list[tuple[int, int, int, dict[str, Any]]] = []
-    expected = (start_position, 0)
+    prefetch_factor = 2
+    loader_options: dict[str, Any] = {
+        "batch_size": None,
+        "num_workers": num_workers,
+        "collate_fn": _identity,
+        "persistent_workers": False,
+    }
+    if num_workers > 0:
+        loader_options["prefetch_factor"] = prefetch_factor
+    loader = torch.utils.data.DataLoader(dataset, **loader_options)
+    pending: list[tuple[int, int, dict[str, Any]]] = []
+    expected = 0
+    expected_total = _total_chunk_count(dataset, start_position)
+    pending_limit = 1 if num_workers == 0 else num_workers * prefetch_factor
     serial = 0
     for chunk in loader:
-        key = (int(chunk["_shard_position"]), int(chunk["_chunk_position"]))
-        heapq.heappush(pending, (*key, serial, chunk))
+        ordinal = int(chunk["_chunk_ordinal"])
+        dataset._worker_ids_observed.add(int(chunk["_worker_id"]))
+        if ordinal < expected:
+            raise RuntimeError("worker stream duplicated an ordered row-group chunk")
+        heapq.heappush(pending, (ordinal, serial, chunk))
         serial += 1
-        while pending and pending[0][:2] == expected:
-            shard_position, chunk_position, _, ready = heapq.heappop(pending)
-            yield ready
-            expected = (
-                (shard_position + 1, 0)
-                if bool(ready["_last_chunk"])
-                else (shard_position, chunk_position + 1)
-            )
-    while pending and pending[0][:2] == expected:
-        shard_position, chunk_position, _, ready = heapq.heappop(pending)
-        yield ready
-        expected = (
-            (shard_position + 1, 0)
-            if bool(ready["_last_chunk"])
-            else (shard_position, chunk_position + 1)
+        dataset._max_pending_chunks_observed = max(
+            dataset._max_pending_chunks_observed,
+            len(pending),
         )
-    if pending or expected != (len(dataset.entries), 0):
+        if len(pending) > pending_limit:
+            raise RuntimeError("worker reorder payloads exceeded the prefetch bound")
+        while pending and pending[0][0] == expected:
+            _, _, ready = heapq.heappop(pending)
+            yield ready
+            expected += 1
+    while pending and pending[0][0] == expected:
+        _, _, ready = heapq.heappop(pending)
+        yield ready
+        expected += 1
+    if pending or expected != expected_total:
         raise RuntimeError("worker stream omitted or duplicated an ordered shard chunk")
 
 

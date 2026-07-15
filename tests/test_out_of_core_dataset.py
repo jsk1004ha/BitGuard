@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 import yaml
 
 from tests.test_out_of_core_prepare import _source_contract, _write_botiot
+from tests.test_out_of_core_shard import _make_directory_link, _remove_directory_link
 
 
 class BatchLayoutBoundedMemoryTests(unittest.TestCase):
@@ -157,7 +158,8 @@ class OutOfCoreDatasetTests(unittest.TestCase):
 
     def test_zero_and_two_workers_produce_identical_batches_and_exact_coverage(self) -> None:
         zero = self._collect(self._dataset(), 0)
-        two = self._collect(self._dataset(), 2)
+        two_dataset = self._dataset()
+        two = self._collect(two_dataset, 2)
         zero_uids = [list(batch["row_uid"]) for batch in zero]
         two_uids = [list(batch["row_uid"]) for batch in two]
         self.assertEqual(zero_uids, two_uids)
@@ -165,6 +167,28 @@ class OutOfCoreDatasetTests(unittest.TestCase):
         self.assertEqual(len(flat), self.prepared.train_count)
         self.assertEqual(len(flat), len(set(flat)))
         self.assertTrue(all(2 <= len(batch) <= 4 for batch in zero_uids))
+
+    def test_uneven_shards_keep_pending_payloads_within_prefetch_bound(self) -> None:
+        dataset = self._dataset()
+        self.assertGreater(len({entry.rows for entry in dataset.entries}), 1)
+
+        self._collect(dataset, 2)
+
+        self.assertEqual(dataset.worker_ids_observed, (0, 1))
+        self.assertGreater(dataset.max_pending_chunks_observed, 0)
+        self.assertLessEqual(dataset.max_pending_chunks_observed, 4)
+
+    def test_shuffle_buffer_rejects_a_larger_row_group_payload(self) -> None:
+        from bitguard_bnn.out_of_core.dataset import ParquetTrainingDataset
+
+        with self.assertRaisesRegex(ValueError, "largest prepared row group"):
+            ParquetTrainingDataset(
+                self.prepared.descriptor_path,
+                split="train",
+                batch_size=4,
+                seed=17,
+                shuffle_buffer_rows=2,
+            )
 
     def test_epoch_order_is_stable_then_changes_and_classes_are_interleaved(self) -> None:
         first_dataset = self._dataset(epoch=3)
@@ -245,6 +269,7 @@ class OutOfCoreDatasetTests(unittest.TestCase):
     def test_training_split_with_fewer_than_two_rows_is_rejected(self) -> None:
         from bitguard_bnn.out_of_core.dataset import (
             ParquetTrainingDataset,
+            _PinnedFileIdentity,
             _logical_batch_sizes,
         )
         from bitguard_bnn.out_of_core.shard import load_shard_manifest
@@ -256,14 +281,19 @@ class OutOfCoreDatasetTests(unittest.TestCase):
         train_entry["rows"] = 1
         tiny_manifest = {**manifest, "entries": [train_entry]}
         tiny_prepared = replace(self.prepared, train_count=1)
+        identity = _PinnedFileIdentity(1, 1, 0, 1, 1)
         with (
             patch(
                 "bitguard_bnn.out_of_core.dataset.verify_prepared_dataset",
                 return_value=tiny_prepared,
             ) as verify,
             patch(
-                "bitguard_bnn.out_of_core.dataset.load_shard_manifest",
+                "bitguard_bnn.out_of_core.dataset._load_pinned_manifest",
                 return_value=tiny_manifest,
+            ),
+            patch(
+                "bitguard_bnn.out_of_core.dataset._inspect_verified_shard",
+                return_value=(identity, (1,)),
             ),
             self.assertRaisesRegex(ValueError, "at least two rows"),
         ):
@@ -286,13 +316,20 @@ class OutOfCoreDatasetTests(unittest.TestCase):
                 return_value=odd_prepared,
             ),
             patch(
-                "bitguard_bnn.out_of_core.dataset.load_shard_manifest",
+                "bitguard_bnn.out_of_core.dataset._load_pinned_manifest",
                 return_value=odd_manifest,
+            ),
+            patch(
+                "bitguard_bnn.out_of_core.dataset._inspect_verified_shard",
+                return_value=(identity, (5,)),
             ),
             self.assertRaisesRegex(ValueError, "batch_size=2"),
         ):
             ParquetTrainingDataset(
-                self.prepared.descriptor_path, batch_size=2, seed=1
+                self.prepared.descriptor_path,
+                batch_size=2,
+                seed=1,
+                shuffle_buffer_rows=5,
             )
 
     def test_corrupt_descriptor_and_manifest_are_rejected_before_iteration(self) -> None:
@@ -319,6 +356,87 @@ class OutOfCoreDatasetTests(unittest.TestCase):
                 ParquetTrainingDataset(descriptor, batch_size=4, seed=1)
         finally:
             manifest.write_bytes(manifest_bytes)
+
+    def test_manifest_swap_after_strict_verification_is_rejected(self) -> None:
+        from bitguard_bnn.out_of_core.dataset import ParquetTrainingDataset
+        from bitguard_bnn.out_of_core.manifest import stable_fingerprint
+        from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
+        from bitguard_bnn.out_of_core.shard import _manifest_semantics
+
+        manifest = Path(self.prepared.shard_manifest_path)
+        original = manifest.read_bytes()
+        replacement = json.loads(original)
+        replacement["coverage"]["uid_digest"] = "f" * 64
+        replacement["fingerprint"] = stable_fingerprint(
+            _manifest_semantics(replacement)
+        )
+
+        def verify_then_swap(path):
+            verified = verify_prepared_dataset(path)
+            manifest.write_text(
+                json.dumps(replacement, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            return verified
+
+        try:
+            with (
+                patch(
+                    "bitguard_bnn.out_of_core.dataset.verify_prepared_dataset",
+                    side_effect=verify_then_swap,
+                ),
+                self.assertRaisesRegex(RuntimeError, "manifest.*fingerprint"),
+            ):
+                ParquetTrainingDataset(
+                    self.prepared.descriptor_path,
+                    batch_size=4,
+                    seed=1,
+                    shuffle_buffer_rows=3,
+                )
+        finally:
+            manifest.write_bytes(original)
+
+    def test_linked_manifest_root_after_strict_verification_is_rejected(self) -> None:
+        from bitguard_bnn.out_of_core.dataset import ParquetTrainingDataset
+        from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
+
+        output = Path(self.prepared.output_dir)
+        backup = self.root / "prepared-before-link"
+        attacker = self.root / "attacker-manifest-root"
+        attacker.mkdir()
+        (attacker / "shard_manifest.json").write_bytes(
+            Path(self.prepared.shard_manifest_path).read_bytes()
+        )
+
+        def verify_then_link(path):
+            verified = verify_prepared_dataset(path)
+            output.rename(backup)
+            try:
+                _make_directory_link(output, attacker)
+            except BaseException:
+                backup.rename(output)
+                raise
+            return verified
+
+        try:
+            with (
+                patch(
+                    "bitguard_bnn.out_of_core.dataset.verify_prepared_dataset",
+                    side_effect=verify_then_link,
+                ),
+                self.assertRaisesRegex(RuntimeError, "manifest root"),
+            ):
+                ParquetTrainingDataset(
+                    self.prepared.descriptor_path,
+                    batch_size=4,
+                    seed=1,
+                    shuffle_buffer_rows=3,
+                )
+        finally:
+            if output.exists() or output.is_symlink():
+                _remove_directory_link(output)
+            if backup.exists():
+                backup.rename(output)
 
 
 if __name__ == "__main__":
