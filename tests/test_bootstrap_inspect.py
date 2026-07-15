@@ -10,11 +10,12 @@ from unittest.mock import patch
 
 import pandas as pd
 
+import bitguard_bnn.bootstrap.inspect as inspect_module
+from bitguard_bnn.data import _coerce_timestamp, _numeric_features
+
 from bitguard_bnn.bootstrap.inspect import (
     SchemaInspectionError,
     _BoundedLines,
-    _numeric_convertible,
-    _timestamp_valid,
     inspect_csv_dataset,
 )
 
@@ -55,10 +56,13 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertEqual(report.feature_columns, ("mean", "std"))
             self.assertEqual(report.class_counts, (("benign", 2), ("flood_like", 2)))
             self.assertEqual(report.unique_devices, 2)
-            self.assertEqual([item.relative_path for item in report.files], [
-                "device_a/gafgyt_attacks/tcp.csv",
-                "device_b/benign_traffic.csv",
-            ])
+            self.assertEqual(
+                [item.relative_path for item in report.files],
+                [
+                    "device_a/gafgyt_attacks/tcp.csv",
+                    "device_b/benign_traffic.csv",
+                ],
+            )
             self.assertEqual(report.rejected_rows, 0)
             self.assertEqual(report.as_dict()["total_rows"], 4)
 
@@ -69,7 +73,7 @@ class SchemaInspectionTest(unittest.TestCase):
             path.write_text(
                 "category,subcategory,saddr,stime,bytes,rate\n"
                 "Normal,Normal,10.0.0.1,1.5,100,2.0\n"
-                "DDoS,TCP,10.0.0.2,2019-01-01T00:00:00Z,200,3.0\n",
+                "DDoS,TCP,10.0.0.2,2.5,200,3.0\n",
                 encoding="utf-8",
             )
             report = inspect_csv_dataset(
@@ -119,9 +123,7 @@ class SchemaInspectionTest(unittest.TestCase):
                     "subcategory",
                 ),
             )
-            self.assertEqual(
-                report.files[0].unusable_columns, ("description", "proto")
-            )
+            self.assertEqual(report.files[0].unusable_columns, ("description", "proto"))
             self.assertEqual(
                 report.as_dict()["unusable_columns"], ["description", "proto"]
             )
@@ -167,7 +169,9 @@ class SchemaInspectionTest(unittest.TestCase):
                 metadata + "Normal,Normal,device-b,2,17,2\n", encoding="utf-8"
             )
 
-            with self.assertRaisesRegex(SchemaInspectionError, "feature schema mismatch"):
+            with self.assertRaisesRegex(
+                SchemaInspectionError, "feature schema mismatch"
+            ):
                 inspect_csv_dataset("botiot", root)
 
     def test_required_columns_and_compatible_feature_schema_are_enforced(self) -> None:
@@ -175,9 +179,13 @@ class SchemaInspectionTest(unittest.TestCase):
             root = Path(directory)
             (root / "one.csv").write_text("label,x\nbenign,1\n", encoding="utf-8")
             (root / "two.csv").write_text("label,y\nbenign,2\n", encoding="utf-8")
-            with self.assertRaisesRegex(SchemaInspectionError, "feature schema mismatch"):
+            with self.assertRaisesRegex(
+                SchemaInspectionError, "feature schema mismatch"
+            ):
                 inspect_csv_dataset("botiot", root, required_columns=("label",))
-            with self.assertRaisesRegex(SchemaInspectionError, "missing required columns"):
+            with self.assertRaisesRegex(
+                SchemaInspectionError, "missing required columns"
+            ):
                 inspect_csv_dataset("botiot", root, required_columns=("missing",))
 
     def test_duplicate_headers_empty_files_and_non_csv_sources_fail(self) -> None:
@@ -195,7 +203,7 @@ class SchemaInspectionTest(unittest.TestCase):
     def test_numeric_candidates_match_coercing_adapter_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "device" ).mkdir()
+            (root / "device").mkdir()
             (root / "device" / "benign.csv").write_text(
                 "x,y\n1,2\nnot-a-number,4\n5,inf\n", encoding="utf-8"
             )
@@ -206,11 +214,10 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertEqual(report.feature_columns, ("x", "y"))
             self.assertEqual(report.unusable_columns, ())
 
-    def test_numeric_eligibility_matches_adapter_scalar_boundaries(self) -> None:
-        # These are the scalar forms relevant to data._numeric_features: pandas
-        # to_numeric(errors="coerce") must produce a non-missing value, while a
-        # decimal that overflows Python's finite range is deliberately excluded.
-        accepted = (
+    def test_numeric_eligibility_exactly_matches_training_pandas_conversion(
+        self,
+    ) -> None:
+        tokens = (
             "0",
             " +1 ",
             "-2",
@@ -221,91 +228,60 @@ class SchemaInspectionTest(unittest.TestCase):
             "+inf",
             "-INF",
             "Infinity",
-            "-infinity",
-        )
-        rejected = (
-            "",
-            "NA",
+            " inf ",
             "nan",
             "+nan",
             "-NaN",
             "1_000",
             "1,000",
             "0x10",
+            "0e309",
+            "0.0e309",
+            ".0e309",
+            "00.1e309",
+            "0.01e310",
             "1e309",
-            "-1e309",
-            "1e",
-            ".",
+            "1e-400",
+            "99e307",
         )
-
-        for token in accepted:
-            with self.subTest(token=token, expected=True):
-                self.assertTrue(_numeric_convertible(token))
-        for token in rejected:
-            with self.subTest(token=token, expected=False):
-                self.assertFalse(_numeric_convertible(token))
-
-    def test_numeric_eligibility_matches_pandas_for_specials_and_exponents(self) -> None:
-        cases = (
-            ("inf", True),
-            ("+inf", True),
-            ("-inf", True),
-            ("infinity", True),
-            ("+infinity", True),
-            ("-infinity", True),
-            (" inf ", False),
-            (" +inf ", False),
-            (" -inf ", False),
-            (" infinity ", False),
-            (" +infinity ", False),
-            (" -infinity ", False),
-            (" 1 ", True),
-            (" -2.5 ", True),
-            ("0e308", True),
-            ("1e308", True),
-            ("0e309", False),
-            ("-0e309", False),
-            ("0e9999", False),
-            ("0e+9999", False),
-            ("1e-400", True),
-            ("99e307", False),
+        columns = tuple(f"value_{index:02d}" for index in range(len(tokens)))
+        frame = pd.DataFrame(
+            [{column: token for column, token in zip(columns, tokens)}]
         )
+        expected_frame = frame.copy()
+        expected = tuple(sorted(_numeric_features(expected_frame), key=str.casefold))
 
-        for token, expected in cases:
-            with self.subTest(token=token):
-                converted = pd.to_numeric(pd.Series([token]), errors="coerce").iloc[0]
-                self.assertEqual(bool(pd.notna(converted)), expected)
-                self.assertEqual(_numeric_convertible(token), expected)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(columns)
+                writer.writerow(tokens)
 
-    def test_timestamp_numeric_grammar_is_strict_and_finite(self) -> None:
-        # The adapter accepts non-missing numeric timestamps, but downstream
-        # sorting and elapsed-time state require finite values. Bootstrap is
-        # deliberately stricter for infinity while sharing the decimal grammar.
-        cases = (
-            ("1", True),
-            (" 1.5 ", True),
-            ("0e308", True),
-            ("1e-400", True),
-            ("2019-01-01T00:00:00Z", True),
-            ("1_000", False),
-            ("1,000", False),
-            ("0e309", False),
-            ("inf", False),
-            ("-infinity", False),
-        )
+            report = inspect_csv_dataset("nbaiot", root, chunk_size=1)
 
-        for token, expected in cases:
-            with self.subTest(token=token):
-                self.assertEqual(_timestamp_valid(token), expected)
+        self.assertEqual(report.feature_columns, expected)
+        observed = {
+            token: column in report.feature_columns
+            for column, token in zip(columns, tokens)
+        }
+        self.assertFalse(observed["0e309"])
+        self.assertTrue(observed["0.0e309"])
+        self.assertTrue(observed[".0e309"])
+        self.assertTrue(observed["00.1e309"])
+        self.assertTrue(observed["0.01e310"])
+        self.assertFalse(observed["1_000"])
 
     def test_underscore_timestamp_is_rejected_during_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "flows.csv").write_text(
-                "category,subcategory,saddr,stime,x\n"
-                "ddos,tcp,device,1_000,1\n",
-                encoding="utf-8",
-            )
+            with (root / "flows.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(("category", "subcategory", "saddr", "stime", "x"))
+                for index in range(99):
+                    writer.writerow(("ddos", "tcp", "device", str(index), "1"))
+                writer.writerow(("ddos", "tcp", "device", "1_000", "1"))
 
             report = inspect_csv_dataset(
                 "botiot",
@@ -314,8 +290,106 @@ class SchemaInspectionTest(unittest.TestCase):
                 fail_on_rejected=False,
             )
 
-            self.assertEqual(report.accepted_rows, 0)
+            self.assertEqual(report.accepted_rows, 99)
             self.assertEqual(report.rejected_reasons, (("invalid_timestamp", 1),))
+
+    def test_timestamp_mode_matches_training_threshold_at_95_percent(self) -> None:
+        for numeric_rows, expected_accepted in ((96, 96), (94, 6)):
+            with (
+                self.subTest(numeric_rows=numeric_rows),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                timestamps = [str(index + 1) for index in range(numeric_rows)]
+                timestamps.extend(
+                    "2019-01-01T00:00:00Z" for _ in range(100 - numeric_rows)
+                )
+                expected = _coerce_timestamp(pd.Series(timestamps)).notna()
+                with (root / "flows.csv").open(
+                    "w", encoding="utf-8", newline=""
+                ) as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(("category", "subcategory", "saddr", "stime", "x"))
+                    for timestamp in timestamps:
+                        writer.writerow(("Normal", "Normal", "device", timestamp, "1"))
+
+                report = inspect_csv_dataset(
+                    "botiot", root, chunk_size=7, fail_on_rejected=False
+                )
+
+                self.assertEqual(report.accepted_rows, int(expected.sum()))
+                self.assertEqual(report.accepted_rows, expected_accepted)
+                self.assertEqual(
+                    report.rejected_reasons,
+                    (("invalid_timestamp", 100 - expected_accepted),),
+                )
+
+    def test_timestamp_numeric_mode_rejects_infinity_for_elapsed_time_safety(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = ["1"] * 95 + ["inf"] * 5
+            with (root / "flows.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(("category", "subcategory", "saddr", "stime", "x"))
+                for timestamp in rows:
+                    writer.writerow(("Normal", "Normal", "device", timestamp, "1"))
+
+            report = inspect_csv_dataset(
+                "botiot", root, chunk_size=9, fail_on_rejected=False
+            )
+
+            self.assertEqual(report.accepted_rows, 95)
+            self.assertEqual(report.rejected_reasons, (("invalid_timestamp", 5),))
+
+    def test_pandas_conversions_never_receive_more_than_one_bounded_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory,saddr,stime,x,y\n"
+                + "".join(
+                    f"Normal,Normal,device,2019-01-01T00:00:{index:02d}Z,value,{index}\n"
+                    for index in range(23)
+                ),
+                encoding="utf-8",
+            )
+            numeric_sizes: list[int] = []
+            datetime_sizes: list[int] = []
+            real_numeric = pd.to_numeric
+            real_datetime = pd.to_datetime
+
+            def bounded_numeric(values, *args, **kwargs):
+                numeric_sizes.append(len(values))
+                return real_numeric(values, *args, **kwargs)
+
+            def bounded_datetime(values, *args, **kwargs):
+                datetime_sizes.append(len(values))
+                return real_datetime(values, *args, **kwargs)
+
+            with (
+                patch.object(inspect_module.pd, "to_numeric", bounded_numeric),
+                patch.object(inspect_module.pd, "to_datetime", bounded_datetime),
+            ):
+                inspect_csv_dataset("botiot", root, chunk_size=5)
+
+            self.assertTrue(numeric_sizes)
+            self.assertLessEqual(max(numeric_sizes), 5)
+            self.assertTrue(datetime_sizes)
+            self.assertLessEqual(max(datetime_sizes), 5)
+
+    def test_missing_pandas_dependency_reports_actionable_bootstrap_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rows.csv").write_text("x\n1\n", encoding="utf-8")
+            with (
+                patch.object(inspect_module, "pd", None),
+                self.assertRaisesRegex(
+                    SchemaInspectionError,
+                    "pandas.*bootstrap.*locked dependencies",
+                ),
+            ):
+                inspect_csv_dataset("nbaiot", root)
 
     def test_pandas_divergent_numeric_forms_are_unusable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -359,7 +433,9 @@ class SchemaInspectionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "rows.csv").write_text("x,y\nleft,right\n", encoding="utf-8")
-            with self.assertRaisesRegex(SchemaInspectionError, "no numeric feature columns"):
+            with self.assertRaisesRegex(
+                SchemaInspectionError, "no numeric feature columns"
+            ):
                 inspect_csv_dataset("nbaiot", root)
 
     def test_bad_label_device_and_timestamp_are_rejected(self) -> None:
@@ -379,11 +455,14 @@ class SchemaInspectionTest(unittest.TestCase):
                 fail_on_rejected=False,
             )
             self.assertEqual(report.accepted_rows, 0)
-            self.assertEqual(report.rejected_reasons, (
-                ("invalid_device", 1),
-                ("invalid_label", 1),
-                ("invalid_timestamp", 1),
-            ))
+            self.assertEqual(
+                report.rejected_reasons,
+                (
+                    ("invalid_device", 1),
+                    ("invalid_label", 1),
+                    ("invalid_timestamp", 1),
+                ),
+            )
 
     def test_row_and_field_ceilings_bound_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -430,7 +509,38 @@ class SchemaInspectionTest(unittest.TestCase):
 
             with (
                 patch("pathlib.Path.lstat", changed),
-                self.assertRaisesRegex(SchemaInspectionError, "changed during inspection"),
+                self.assertRaisesRegex(
+                    SchemaInspectionError, "changed during inspection"
+                ),
+            ):
+                inspect_csv_dataset("nbaiot", root)
+
+    def test_source_replacement_between_bounded_passes_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            path.write_text("x\n1\n", encoding="utf-8")
+            real_open = inspect_module._open_pinned_text
+            calls = 0
+
+            def replace_before_second_pass(candidate: Path):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    replacement = root / "replacement.csv"
+                    replacement.write_text("x\n2\n", encoding="utf-8")
+                    os.replace(replacement, path)
+                return real_open(candidate)
+
+            with (
+                patch.object(
+                    inspect_module,
+                    "_open_pinned_text",
+                    replace_before_second_pass,
+                ),
+                self.assertRaisesRegex(
+                    SchemaInspectionError, "changed between inspection passes"
+                ),
             ):
                 inspect_csv_dataset("nbaiot", root)
 

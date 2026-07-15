@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import csv
-import datetime as dt
 import itertools
-import math
 import os
-import re
 import sqlite3
 import stat
 import tempfile
 import threading
 import unicodedata
+import warnings
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -20,6 +18,13 @@ from pathlib import Path
 from typing import TextIO
 
 from bitguard_bnn.constants import botiot_behavior, nbaiot_behavior, normalize_token
+
+_PANDAS_IMPORT_ERROR: Exception | None = None
+try:
+    import pandas as pd
+except Exception as error:  # pragma: no cover - depends on a broken environment
+    pd = None  # type: ignore[assignment]
+    _PANDAS_IMPORT_ERROR = error
 
 
 class SchemaInspectionError(RuntimeError):
@@ -103,20 +108,6 @@ class SchemaInspectionReport:
 
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-_MISSING_NUMERIC = {"", "na", "n/a", "nan", "null", "none", "?"}
-_INFINITY_NUMERIC = {
-    "inf",
-    "+inf",
-    "-inf",
-    "infinity",
-    "+infinity",
-    "-infinity",
-}
-_ASCII_DECIMAL = re.compile(
-    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
-    r"(?:[eE](?P<exponent_sign>[+-]?)(?P<exponent>[0-9]+))?",
-    re.ASCII,
-)
 _DEFAULT_REQUIRED = {
     "nbaiot": (),
     "botiot": ("category", "subcategory", "saddr", "stime"),
@@ -138,7 +129,9 @@ _CSV_FIELD_LIMIT_LOCK = threading.RLock()
 
 
 def _is_reparse(result: os.stat_result) -> bool:
-    return bool((getattr(result, "st_file_attributes", 0) or 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
+    return bool(
+        (getattr(result, "st_file_attributes", 0) or 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+    )
 
 
 def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
@@ -162,9 +155,17 @@ def _regular_file(path: Path) -> os.stat_result:
     try:
         result = path.lstat()
     except OSError as error:
-        raise SchemaInspectionError(f"cannot inspect CSV source {path}: {error}") from error
-    if not stat.S_ISREG(result.st_mode) or stat.S_ISLNK(result.st_mode) or _is_reparse(result):
-        raise SchemaInspectionError(f"CSV source must be a regular non-link file: {path}")
+        raise SchemaInspectionError(
+            f"cannot inspect CSV source {path}: {error}"
+        ) from error
+    if (
+        not stat.S_ISREG(result.st_mode)
+        or stat.S_ISLNK(result.st_mode)
+        or _is_reparse(result)
+    ):
+        raise SchemaInspectionError(
+            f"CSV source must be a regular non-link file: {path}"
+        )
     return result
 
 
@@ -172,7 +173,9 @@ def _verify_source_directories(root: Path, path: Path) -> None:
     try:
         relative = path.relative_to(root)
     except ValueError as error:
-        raise SchemaInspectionError(f"CSV source escapes its inspection root: {path}") from error
+        raise SchemaInspectionError(
+            f"CSV source escapes its inspection root: {path}"
+        ) from error
     current = root
     try:
         root_result = current.lstat()
@@ -185,7 +188,9 @@ def _verify_source_directories(root: Path, path: Path) -> None:
         or stat.S_ISLNK(root_result.st_mode)
         or _is_reparse(root_result)
     ):
-        raise SchemaInspectionError(f"CSV source root changed during inspection: {current}")
+        raise SchemaInspectionError(
+            f"CSV source root changed during inspection: {current}"
+        )
     directories = relative.parts[:-1]
     for component in directories:
         current /= component
@@ -211,12 +216,18 @@ def _open_pinned_text(path: Path) -> tuple[TextIO, os.stat_result, os.stat_resul
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise SchemaInspectionError(f"cannot open CSV source {path}: {error}") from error
+        raise SchemaInspectionError(
+            f"cannot open CSV source {path}: {error}"
+        ) from error
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or not _same_object(before, opened):
             raise SchemaInspectionError(f"CSV source changed during inspection: {path}")
-        return os.fdopen(descriptor, "r", encoding="utf-8-sig", newline=""), opened, before
+        return (
+            os.fdopen(descriptor, "r", encoding="utf-8-sig", newline=""),
+            opened,
+            before,
+        )
     except BaseException:
         os.close(descriptor)
         raise
@@ -234,11 +245,12 @@ def _verify_pinned_text(
     try:
         current_path = path.lstat()
     except OSError as error:
-        raise SchemaInspectionError(f"CSV source changed during inspection: {path}") from error
-    if (
-        _content_fingerprint(opened) != _content_fingerprint(current_fd)
-        or _content_fingerprint(path_before) != _content_fingerprint(current_path)
-    ):
+        raise SchemaInspectionError(
+            f"CSV source changed during inspection: {path}"
+        ) from error
+    if _content_fingerprint(opened) != _content_fingerprint(
+        current_fd
+    ) or _content_fingerprint(path_before) != _content_fingerprint(current_path):
         raise SchemaInspectionError(f"CSV source changed during inspection: {path}")
 
 
@@ -288,7 +300,9 @@ def _discover_csvs(source: Path) -> tuple[Path, tuple[Path, ...]]:
         raise SchemaInspectionError(f"no CSV files found under {absolute}")
     relative_keys = [item.relative_to(absolute).as_posix().casefold() for item in files]
     if len(relative_keys) != len(set(relative_keys)):
-        raise SchemaInspectionError("CSV source contains duplicate case-folded relative paths")
+        raise SchemaInspectionError(
+            "CSV source contains duplicate case-folded relative paths"
+        )
     return absolute, tuple(files)
 
 
@@ -374,7 +388,9 @@ def _column_key(column: str) -> str:
     return unicodedata.normalize("NFC", column.strip()).casefold()
 
 
-def _find(mapping: dict[str, str], preferred: str | None, candidates: Iterable[str]) -> str | None:
+def _find(
+    mapping: dict[str, str], preferred: str | None, candidates: Iterable[str]
+) -> str | None:
     for name in itertools.chain((preferred,), candidates):
         key = _column_key(name) if name else None
         if key and key in mapping:
@@ -382,54 +398,15 @@ def _find(mapping: dict[str, str], preferred: str | None, candidates: Iterable[s
     return None
 
 
-def _finite_decimal(value: str) -> float | None:
-    match = _ASCII_DECIMAL.fullmatch(value)
-    if match is None:
-        return None
-    exponent = match.group("exponent")
-    if exponent is not None and match.group("exponent_sign") != "-":
-        significant = exponent.lstrip("0")
-        if len(significant) > 3 or (
-            len(significant) == 3 and significant > "308"
-        ):
-            return None
-    try:
-        numeric = float(value)
-    except (OverflowError, ValueError):
-        return None
-    return numeric if math.isfinite(numeric) else None
-
-
-def _numeric_convertible(value: str) -> bool:
-    raw_token = value.casefold()
-    token = raw_token.strip()
-    if token in _MISSING_NUMERIC:
-        return False
-    # Keep bootstrap column eligibility synchronized with data._numeric_features,
-    # which uses pandas.to_numeric(errors="coerce") and selects columns with any
-    # non-missing result.  The adapter-relevant CSV scalar grammar is deliberately
-    # ASCII-only: pandas-recognized infinity spellings are non-missing, while NaN,
-    # Python-only underscores, grouping separators, hex, and decimal overflow are
-    # ineligible.  The record-size ceiling bounds this per-cell linear parse.
-    # pandas accepts these spellings only when they are not whitespace-padded.
-    if raw_token in _INFINITY_NUMERIC:
-        return True
-    return _finite_decimal(token) is not None
-
-
-def _timestamp_valid(value: str) -> bool:
-    token = value.strip()
-    if not token:
-        return False
-    # Reuse the feature decimal grammar, but require finite timestamps because
-    # downstream ordering and elapsed-time state cannot safely consume infinity.
-    if _finite_decimal(token) is not None:
-        return True
-    try:
-        dt.datetime.fromisoformat(token.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return True
+def _require_pandas() -> None:
+    if pd is None:
+        error = SchemaInspectionError(
+            "pandas is required for schema inspection parity; run bootstrap through "
+            "bootstrap.ps1 or bootstrap.sh so the locked dependencies are installed"
+        )
+        if _PANDAS_IMPORT_ERROR is None:
+            raise error
+        raise error from _PANDAS_IMPORT_ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,11 +428,7 @@ def _schema_for(
     path: Path,
 ) -> _Schema:
     mapping = _header_mapping(header, path)
-    missing = [
-        column
-        for column in required
-        if _column_key(column) not in mapping
-    ]
+    missing = [column for column in required if _column_key(column) not in mapping]
     if missing:
         raise SchemaInspectionError(
             f"missing required columns in {path}: {sorted(missing, key=str.casefold)}"
@@ -469,12 +442,16 @@ def _schema_for(
         raw_label = _find(mapping, None, ("subcategory", "attack", "category", "label"))
         device = _find(mapping, None, ("saddr", "srcip", "device_id"))
         timestamp = _find(mapping, None, ("stime", "timestamp", "time"))
-    metadata = {item for item in (label, raw_label, device, timestamp) if item is not None}
+    metadata = {
+        item for item in (label, raw_label, device, timestamp) if item is not None
+    }
     drop_keys = {_column_key(column) for column in drop_columns}
     dropped = {column for column in header if _column_key(column) in drop_keys}
     excluded = metadata | dropped
     candidates = tuple(
-        sorted((column for column in header if column not in excluded), key=str.casefold)
+        sorted(
+            (column for column in header if column not in excluded), key=str.casefold
+        )
     )
     if not candidates:
         raise SchemaInspectionError(f"no numeric feature columns remain in {path}")
@@ -507,6 +484,8 @@ def _row_metadata(
     schema: _Schema,
     root: Path,
     path: Path,
+    *,
+    timestamp_valid: bool = True,
 ) -> tuple[str, str] | str:
     if dataset == "nbaiot":
         return _nbaiot_metadata(root, path)
@@ -523,7 +502,7 @@ def _row_metadata(
         device = values[schema.device].strip()
         if not device:
             return "invalid_device"
-    if schema.timestamp is not None and not _timestamp_valid(values[schema.timestamp]):
+    if schema.timestamp is not None and not timestamp_valid:
         return "invalid_timestamp"
     return device, label
 
@@ -577,6 +556,147 @@ def _next_chunk(
     return chunk
 
 
+@dataclass(frozen=True, slots=True)
+class _FileInspectionPlan:
+    header: tuple[str, ...]
+    schema: _Schema
+    feature_columns: tuple[str, ...]
+    unusable_columns: tuple[str, ...]
+    timestamp_numeric_mode: bool
+    source_fingerprint: tuple[int, int, int, int]
+
+
+def _converted_numeric(values: Sequence[str]):
+    _require_pandas()
+    assert pd is not None
+    try:
+        return pd.to_numeric(pd.Series(values, dtype="object"), errors="coerce")
+    except Exception as error:
+        raise SchemaInspectionError(
+            "pandas numeric conversion failed; rerun bootstrap to restore the locked "
+            "dependency environment"
+        ) from error
+
+
+def _timestamp_validity(values: Sequence[str], *, numeric_mode: bool):
+    _require_pandas()
+    assert pd is not None
+    if numeric_mode:
+        converted = _converted_numeric(values)
+        # Training accepts numeric infinity, but ordering and elapsed-time state
+        # cannot safely consume it. This is the sole intentional safety narrowing.
+        return (
+            converted.notna() & converted.ne(float("inf")) & converted.ne(float("-inf"))
+        )
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Could not infer format, so each element will be parsed individually",
+                category=UserWarning,
+            )
+            return pd.to_datetime(
+                pd.Series(values, dtype="object"), errors="coerce", utc=True
+            ).notna()
+    except Exception as error:
+        raise SchemaInspectionError(
+            "pandas timestamp conversion failed; rerun bootstrap to restore the locked "
+            "dependency environment"
+        ) from error
+
+
+def _read_header(
+    path: Path,
+    bounded_lines: _BoundedLines,
+    reader: Iterable[list[str]],
+) -> list[str]:
+    try:
+        header = next(iter(reader))
+    except StopIteration as error:
+        raise SchemaInspectionError(f"empty CSV: {path}") from error
+    bounded_lines.reset_record()
+    return header
+
+
+def _plan_file_inspection(
+    dataset: str,
+    root: Path,
+    path: Path,
+    required: Sequence[str],
+    dropped: Sequence[str],
+    *,
+    chunk_size: int,
+    max_record_chars: int,
+) -> _FileInspectionPlan:
+    """Choose adapter-compatible schema and timestamp mode in bounded chunks."""
+
+    handle, opened, path_before = _open_pinned_text(path)
+    numeric_keys: set[str] = set()
+    timestamp_numeric = 0
+    timestamp_total = 0
+    try:
+        bounded_lines = _BoundedLines(handle, max_record_chars)
+        reader = csv.reader(bounded_lines, strict=True)
+        header = _read_header(path, bounded_lines, reader)
+        schema = _schema_for(dataset, header, required, dropped, path)
+        while True:
+            chunk = _next_chunk(reader, bounded_lines, chunk_size)
+            if not chunk:
+                break
+            values_chunk: list[dict[str, str]] = []
+            for row in chunk:
+                reason, values = _row_reason(
+                    row, schema, max_record_chars=max_record_chars
+                )
+                if reason is None:
+                    assert values is not None
+                    values_chunk.append(values)
+            if not values_chunk:
+                continue
+            for candidate in schema.candidates:
+                key = _column_key(candidate)
+                if key in numeric_keys:
+                    continue
+                converted = _converted_numeric(
+                    [values[candidate] for values in values_chunk]
+                )
+                if bool(converted.notna().any()):
+                    numeric_keys.add(key)
+            if schema.timestamp is not None:
+                timestamp_values = [values[schema.timestamp] for values in values_chunk]
+                converted_timestamp = _converted_numeric(timestamp_values)
+                timestamp_numeric += int(converted_timestamp.notna().sum())
+                timestamp_total += len(timestamp_values)
+    except (csv.Error, UnicodeError) as error:
+        raise SchemaInspectionError(f"cannot parse CSV {path}: {error}") from error
+    finally:
+        try:
+            _verify_pinned_text(path, handle, opened, path_before, root)
+        finally:
+            handle.close()
+
+    features = tuple(
+        column for column in schema.candidates if _column_key(column) in numeric_keys
+    )
+    unusable = tuple(
+        column
+        for column in schema.candidates
+        if _column_key(column) not in numeric_keys
+    )
+    if not features:
+        raise SchemaInspectionError(f"no numeric feature columns found in {path}")
+    return _FileInspectionPlan(
+        header=tuple(header),
+        schema=schema,
+        feature_columns=features,
+        unusable_columns=unusable,
+        timestamp_numeric_mode=(
+            timestamp_total > 0 and timestamp_numeric / timestamp_total >= 0.95
+        ),
+        source_fingerprint=_content_fingerprint(path_before),
+    )
+
+
 def _inspect_csv_dataset_unlocked(
     dataset: str,
     source: str | os.PathLike[str],
@@ -614,6 +734,7 @@ def _inspect_csv_dataset_unlocked(
         drop_columns,
         _DEFAULT_DROP_COLUMNS[normalized_dataset],
     )
+    _require_pandas()
     root, paths = _discover_csvs(Path(source))
     canonical_features: tuple[str, ...] | None = None
     unusable_columns: dict[str, str] = {}
@@ -631,23 +752,45 @@ def _inspect_csv_dataset_unlocked(
             for path in paths:
                 relative = path.relative_to(root).as_posix()
                 _verify_source_directories(root, path)
+                plan = _plan_file_inspection(
+                    normalized_dataset,
+                    root,
+                    path,
+                    required,
+                    dropped,
+                    chunk_size=chunk_size,
+                    max_record_chars=max_record_chars,
+                )
+                schema = plan.schema
+                file_features = plan.feature_columns
+                file_unusable = plan.unusable_columns
+                if canonical_features is None:
+                    canonical_features = file_features
+                elif {_column_key(item) for item in file_features} != {
+                    _column_key(item) for item in canonical_features
+                }:
+                    raise SchemaInspectionError(
+                        f"feature schema mismatch in {path}: "
+                        f"expected={list(canonical_features)}, observed={list(file_features)}"
+                    )
+
                 handle, opened, path_before = _open_pinned_text(path)
                 file_rows = 0
                 file_accepted = 0
                 file_rejections: Counter[str] = Counter()
                 file_classes: Counter[str] = Counter()
-                file_numeric_keys: set[str] = set()
                 try:
+                    if _content_fingerprint(path_before) != plan.source_fingerprint:
+                        raise SchemaInspectionError(
+                            f"CSV source changed between inspection passes: {path}"
+                        )
                     bounded_lines = _BoundedLines(handle, max_record_chars)
                     reader = csv.reader(bounded_lines, strict=True)
-                    try:
-                        header = next(reader)
-                    except StopIteration as error:
-                        raise SchemaInspectionError(f"empty CSV: {path}") from error
-                    bounded_lines.reset_record()
-                    schema = _schema_for(
-                        normalized_dataset, header, required, dropped, path
-                    )
+                    header = _read_header(path, bounded_lines, reader)
+                    if tuple(header) != plan.header:
+                        raise SchemaInspectionError(
+                            f"CSV source changed between inspection passes: {path}"
+                        )
 
                     logical_row = 1
                     while True:
@@ -655,20 +798,39 @@ def _inspect_csv_dataset_unlocked(
                         if not chunk:
                             break
                         chunk_devices: Counter[str] = Counter()
-                        for row in chunk:
+                        checked_rows = [
+                            _row_reason(row, schema, max_record_chars=max_record_chars)
+                            for row in chunk
+                        ]
+                        normalized_rows = [
+                            values
+                            for reason, values in checked_rows
+                            if reason is None and values is not None
+                        ]
+                        timestamp_validity = iter(
+                            _timestamp_validity(
+                                [
+                                    values[schema.timestamp]
+                                    for values in normalized_rows
+                                ],
+                                numeric_mode=plan.timestamp_numeric_mode,
+                            ).tolist()
+                            if schema.timestamp is not None
+                            else [True] * len(normalized_rows)
+                        )
+                        for reason, values in checked_rows:
                             logical_row += 1
                             file_rows += 1
                             total_rows += 1
-                            reason, values = _row_reason(
-                                row, schema, max_record_chars=max_record_chars
-                            )
                             if reason is None:
                                 assert values is not None
-                                for candidate in schema.candidates:
-                                    if _numeric_convertible(values[candidate]):
-                                        file_numeric_keys.add(_column_key(candidate))
                                 metadata = _row_metadata(
-                                    normalized_dataset, values, schema, root, path
+                                    normalized_dataset,
+                                    values,
+                                    schema,
+                                    root,
+                                    path,
+                                    timestamp_valid=bool(next(timestamp_validity)),
                                 )
                                 if isinstance(metadata, str):
                                     reason = metadata
@@ -687,31 +849,10 @@ def _inspect_csv_dataset_unlocked(
                                         RejectedRowSample(relative, logical_row, reason)
                                     )
                         devices.add(chunk_devices)
-                    file_features = tuple(
-                        column
-                        for column in schema.candidates
-                        if _column_key(column) in file_numeric_keys
-                    )
-                    file_unusable = tuple(
-                        column
-                        for column in schema.candidates
-                        if _column_key(column) not in file_numeric_keys
-                    )
-                    if not file_features:
-                        raise SchemaInspectionError(
-                            f"no numeric feature columns found in {path}"
-                        )
-                    if canonical_features is None:
-                        canonical_features = file_features
-                    elif {_column_key(item) for item in file_features} != {
-                        _column_key(item) for item in canonical_features
-                    }:
-                        raise SchemaInspectionError(
-                            f"feature schema mismatch in {path}: "
-                            f"expected={list(canonical_features)}, observed={list(file_features)}"
-                        )
                 except (csv.Error, UnicodeError) as error:
-                    raise SchemaInspectionError(f"cannot parse CSV {path}: {error}") from error
+                    raise SchemaInspectionError(
+                        f"cannot parse CSV {path}: {error}"
+                    ) from error
                 finally:
                     try:
                         _verify_pinned_text(path, handle, opened, path_before, root)
@@ -723,7 +864,7 @@ def _inspect_csv_dataset_unlocked(
                         rows=file_rows,
                         accepted_rows=file_accepted,
                         rejected_rows=sum(file_rejections.values()),
-                        columns=tuple(header),
+                        columns=plan.header,
                         feature_columns=file_features,
                         unusable_columns=file_unusable,
                         excluded_columns=schema.excluded,
@@ -736,11 +877,14 @@ def _inspect_csv_dataset_unlocked(
                     excluded_columns.setdefault(_column_key(column), column)
 
             if total_rows == 0:
-                raise SchemaInspectionError("CSV dataset contains headers but no data rows")
+                raise SchemaInspectionError(
+                    "CSV dataset contains headers but no data rows"
+                )
             rejected_rows = sum(rejection_counts.values())
             if fail_on_rejected and rejected_rows:
                 reasons = ", ".join(
-                    f"{reason}={count}" for reason, count in sorted(rejection_counts.items())
+                    f"{reason}={count}"
+                    for reason, count in sorted(rejection_counts.items())
                 )
                 raise SchemaInspectionError(
                     f"schema inspection found {rejected_rows} rejected rows: {reasons}"
