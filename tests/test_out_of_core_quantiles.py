@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
 import math
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from bitguard_bnn.out_of_core import quantiles as quantile_module
 from bitguard_bnn.out_of_core.quantiles import PriorityRowSketch
 
 
@@ -21,7 +23,60 @@ def _records(count: int, width: int = 3) -> list[tuple[str, np.ndarray]]:
     ]
 
 
+def _serialize_payload(payload: dict[str, object]) -> bytes:
+    payload_bytes = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return json.dumps(
+        {
+            "checksum": hashlib.sha256(payload_bytes).hexdigest(),
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _payload(sketch: PriorityRowSketch) -> dict[str, object]:
+    return json.loads(sketch.to_bytes())["payload"]
+
+
+def _max_count_sketch(uid: str) -> PriorityRowSketch:
+    sketch = PriorityRowSketch(capacity=1, seed=1, width=1)
+    sketch.update(uid, [1.0])
+    payload = _payload(sketch)
+    payload["total_rows"] = np.iinfo(np.int64).max
+    payload["finite_counts"] = [np.iinfo(np.int64).max]
+    payload["missing_counts"] = [0]
+    return PriorityRowSketch.from_bytes(_serialize_payload(payload))
+
+
 class PriorityRowSketchTests(unittest.TestCase):
+    def test_public_limits_are_versioned_and_cover_full_profiles(self) -> None:
+        self.assertGreaterEqual(quantile_module.LIMITS_VERSION, 1)
+        self.assertGreaterEqual(quantile_module.MAX_SKETCH_WIDTH, 115)
+        self.assertGreaterEqual(quantile_module.MAX_SKETCH_CAPACITY, 200_000)
+        self.assertGreaterEqual(
+            quantile_module.MAX_RETAINED_ROWS,
+            quantile_module.MAX_SKETCH_CAPACITY,
+        )
+        self.assertGreaterEqual(
+            quantile_module.MAX_RETAINED_VALUES,
+            200_000 * 115,
+        )
+        self.assertGreaterEqual(quantile_module.MAX_SERIALIZED_BYTES, 512 * 1024**2)
+        planned = PriorityRowSketch(capacity=200_000, seed=17, width=115)
+        self.assertEqual(planned.capacity, 200_000)
+
+    def test_capacity_width_product_is_bounded(self) -> None:
+        with self.assertRaisesRegex(ValueError, "capacity.*width|retained values"):
+            PriorityRowSketch(
+                capacity=quantile_module.MAX_SKETCH_CAPACITY,
+                seed=1,
+                width=quantile_module.MAX_SKETCH_WIDTH,
+            )
+
     def test_is_order_and_merge_independent(self) -> None:
         records = _records(137)
         whole = PriorityRowSketch(capacity=31, seed=17, width=3)
@@ -215,14 +270,149 @@ class PriorityRowSketchTests(unittest.TestCase):
         payload_bytes = json.dumps(
             envelope["payload"], sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        import hashlib
-
         envelope["checksum"] = hashlib.sha256(payload_bytes).hexdigest()
         unsupported = json.dumps(
             envelope, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         with self.assertRaisesRegex(ValueError, "version"):
             PriorityRowSketch.from_bytes(unsupported)
+
+    def test_deserialization_rejects_hostile_shapes_before_allocation(self) -> None:
+        sketch = PriorityRowSketch(capacity=1, seed=1, width=1)
+        sketch.update("a", [1.0])
+        baseline = _payload(sketch)
+        cases = (
+            ("width", 10**15, "width"),
+            ("capacity", 10**15, "capacity"),
+            ("width", True, "width"),
+            ("seed", 2**63, "seed"),
+            ("total_rows", np.iinfo(np.int64).max + 1, "total_rows"),
+        )
+        for field, value, message in cases:
+            hostile = dict(baseline)
+            hostile[field] = value
+            with (
+                self.subTest(field=field, value=value),
+                patch.object(
+                    quantile_module.np,
+                    "zeros",
+                    side_effect=AssertionError("allocation attempted"),
+                ),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                PriorityRowSketch.from_bytes(_serialize_payload(hostile))
+
+        product = dict(baseline)
+        product["capacity"] = quantile_module.MAX_SKETCH_CAPACITY
+        product["width"] = quantile_module.MAX_SKETCH_WIDTH
+        product["finite_counts"] = [1] * quantile_module.MAX_SKETCH_WIDTH
+        product["missing_counts"] = [0] * quantile_module.MAX_SKETCH_WIDTH
+        with (
+            patch.object(
+                quantile_module.np,
+                "zeros",
+                side_effect=AssertionError("allocation attempted"),
+            ),
+            self.assertRaisesRegex(ValueError, "capacity.*width|retained values"),
+        ):
+            PriorityRowSketch.from_bytes(_serialize_payload(product))
+
+    def test_deserialization_validates_list_lengths_before_allocation(self) -> None:
+        sketch = PriorityRowSketch(capacity=1, seed=1, width=1)
+        sketch.update("a", [1.0])
+        baseline = _payload(sketch)
+        cases: tuple[tuple[str, list[object], str], ...] = (
+            ("finite_counts", [], "finite_counts"),
+            ("missing_counts", [0, 0], "missing_counts"),
+            ("retained_rows", [], "retained row"),
+        )
+        for field, value, message in cases:
+            hostile = dict(baseline)
+            hostile[field] = value
+            with (
+                self.subTest(field=field),
+                patch.object(
+                    quantile_module.np,
+                    "zeros",
+                    side_effect=AssertionError("allocation attempted"),
+                ),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                PriorityRowSketch.from_bytes(_serialize_payload(hostile))
+
+    def test_deserialization_bounds_retained_rows_before_allocation(self) -> None:
+        sketch = PriorityRowSketch(capacity=2, seed=1, width=1)
+        sketch.update_many(["a", "b"], [[1.0], [2.0]])
+        serialized = sketch.to_bytes()
+        with (
+            patch.object(quantile_module, "MAX_RETAINED_ROWS", 1),
+            patch.object(
+                quantile_module.np,
+                "zeros",
+                side_effect=AssertionError("allocation attempted"),
+            ),
+            self.assertRaisesRegex(ValueError, "retained"),
+        ):
+            PriorityRowSketch.from_bytes(serialized)
+
+    def test_deserialization_rejects_oversized_bytes_before_json_or_allocation(self) -> None:
+        sketch = PriorityRowSketch(capacity=1, seed=1, width=1)
+        serialized = sketch.to_bytes()
+        with (
+            patch.object(
+                quantile_module,
+                "MAX_SERIALIZED_BYTES",
+                len(serialized) - 1,
+            ),
+            patch.object(
+                quantile_module.json,
+                "loads",
+                side_effect=AssertionError("JSON parse attempted"),
+            ),
+            patch.object(
+                quantile_module.np,
+                "zeros",
+                side_effect=AssertionError("allocation attempted"),
+            ),
+            self.assertRaisesRegex(ValueError, "serialized.*size|too large"),
+        ):
+            PriorityRowSketch.from_bytes(serialized)
+
+    def test_constructor_rejects_seed_outside_signed_64_bit_range(self) -> None:
+        for seed in (-(2**63) - 1, 2**63, 10**5000):
+            with self.subTest(seed_bits=seed.bit_length()), self.assertRaisesRegex(
+                ValueError, "seed"
+            ):
+                PriorityRowSketch(capacity=1, seed=seed, width=1)
+
+    def test_update_overflow_and_priority_failure_are_transactional(self) -> None:
+        full = _max_count_sketch("full")
+        before = full.to_bytes()
+        with self.assertRaisesRegex((OverflowError, ValueError), "limit|overflow"):
+            full.update("extra", [2.0])
+        self.assertEqual(full.to_bytes(), before)
+
+        ordinary = PriorityRowSketch(capacity=2, seed=1, width=1)
+        ordinary.update("existing", [1.0])
+        before = ordinary.to_bytes()
+        with (
+            patch.object(
+                quantile_module,
+                "_priority_for_uid",
+                side_effect=RuntimeError("priority failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "priority failed"),
+        ):
+            ordinary.update("new", [2.0])
+        self.assertEqual(ordinary.to_bytes(), before)
+
+    def test_merge_counter_overflow_is_rejected_transactionally(self) -> None:
+        left = _max_count_sketch("left")
+        right = _max_count_sketch("right")
+        before = left.to_bytes()
+        with self.assertRaisesRegex((OverflowError, ValueError), "limit|overflow"):
+            left.merge(right)
+        self.assertEqual(left.to_bytes(), before)
 
     def test_merge_requires_compatible_sketches_and_is_transactional(self) -> None:
         base = PriorityRowSketch(capacity=3, seed=1, width=2)

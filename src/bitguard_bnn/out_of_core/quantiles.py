@@ -25,6 +25,18 @@ from numpy.typing import NDArray
 
 ALGORITHM = "blake2b-128-bottom-k-complete-row"
 VERSION = 1
+LIMITS_VERSION = 1
+# These limits cover the full profiles (capacity 200,000 and up to 115 current
+# source features) while bounding allocations from untrusted state. Canonical
+# JSON float tokens for that 23-million-value profile fit below 768 MiB.
+MAX_SKETCH_WIDTH = 4_096
+MAX_SKETCH_CAPACITY = 1_000_000
+MAX_RETAINED_ROWS = 1_000_000
+MAX_RETAINED_VALUES = 32_000_000
+MAX_SERIALIZED_BYTES = 768 * 1024**2
+MAX_COUNT = int(np.iinfo(np.int64).max)
+MIN_SEED = -(2**63)
+MAX_SEED = 2**63 - 1
 _PERSONALIZATION = b"bg-row-prio-v1"
 
 
@@ -88,12 +100,31 @@ def _row_tokens(values: Sequence[float]) -> tuple[str, ...]:
     return tuple(_float_token(value) for value in values)
 
 
-def _require_plain_int(value: object, name: str, *, positive: bool = False) -> int:
+def _require_plain_int(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
     if positive and value <= 0:
         raise ValueError(f"{name} must be positive")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must not exceed {maximum}")
     return value
+
+
+def _validate_shape_product(capacity: int, width: int) -> None:
+    if capacity * width > MAX_RETAINED_VALUES:
+        raise ValueError(
+            "capacity * width exceeds the "
+            f"{MAX_RETAINED_VALUES} retained values limit"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,9 +157,25 @@ class PriorityRowSketch:
     version = VERSION
 
     def __init__(self, *, capacity: int, seed: int, width: int) -> None:
-        self._capacity = _require_plain_int(capacity, "capacity", positive=True)
-        self._seed = _require_plain_int(seed, "seed")
-        self._width = _require_plain_int(width, "width", positive=True)
+        self._capacity = _require_plain_int(
+            capacity,
+            "capacity",
+            positive=True,
+            maximum=MAX_SKETCH_CAPACITY,
+        )
+        self._seed = _require_plain_int(
+            seed,
+            "seed",
+            minimum=MIN_SEED,
+            maximum=MAX_SEED,
+        )
+        self._width = _require_plain_int(
+            width,
+            "width",
+            positive=True,
+            maximum=MAX_SKETCH_WIDTH,
+        )
+        _validate_shape_product(self._capacity, self._width)
         self._algorithm = self.algorithm
         self._version = self.version
         self._heap: list[_HeapRow] = []
@@ -208,14 +255,28 @@ class PriorityRowSketch:
             result.append(float("nan") if math.isnan(converted) else converted)
         return tuple(result)
 
-    def _retain(self, row: _HeapRow) -> None:
+    def _retention_action(self, row: _HeapRow) -> tuple[str, _HeapRow | None]:
         if len(self._heap) < self.capacity:
+            return "append", None
+        if row.key >= self._heap[0].key:
+            return "discard", None
+        return "replace", self._heap[0]
+
+    def _apply_retention(
+        self,
+        row: _HeapRow,
+        action: tuple[str, _HeapRow | None],
+    ) -> None:
+        operation, expected_evicted = action
+        if operation == "append":
             heapq.heappush(self._heap, row)
             self._retained_by_uid[row.row_uid] = row
             return
-        if row.key >= self._heap[0].key:
+        if operation == "discard":
             return
         evicted = heapq.heapreplace(self._heap, row)
+        if evicted is not expected_evicted:
+            raise RuntimeError("priority sketch heap changed during update")
         del self._retained_by_uid[evicted.row_uid]
         self._retained_by_uid[row.row_uid] = row
 
@@ -235,11 +296,24 @@ class PriorityRowSketch:
                 return
             raise ValueError(f"conflicting duplicate row_uid: {uid}")
 
+        priority = _priority_for_uid(self.seed, uid)
+        prospective_total = self._total_rows + 1
+        if prospective_total > MAX_COUNT:
+            raise OverflowError(f"total_rows exceeds the {MAX_COUNT} counter limit")
         finite = np.isfinite(np.asarray(row_values, dtype=np.float64))
-        self._total_rows += 1
-        self._finite_counts += finite.astype(np.int64)
-        self._missing_counts += (~finite).astype(np.int64)
-        self._retain(_HeapRow(_priority_for_uid(self.seed, uid), uid, row_values))
+        # A valid column count never exceeds total_rows. Checking the
+        # prospective total first therefore proves these int64 additions safe.
+        next_finite = self._finite_counts + finite.astype(np.int64)
+        next_missing = self._missing_counts + (~finite).astype(np.int64)
+        row = _HeapRow(priority, uid, row_values)
+        retention_action = self._retention_action(row)
+
+        # Priority calculation, counter bounds, arrays, and the heap decision
+        # are complete before any observable state is mutated.
+        self._apply_retention(row, retention_action)
+        self._total_rows = prospective_total
+        self._finite_counts = next_finite
+        self._missing_counts = next_missing
 
     def update_many(
         self,
@@ -298,25 +372,48 @@ class PriorityRowSketch:
             key=lambda row: row.key,
         )
 
-        overlap_finite: NDArray[np.int64] = np.zeros(
-            self.width, dtype=np.int64
-        )
+        overlap_finite = [0] * self.width
         for uid in overlap:
-            values = np.asarray(self._retained_by_uid[uid].values, dtype=np.float64)
-            overlap_finite += np.isfinite(values).astype(np.int64)
-        overlap_missing: NDArray[np.int64] = len(overlap) - overlap_finite
+            for column, value in enumerate(self._retained_by_uid[uid].values):
+                overlap_finite[column] += int(math.isfinite(value))
+        overlap_missing = [len(overlap) - count for count in overlap_finite]
+
+        prospective_total = self._total_rows + other._total_rows - len(overlap)
+        if not 0 <= prospective_total <= MAX_COUNT:
+            raise OverflowError(f"merged total_rows exceeds the {MAX_COUNT} counter limit")
+        prospective_finite: list[int] = []
+        prospective_missing: list[int] = []
+        for column in range(self.width):
+            finite_count = (
+                int(self._finite_counts[column])
+                + int(other._finite_counts[column])
+                - overlap_finite[column]
+            )
+            missing_count = (
+                int(self._missing_counts[column])
+                + int(other._missing_counts[column])
+                - overlap_missing[column]
+            )
+            if (
+                not 0 <= finite_count <= MAX_COUNT
+                or not 0 <= missing_count <= MAX_COUNT
+                or finite_count + missing_count != prospective_total
+            ):
+                raise OverflowError("merged column counts overflow or contradict total_rows")
+            prospective_finite.append(finite_count)
+            prospective_missing.append(missing_count)
+        next_finite = np.asarray(prospective_finite, dtype=np.int64)
+        next_missing = np.asarray(prospective_missing, dtype=np.int64)
+        next_heap = list(retained)
+        heapq.heapify(next_heap)
+        next_by_uid = {row.row_uid: row for row in retained}
 
         # Commit only after compatibility and overlap validation have succeeded.
-        self._total_rows = self._total_rows + other._total_rows - len(overlap)
-        self._finite_counts = (
-            self._finite_counts + other._finite_counts - overlap_finite
-        )
-        self._missing_counts = (
-            self._missing_counts + other._missing_counts - overlap_missing
-        )
-        self._heap = list(retained)
-        heapq.heapify(self._heap)
-        self._retained_by_uid = {row.row_uid: row for row in retained}
+        self._total_rows = prospective_total
+        self._finite_counts = next_finite
+        self._missing_counts = next_missing
+        self._heap = next_heap
+        self._retained_by_uid = next_by_uid
         return self
 
     def quantile(self, column: int, q: float) -> float:
@@ -422,10 +519,25 @@ class PriorityRowSketch:
             "checksum": hashlib.sha256(payload_bytes).hexdigest(),
             "payload": payload,
         }
-        return _canonical_json(envelope)
+        serialized = _canonical_json(envelope)
+        if len(serialized) > MAX_SERIALIZED_BYTES:
+            raise ValueError(
+                f"serialized sketch size exceeds {MAX_SERIALIZED_BYTES} bytes"
+            )
+        return serialized
 
     @classmethod
     def from_bytes(cls, serialized: bytes | bytearray | memoryview) -> "PriorityRowSketch":
+        if isinstance(serialized, memoryview):
+            serialized_size = serialized.nbytes
+        elif isinstance(serialized, (bytes, bytearray)):
+            serialized_size = len(serialized)
+        else:
+            raise ValueError("serialized sketch must be bytes-like")
+        if serialized_size > MAX_SERIALIZED_BYTES:
+            raise ValueError(
+                f"serialized sketch size exceeds {MAX_SERIALIZED_BYTES} bytes"
+            )
         try:
             raw = bytes(serialized)
             envelope = json.loads(raw.decode("utf-8"))
@@ -445,46 +557,18 @@ class PriorityRowSketch:
 
     @classmethod
     def _from_snapshot(cls, payload: Mapping[str, Any]) -> "PriorityRowSketch":
-        expected_keys = {
-            "algorithm",
-            "version",
-            "capacity",
-            "seed",
-            "width",
-            "total_rows",
-            "finite_counts",
-            "missing_counts",
-            "retained_rows",
-            "deduplication",
-        }
-        if set(payload) != expected_keys:
-            raise ValueError("serialized sketch fields are invalid")
-        if payload["algorithm"] != ALGORITHM:
-            raise ValueError("unsupported sketch algorithm")
-        if payload["version"] != VERSION:
-            raise ValueError("unsupported sketch version")
-        if payload["deduplication"] != cls._deduplication_contract():
-            raise ValueError("serialized deduplication contract is invalid")
-
-        sketch = cls(
-            capacity=_require_plain_int(payload["capacity"], "capacity", positive=True),
-            seed=_require_plain_int(payload["seed"], "seed"),
-            width=_require_plain_int(payload["width"], "width", positive=True),
-        )
-        total_rows = _require_plain_int(payload["total_rows"], "total_rows")
-        if total_rows < 0:
-            raise ValueError("total_rows must be non-negative")
-        finite = cls._parse_counts(payload["finite_counts"], sketch.width, "finite_counts")
-        missing = cls._parse_counts(payload["missing_counts"], sketch.width, "missing_counts")
-        if np.any(finite + missing != total_rows):
-            raise ValueError("serialized counts do not match total_rows")
-
-        retained_payload = payload["retained_rows"]
-        if not isinstance(retained_payload, list):
-            raise ValueError("retained_rows must be a list")
-        expected_retained = min(total_rows, sketch.capacity)
-        if len(retained_payload) != expected_retained:
-            raise ValueError("serialized retained row count is invalid")
+        (
+            capacity,
+            seed,
+            width,
+            total_rows,
+            finite_values,
+            missing_values,
+            retained_payload,
+        ) = cls._preflight_snapshot(payload)
+        sketch = cls(capacity=capacity, seed=seed, width=width)
+        finite = np.asarray(finite_values, dtype=np.int64)
+        missing = np.asarray(missing_values, dtype=np.int64)
 
         rows: list[_HeapRow] = []
         seen_uids: set[str] = set()
@@ -533,17 +617,107 @@ class PriorityRowSketch:
         sketch._retained_by_uid = {row.row_uid: row for row in rows}
         return sketch
 
+    @classmethod
+    def _preflight_snapshot(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> tuple[int, int, int, int, list[int], list[int], list[Any]]:
+        """Validate all allocation-driving state using Python scalars only."""
+
+        expected_keys = {
+            "algorithm",
+            "version",
+            "capacity",
+            "seed",
+            "width",
+            "total_rows",
+            "finite_counts",
+            "missing_counts",
+            "retained_rows",
+            "deduplication",
+        }
+        if set(payload) != expected_keys:
+            raise ValueError("serialized sketch fields are invalid")
+        if not isinstance(payload["algorithm"], str) or payload["algorithm"] != ALGORITHM:
+            raise ValueError("unsupported sketch algorithm")
+        version = _require_plain_int(payload["version"], "version")
+        if version != VERSION:
+            raise ValueError("unsupported sketch version")
+        if payload["deduplication"] != cls._deduplication_contract():
+            raise ValueError("serialized deduplication contract is invalid")
+
+        capacity = _require_plain_int(
+            payload["capacity"],
+            "capacity",
+            positive=True,
+            maximum=MAX_SKETCH_CAPACITY,
+        )
+        seed = _require_plain_int(
+            payload["seed"],
+            "seed",
+            minimum=MIN_SEED,
+            maximum=MAX_SEED,
+        )
+        width = _require_plain_int(
+            payload["width"],
+            "width",
+            positive=True,
+            maximum=MAX_SKETCH_WIDTH,
+        )
+        _validate_shape_product(capacity, width)
+        total_rows = _require_plain_int(
+            payload["total_rows"],
+            "total_rows",
+            minimum=0,
+            maximum=MAX_COUNT,
+        )
+        finite = cls._parse_count_values(payload["finite_counts"], width, "finite_counts")
+        missing = cls._parse_count_values(
+            payload["missing_counts"], width, "missing_counts"
+        )
+        if any(
+            finite_count + missing_count != total_rows
+            for finite_count, missing_count in zip(finite, missing)
+        ):
+            raise ValueError("serialized counts do not match total_rows")
+
+        retained_payload = payload["retained_rows"]
+        if not isinstance(retained_payload, list):
+            raise ValueError("retained_rows must be a list")
+        if len(retained_payload) > MAX_RETAINED_ROWS:
+            raise ValueError(
+                f"retained row count exceeds the {MAX_RETAINED_ROWS} limit"
+            )
+        expected_retained = min(total_rows, capacity)
+        if len(retained_payload) != expected_retained:
+            raise ValueError("serialized retained row count is invalid")
+        return capacity, seed, width, total_rows, finite, missing, retained_payload
+
     @staticmethod
-    def _parse_counts(value: object, width: int, name: str) -> np.ndarray:
+    def _parse_count_values(value: object, width: int, name: str) -> list[int]:
         if not isinstance(value, list) or len(value) != width:
             raise ValueError(f"{name} must contain exactly width entries")
         parsed: list[int] = []
         for count in value:
-            parsed_count = _require_plain_int(count, name)
-            if parsed_count < 0:
-                raise ValueError(f"{name} entries must be non-negative")
+            parsed_count = _require_plain_int(
+                count,
+                name,
+                minimum=0,
+                maximum=MAX_COUNT,
+            )
             parsed.append(parsed_count)
-        return np.asarray(parsed, dtype=np.int64)
+        return parsed
 
 
-__all__ = ["PriorityRowSketch"]
+__all__ = [
+    "LIMITS_VERSION",
+    "MAX_COUNT",
+    "MAX_RETAINED_ROWS",
+    "MAX_RETAINED_VALUES",
+    "MAX_SEED",
+    "MAX_SERIALIZED_BYTES",
+    "MAX_SKETCH_CAPACITY",
+    "MAX_SKETCH_WIDTH",
+    "MIN_SEED",
+    "PriorityRowSketch",
+]
