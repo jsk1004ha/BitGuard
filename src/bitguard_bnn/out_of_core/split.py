@@ -294,13 +294,16 @@ def _iter_run(
         parquet = pq.ParquetFile(handle)
         for batch in parquet.iter_batches(batch_size=batch_rows):
             rows = batch.to_pylist()
+            row_count = len(rows)
             if tracker is not None:
-                tracker.open_merge_batch(len(rows))
+                tracker.open_merge_batch(row_count)
             try:
                 yield from rows
             finally:
+                rows.clear()
                 if tracker is not None:
-                    tracker.close_merge_batch(len(rows))
+                    tracker.close_merge_batch(row_count)
+                del rows
 
 
 def _merge_direct(

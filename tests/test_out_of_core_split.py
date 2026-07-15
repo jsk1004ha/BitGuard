@@ -6,7 +6,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from unittest.mock import patch
 
 import pandas as pd
@@ -399,6 +399,63 @@ class OutOfCoreSplitTests(unittest.TestCase):
                         Path(temp),
                         merge_read_batch_rows=invalid,  # type: ignore[arg-type]
                     )
+
+    def test_merge_releases_materialized_rows_before_advancing_or_unwinding(self) -> None:
+        from bitguard_bnn.out_of_core import split as split_module
+
+        materialized: list[list[dict[str, int]]] = []
+        rows_seen_before_next_batch: list[int] = []
+        outer = self
+
+        class FakeBatch:
+            def __init__(self, start: int) -> None:
+                self.start = start
+
+            def to_pylist(self) -> list[dict[str, int]]:
+                rows = [{"value": self.start}, {"value": self.start + 1}]
+                materialized.append(rows)
+                return rows
+
+        class FakeParquetFile:
+            def __init__(self, _handle: object) -> None:
+                pass
+
+            def iter_batches(self, *, batch_size: int):
+                outer.assertEqual(batch_size, 2)
+                for start in (0, 2):
+                    if materialized:
+                        rows_seen_before_next_batch.append(len(materialized[-1]))
+                    yield FakeBatch(start)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run = root / "run.parquet"
+            run.touch()
+            tracker = split_module._ResourceTracker(root, 4, 2)
+            with patch.object(split_module.pq, "ParquetFile", FakeParquetFile):
+                iterator = split_module._iter_run(run, 2, tracker)
+                self.assertEqual(next(iterator)["value"], 0)
+                self.assertEqual(next(iterator)["value"], 1)
+                self.assertEqual(next(iterator)["value"], 2)
+                self.assertEqual(rows_seen_before_next_batch, [0])
+                self.assertEqual(materialized[0], [])
+                iterator.close()
+                self.assertEqual(materialized[1], [])
+                self.assertEqual(tracker._merge_input_rows_buffered, 0)
+
+                error_tracker = split_module._ResourceTracker(root, 4, 2)
+
+                def fail_key(_row: Mapping[str, object]) -> tuple[object, ...]:
+                    raise RuntimeError("injected merge key failure")
+
+                merged = split_module._merge_direct([run], fail_key, 2, error_tracker)
+                with self.assertRaisesRegex(RuntimeError, "merge key failure"):
+                    next(merged)
+                self.assertEqual(materialized[-1], [])
+                self.assertEqual(error_tracker._merge_input_rows_buffered, 0)
+
+        self.assertEqual(tracker.max_merge_input_rows_buffered, 2)
+        self.assertTrue(all(not rows for rows in materialized))
 
     def test_manifest_publication_failure_rolls_back_membership_and_partials(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
