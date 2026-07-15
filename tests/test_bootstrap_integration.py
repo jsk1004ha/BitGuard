@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -12,7 +13,7 @@ import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from bitguard_bnn.bootstrap.cleanup import scan_cleanup_debt
 from bitguard_bnn.bootstrap.download import DownloadResult, download_file
@@ -35,6 +36,8 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         "last_completed_stage",
         "failed_stage",
         "error",
+        "report_error",
+        "lock_release_error",
         "recovery_command",
         "inputs",
         "compute",
@@ -414,7 +417,10 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         journal = self.root / "journal.json"
         with patch.object(orchestrator_module, "_fsync_parent_directory") as durable:
             orchestrator_module._write_json(journal, {"status": "intent"})
-        durable.assert_called_once_with(journal)
+        self.assertEqual(
+            durable.call_args_list,
+            [call(journal.parent), call(journal)],
+        )
 
         candidate = self.root / ".bitguard-acquire-test-candidate"
         destination = self.root / "published.bin"
@@ -557,6 +563,51 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "non-symlink directory"):
                     orchestrator_module._ensure_durable_directory(root)
 
+    def test_tree_durability_flushes_files_and_directories_bottom_up(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        root = self.root / "durability-tree"
+        child = root / "child"
+        child.mkdir(parents=True)
+        child_file = child / "child.bin"
+        root_file = root / "root.bin"
+        child_file.write_bytes(b"child")
+        root_file.write_bytes(b"root")
+        events: list[tuple[str, Path]] = []
+
+        with (
+            patch.object(
+                orchestrator_module,
+                "_fsync_regular_file",
+                side_effect=lambda path: events.append(("file", Path(path))),
+            ),
+            patch.object(
+                orchestrator_module,
+                "_fsync_directory",
+                side_effect=lambda path: events.append(("directory", Path(path))),
+            ),
+            patch.object(
+                orchestrator_module,
+                "_fsync_parent_directory",
+                side_effect=lambda path: events.append(("parent", Path(path))),
+            ),
+        ):
+            orchestrator_module._make_tree_durable(root)
+
+        self.assertLess(
+            events.index(("file", child_file)),
+            events.index(("directory", child)),
+        )
+        self.assertLess(
+            events.index(("directory", child)),
+            events.index(("directory", root)),
+        )
+        self.assertLess(
+            events.index(("file", root_file)),
+            events.index(("directory", root)),
+        )
+        self.assertEqual(events[-1], ("parent", root))
+
     def test_protocol_roots_use_durable_creation_in_stage_order(self) -> None:
         from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
 
@@ -581,14 +632,26 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
 
         self.assertEqual(report["status"], "sources_verified")
         metadata = self.data_root / ".bitguard"
-        self.assertEqual(
-            observed,
-            [
-                metadata / "acquired",
-                metadata / "acquisition-journal",
-                self.data_root / "raw",
-                metadata / "extraction-journal",
-            ],
+        required = (
+            self.data_root,
+            metadata,
+            self.runs_root,
+            metadata / "acquired",
+            metadata / "acquisition-journal",
+            self.data_root / "raw",
+            metadata / "extraction-journal",
+            metadata / "manifests",
+            metadata / "schema",
+        )
+        for path in required:
+            self.assertIn(path, observed)
+        self.assertLess(
+            observed.index(metadata / "acquired"),
+            observed.index(metadata / "acquisition-journal"),
+        )
+        self.assertLess(
+            observed.index(self.data_root / "raw"),
+            observed.index(metadata / "extraction-journal"),
         )
 
     def test_journal_and_aggregate_reports_redact_injected_downloader_urls(
@@ -1024,7 +1087,271 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
             {"prefix <redacted-url>", "prefix <redacted-url>#collision-2"},
         )
 
-    def test_lock_release_failure_uses_same_comprehensive_report_schema(self) -> None:
+    def test_redaction_fails_closed_for_every_uri_scheme_and_mapping_key(
+        self,
+    ) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        payload = {
+            "ftp://user:ftp-secret@example.invalid/a?token=ftp#fragment": "ftp",
+            "s3://access:s3-secret@bucket/key?X-Amz-Signature=signed": "s3",
+            "file://user:file-secret@host/path?api_key=file-key": "file",
+            r"custom:\user:custom-secret@example.invalid\path?secret=custom": "custom",
+            "opaque:user:opaque-secret@example.invalid/path?secret=opaque": "opaque",
+        }
+
+        redacted = orchestrator_module._redact_report_value(payload)
+
+        encoded = json.dumps(redacted)
+        for secret in (
+            "ftp-secret",
+            "s3-secret",
+            "file-secret",
+            "custom-secret",
+            "opaque-secret",
+            "token=ftp",
+            "X-Amz-Signature",
+            "api_key",
+            "secret=custom",
+            "secret=opaque",
+            "#fragment",
+        ):
+            self.assertNotIn(secret, encoded)
+        self.assertEqual(
+            set(redacted.values()),
+            {"ftp", "s3", "file", "custom", "opaque"},
+        )
+
+    def test_copy_tree_fsync_failure_prevents_journal_and_publication(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        options = replace(self.options, datasets=("botiot",))
+        original_fsync_directory = orchestrator_module._fsync_directory
+
+        def fail_copy_staging(path):
+            if path.name.startswith(".bitguard-extract-copy-"):
+                raise OSError("injected copied-tree fsync failure")
+            return original_fsync_directory(path)
+
+        with patch.object(
+            orchestrator_module,
+            "_fsync_directory",
+            side_effect=fail_copy_staging,
+        ):
+            failed = run_bootstrap(options, dependencies=self.dependencies())
+
+        self.assertEqual(failed["failed_stage"], "acquire")
+        metadata = self.data_root / ".bitguard"
+        self.assertFalse((metadata / "acquisition-journal" / "botiot.json").exists())
+        acquired = metadata / "acquired"
+        self.assertFalse(any(acquired.glob("botiot-*")))
+
+    def test_extracted_tree_fsync_failure_prevents_journal_and_publication(
+        self,
+    ) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        options = replace(
+            self.options,
+            datasets=("nbaiot",),
+            botiot_source=None,
+            accepted_botiot_license=False,
+        )
+        original_fsync_directory = orchestrator_module._fsync_directory
+
+        def fail_extraction_staging(path):
+            if path.name.startswith(".bitguard-extract-nbaiot-"):
+                raise OSError("injected extracted-tree fsync failure")
+            return original_fsync_directory(path)
+
+        with patch.object(
+            orchestrator_module,
+            "_fsync_directory",
+            side_effect=fail_extraction_staging,
+        ):
+            failed = run_bootstrap(options, dependencies=self.dependencies())
+
+        self.assertEqual(failed["failed_stage"], "extract")
+        metadata = self.data_root / ".bitguard"
+        self.assertFalse((metadata / "extraction-journal" / "nbaiot.json").exists())
+        self.assertFalse(any((self.data_root / "raw").glob("nbaiot-*")))
+
+    def test_every_protocol_directory_is_reverified_on_fresh_and_retry_runs(
+        self,
+    ) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        original_ensure = orchestrator_module._ensure_durable_directory
+        with patch.object(
+            orchestrator_module,
+            "_ensure_durable_directory",
+            wraps=original_ensure,
+        ) as ensure:
+            first = run_bootstrap(self.options, dependencies=self.dependencies())
+            retry = run_bootstrap(
+                replace(self.options, restart_stage="inspect"),
+                dependencies=self.dependencies(),
+            )
+
+        self.assertEqual(first["status"], "sources_verified")
+        self.assertEqual(retry["status"], "sources_verified")
+        verified = [call.args[0] for call in ensure.call_args_list]
+        for required in (
+            self.data_root,
+            self.data_root / ".bitguard",
+            self.data_root / ".bitguard" / "manifests",
+            self.data_root / ".bitguard" / "schema",
+            self.runs_root,
+        ):
+            self.assertGreaterEqual(verified.count(required), 2, required)
+
+    def test_hardware_change_invalidates_environment_and_downstream_stages(
+        self,
+    ) -> None:
+        first = run_bootstrap(self.options, dependencies=self.dependencies())
+        changed = self.dependencies()
+        changed = replace(
+            changed,
+            compute_resolver=lambda requested: {
+                "requested": requested,
+                "selected_profile": "cpu",
+                "device": "cpu",
+                "device_name": "different-cpu-profile",
+            },
+        )
+
+        rerun = run_bootstrap(self.options, dependencies=changed)
+
+        self.assertEqual(first["status"], "sources_verified")
+        self.assertEqual(rerun["reused_stages"], ["preflight"])
+        self.assertEqual(
+            rerun["executed_stages"],
+            ["environment", "acquire", "extract", "inspect"],
+        )
+
+    def test_moving_data_root_invalidates_environment_and_downstream_stages(
+        self,
+    ) -> None:
+        first = run_bootstrap(self.options, dependencies=self.dependencies())
+        moved_root = (self.root / "moved-data").resolve()
+        shutil.copytree(self.data_root, moved_root)
+        moved = replace(self.options, data_root=moved_root)
+
+        rerun = run_bootstrap(moved, dependencies=self.dependencies())
+
+        self.assertEqual(first["status"], "sources_verified")
+        self.assertEqual(rerun["reused_stages"], ["preflight"])
+        self.assertEqual(rerun["executed_stages"], ["environment"])
+        self.assertEqual(rerun["failed_stage"], "acquire")
+        for downstream in ("acquire", "extract", "inspect"):
+            self.assertNotIn(downstream, rerun["reused_stages"])
+
+    def test_environment_manifest_omits_hostname_user_and_unknown_secrets(self) -> None:
+        dependencies = replace(
+            self.dependencies(),
+            compute_resolver=lambda requested: {
+                "requested": requested,
+                "selected_profile": "cpu",
+                "device": "cpu",
+                "hostname": "private-host-secret",
+                "user": "private-user-secret",
+                "custom_token": "private-token-secret",
+            },
+        )
+
+        report = run_bootstrap(self.options, dependencies=dependencies)
+
+        environment = Path(report["reports"]["environment"]).read_text(encoding="utf-8")
+        payload = json.loads(environment)
+        self.assertEqual(
+            set(payload["runtime"]),
+            {"os", "python", "torch", "cuda"},
+        )
+        self.assertGreaterEqual(
+            set(payload["runtime"]["os"]),
+            {"system", "platform", "release", "version", "machine", "processor"},
+        )
+        self.assertEqual(
+            set(payload["runtime"]["python"]),
+            {"implementation", "version"},
+        )
+        self.assertIn("version", payload["runtime"]["torch"])
+        self.assertGreaterEqual(
+            set(payload["runtime"]["cuda"]),
+            {"runtime", "device", "device_name", "device_index", "profile"},
+        )
+        self.assertEqual(len(payload["data_root_identity"]), 64)
+        self.assertNotIn(str(self.data_root), environment)
+        for secret in (
+            "private-host-secret",
+            "private-user-secret",
+            "private-token-secret",
+        ):
+            self.assertNotIn(secret, environment)
+
+    def test_stage_failure_remains_primary_when_report_persistence_also_fails(
+        self,
+    ) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        original_write_json = orchestrator_module._write_json
+
+        def fail_canonical_report(path, value):
+            if path.name == "bootstrap-report.json":
+                raise OSError("injected canonical report failure")
+            return original_write_json(path, value)
+
+        with (
+            patch.object(
+                orchestrator_module,
+                "_write_json",
+                side_effect=fail_canonical_report,
+            ),
+            patch.object(
+                orchestrator_module,
+                "_extract_archive",
+                side_effect=RuntimeError("injected extraction stage failure"),
+            ),
+        ):
+            failed = run_bootstrap(self.options, dependencies=self.dependencies())
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failed_stage"], "extract")
+        self.assertIn("injected extraction stage failure", failed["error"])
+        self.assertIn("injected canonical report failure", failed["report_error"])
+        self.assertIsNone(failed["lock_release_error"])
+        self.assertNotEqual(Path(failed["report_path"]).name, "bootstrap-report.json")
+        self.assert_comprehensive_report(failed)
+
+    def test_stage_failure_remains_primary_when_lock_release_also_fails(self) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        original_release = BootstrapWriterLock.release
+
+        def fail_after_release(lock):
+            original_release(lock)
+            raise RuntimeError("injected lock release failure")
+
+        with (
+            patch.object(BootstrapWriterLock, "release", fail_after_release),
+            patch.object(
+                orchestrator_module,
+                "_extract_archive",
+                side_effect=RuntimeError("injected extraction stage failure"),
+            ),
+        ):
+            failed = run_bootstrap(self.options, dependencies=self.dependencies())
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["failed_stage"], "extract")
+        self.assertIn("injected extraction stage failure", failed["error"])
+        self.assertIn("injected lock release failure", failed["lock_release_error"])
+        self.assertIsNone(failed["report_error"])
+        self.assert_comprehensive_report(failed)
+
+    def test_successful_stages_with_lock_release_failure_never_publish_success(
+        self,
+    ) -> None:
         original_release = BootstrapWriterLock.release
 
         def fail_after_release(lock):
@@ -1045,7 +1372,15 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["last_completed_stage"], "inspect")
         self.assertEqual(failed["failed_stage"], "lock-release")
+        self.assertIn("release", failed["lock_release_error"])
+        self.assertIsNone(failed["report_error"])
         self.assert_comprehensive_report(failed)
+        canonical = self.data_root / ".bitguard" / "bootstrap-report.json"
+        self.assertEqual(Path(failed["report_path"]), canonical)
+        self.assertEqual(
+            json.loads(canonical.read_text(encoding="utf-8"))["status"],
+            "failed",
+        )
         encoded = json.dumps(failed)
         self.assertNotIn("secret", encoded)
         self.assertNotIn("token=release", encoded)
@@ -1112,6 +1447,52 @@ class CleanupDebtTest(unittest.TestCase):
             self.assertIn("Get-Item -Force -LiteralPath", windows["recovery_command"])
             self.assertIn(str(retired).replace("'", "''"), windows["recovery_command"])
             self.assertNotIn("Remove-Item", windows["recovery_command"])
+
+    def test_scan_never_traverses_symlinked_debt_and_records_scan_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "secret.bin").write_bytes(b"do-not-count")
+            linked = root / ".bitguard-retired-linked"
+            try:
+                linked.symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks unavailable: {error}")
+
+            report = scan_cleanup_debt((root,))
+
+            self.assertEqual(report["apparent_bytes"], 0)
+            self.assertEqual(report["unique_bytes"], 0)
+            self.assertTrue(report["scan_errors"])
+            self.assertIn(str(linked), json.dumps(report["scan_errors"]))
+
+    def test_scan_reports_interrupted_partial_and_private_json_temporaries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            partial = root / "archive.zip.partial"
+            partial.write_bytes(b"partial")
+            report_temp = root / (
+                "bootstrap-report.json.0123456789abcdef0123456789abcdef.tmp"
+            )
+            report_temp.write_bytes(b"report")
+            journal_temp = root / "nbaiot.json.abcdef0123456789abcdef0123456789.tmp"
+            journal_temp.write_bytes(b"journal")
+            (root / "ordinary.tmp").write_bytes(b"ignore")
+
+            report = scan_cleanup_debt((root,))
+
+            paths = {
+                Path(item["path"]).name: item["kind"] for item in report["artifacts"]
+            }
+            self.assertEqual(paths[partial.name], "partial")
+            self.assertEqual(paths[report_temp.name], "atomic_json_temporary")
+            self.assertEqual(paths[journal_temp.name], "atomic_json_temporary")
+            self.assertNotIn("ordinary.tmp", paths)
+            for candidate in (partial, report_temp, journal_temp):
+                self.assertTrue(candidate.exists())
 
 
 class GitIgnoreContractTest(unittest.TestCase):

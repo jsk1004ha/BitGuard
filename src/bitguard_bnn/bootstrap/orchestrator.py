@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -47,7 +50,11 @@ UNKNOWN_REMOTE_ARCHIVE_BYTES = 4 * 1024**3
 ARCHIVE_EXPANSION_FACTOR = 12
 REPORT_AND_METADATA_BYTES = 64 * 1024**2
 DEFAULT_DISK_RESERVE_BYTES = 2 * 1024**3
-_URLISH_PATH = re.compile(r"https?:[\\/]+", re.IGNORECASE)
+_URLISH_PATH = re.compile(
+    r"(?<![A-Za-z0-9+.-])(?![A-Za-z]:[\\/])"
+    r"[A-Za-z][A-Za-z0-9+.-]*:(?:[\\/]+|[^\s]*[@?#][^\s]*)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +188,7 @@ def _write_all(descriptor: int, payload: bytes) -> None:
 
 
 def _write_json(path: Path, value: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_durable_directory(path.parent)
     payload = (
         json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
@@ -251,8 +258,24 @@ def _ensure_durable_directory(path: Path) -> bool:
         _fsync_parent_directory(path)
         return False
 
+    parent = path.parent
+    if parent == path:
+        raise RuntimeError(f"Cannot create missing protocol filesystem root: {path}")
     try:
-        path.mkdir(parents=True, exist_ok=False)
+        parent_result = parent.lstat()
+    except FileNotFoundError:
+        _ensure_durable_directory(parent)
+        parent_result = parent.lstat()
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot inspect protocol directory parent {parent}: {error}"
+        ) from error
+    if unsafe(parent_result):
+        raise RuntimeError(
+            f"Protocol directory parent must be a non-symlink directory: {parent}"
+        )
+    try:
+        path.mkdir(exist_ok=False)
     except FileExistsError:
         current = path.lstat()
         if unsafe(current):
@@ -268,6 +291,99 @@ def _ensure_durable_directory(path: Path) -> bool:
     _fsync_directory(path)
     _fsync_parent_directory(path)
     return True
+
+
+def _fsync_regular_file(path: Path) -> None:
+    """Flush one unchanged regular file and reject link/reparse substitution."""
+
+    before = path.lstat()
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or bool(getattr(before, "st_reparse_tag", 0))
+    ):
+        raise RuntimeError(f"Durability target must be a regular file: {path}")
+    descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    sync_error: OSError | None = None
+    opened: os.stat_result | None = None
+    try:
+        opened = os.fstat(descriptor)
+        os.fsync(descriptor)
+    except OSError as error:
+        sync_error = error
+    try:
+        os.close(descriptor)
+    except OSError as close_error:
+        if sync_error is not None:
+            raise OSError(
+                f"file fsync failed: {sync_error}; file close failed: {close_error}"
+            ) from sync_error
+        raise
+    if sync_error is not None:
+        raise sync_error
+    after = path.lstat()
+    identity = lambda result: (
+        result.st_dev,
+        result.st_ino,
+        stat.S_IFMT(result.st_mode),
+        result.st_size,
+        result.st_mtime_ns,
+    )
+    if (
+        opened is None
+        or identity(before) != identity(opened)
+        or identity(before) != identity(after)
+    ):
+        raise RuntimeError(f"Durability target changed while it was flushed: {path}")
+
+
+def _make_tree_durable(root: Path) -> None:
+    """Flush regular files and directories bottom-up before tree publication."""
+
+    def visit(directory: Path) -> None:
+        result = directory.lstat()
+        if (
+            stat.S_ISLNK(result.st_mode)
+            or not stat.S_ISDIR(result.st_mode)
+            or bool(getattr(result, "st_reparse_tag", 0))
+        ):
+            raise RuntimeError(
+                f"Durability tree must contain only non-link directories: {directory}"
+            )
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as error:
+            raise RuntimeError(
+                f"Cannot scan durability tree {directory}: {error}"
+            ) from error
+        for entry in entries:
+            candidate = Path(entry.path)
+            child = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(child.st_mode) or bool(getattr(child, "st_reparse_tag", 0)):
+                raise RuntimeError(
+                    f"Durability tree links are not allowed: {candidate}"
+                )
+            if stat.S_ISDIR(child.st_mode):
+                visit(candidate)
+            elif stat.S_ISREG(child.st_mode):
+                _fsync_regular_file(candidate)
+            else:
+                raise RuntimeError(
+                    f"Durability tree contains an unsupported entry: {candidate}"
+                )
+        _fsync_directory(directory)
+
+    visit(root)
+    _fsync_parent_directory(root)
+
+
+def _make_content_durable(path: Path, kind: str) -> None:
+    if kind == "directory":
+        _make_tree_durable(path)
+        return
+    _fsync_regular_file(path)
+    _fsync_parent_directory(path)
 
 
 def _redact_text(value: str) -> str:
@@ -319,6 +435,76 @@ def _sanitized_report_mapping(value: object, subject: str) -> dict[str, object]:
     if not all(isinstance(key, str) for key in sanitized):
         raise RuntimeError(f"{subject} report payload keys must be strings")
     return cast(dict[str, object], sanitized)
+
+
+def _environment_manifest(
+    options: BootstrapOptions,
+    resolved_compute: Mapping[str, object],
+) -> dict[str, object]:
+    """Return stable runtime facts without hostnames, users, or arbitrary fields."""
+
+    verification_value = resolved_compute.get("verification")
+    verification = verification_value if isinstance(verification_value, Mapping) else {}
+    driver_value = resolved_compute.get("driver")
+    driver = driver_value if isinstance(driver_value, Mapping) else {}
+    cpu_value = resolved_compute.get("cpu")
+    cpu = cpu_value if isinstance(cpu_value, Mapping) else {}
+    ram_value = resolved_compute.get("ram")
+    ram = ram_value if isinstance(ram_value, Mapping) else {}
+
+    def fact(name: str) -> object:
+        value = verification.get(name)
+        return resolved_compute.get(name) if value is None else value
+
+    torch_version = fact("torch_version")
+    if not isinstance(torch_version, str) or not torch_version:
+        try:
+            torch_version = importlib.metadata.version("torch")
+        except importlib.metadata.PackageNotFoundError:
+            torch_version = None
+
+    selected_profile = fact("selected_profile")
+    manifest: dict[str, object] = {
+        "runtime": {
+            "os": {
+                "system": platform.system(),
+                "platform": sys.platform,
+                "release": platform.release(),
+                "version": platform.version(),
+                "machine": platform.machine(),
+                "processor": platform.processor(),
+            },
+            "python": {
+                "implementation": platform.python_implementation(),
+                "version": platform.python_version(),
+            },
+            "torch": {"version": torch_version},
+            "cuda": {
+                "runtime": fact("torch_cuda_version"),
+                "device": fact("device"),
+                "device_name": fact("device_name"),
+                "device_index": fact("device_index"),
+                "profile": selected_profile,
+                "driver_version": driver.get("driver_version"),
+                "driver_device_name": driver.get("device_name"),
+                "driver_memory_bytes": driver.get("memory_bytes"),
+                "driver_cuda_profile": driver.get("cuda_profile"),
+            },
+        },
+        "compute": {
+            "requested": resolved_compute.get("requested", options.compute),
+            "selected_profile": selected_profile,
+            "device": fact("device"),
+            "device_name": fact("device_name"),
+            "device_index": fact("device_index"),
+            "cpu_logical_count": cpu.get("logical_count"),
+            "ram_total_bytes": ram.get("total_bytes"),
+        },
+        "data_root_identity": _json_signature(
+            {"resolved_data_root": str(options.data_root.resolve(strict=False))}
+        ),
+    }
+    return manifest
 
 
 def _resolved_local_path(path: Path, label: str) -> Path:
@@ -457,7 +643,7 @@ def _retained_candidate(
 
 
 def _publish_candidate(candidate: Path, destination: Path, kind: str) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_durable_directory(destination.parent)
     initial = candidate.lstat()
     if stat.S_ISLNK(initial.st_mode):
         raise RuntimeError(f"Publication candidate must not be a symlink: {candidate}")
@@ -507,7 +693,7 @@ def _fallback_report_paths(options: BootstrapOptions) -> tuple[Path, ...]:
 
 
 def _copy_file(source: Path, destination: Path, expected_digest: str) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_durable_directory(destination.parent)
     if destination.exists():
         actual, _size = _regular_digest(destination)
         if actual == expected_digest:
@@ -526,6 +712,7 @@ def _copy_file(source: Path, destination: Path, expected_digest: str) -> Path:
         if copied_digest != expected_digest:
             raise RuntimeError(f"Copied source failed digest verification: {source}")
         os.rename(temporary, destination)
+        _fsync_parent_directory(destination)
     except BaseException:
         # The private candidate is intentionally retained if publication fails.
         raise
@@ -543,7 +730,7 @@ def _copy_tree(
             f"Existing acquisition directory differs from its source: {destination}. "
             "Preserve it for inspection and use a new data root."
         )
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_durable_directory(destination.parent)
     staging = Path(
         tempfile.mkdtemp(prefix=".bitguard-extract-copy-", dir=destination.parent)
     )
@@ -564,7 +751,9 @@ def _copy_tree(
     copied_digest, _size, _files = _tree_digest(staging)
     if copied_digest != expected_digest:
         raise RuntimeError(f"Copied directory failed digest verification: {source}")
+    _make_tree_durable(staging)
     os.rename(staging, destination)
+    _fsync_parent_directory(destination)
     _digest, _size, files = _tree_digest(destination)
     return files
 
@@ -671,6 +860,8 @@ def run_bootstrap(
     reused: list[str] = []
     failed_stage: str | None = None
     last_completed: str | None = None
+    report_persistence_error: BaseException | None = None
+    lock_release_error: BaseException | None = None
     compute: dict[str, object] | None = None
     manifests: dict[str, str] = {}
     schemas: dict[str, str] = {}
@@ -704,7 +895,9 @@ def run_bootstrap(
                 "recovery_command": inspection_command(
                     str(root) for root in sorted(cleanup_roots, key=str)
                 ),
-                "scan_error": _safe_error(error),
+                "scan_errors": [
+                    {"path": "<cleanup-roots>", "error": _safe_error(error)}
+                ],
             }
 
     def build_report(
@@ -718,6 +911,14 @@ def run_bootstrap(
             "last_completed_stage": last_completed,
             "failed_stage": failed_stage,
             "error": None if error is None else _safe_error(error),
+            "report_error": (
+                None
+                if report_persistence_error is None
+                else _safe_error(report_persistence_error)
+            ),
+            "lock_release_error": (
+                None if lock_release_error is None else _safe_error(lock_release_error)
+            ),
             "recovery_command": _recovery(failed_stage) if error is not None else None,
             "inputs": {"original": original, "resolved": options.to_dict()},
             "compute": compute,
@@ -755,7 +956,7 @@ def run_bootstrap(
         *,
         preferred: Path | None,
     ) -> dict[str, object]:
-        nonlocal failed_stage
+        nonlocal failed_stage, report_persistence_error
         targets = ([preferred] if preferred is not None else []) + list(
             _fallback_report_paths(options)
         )
@@ -765,33 +966,31 @@ def run_bootstrap(
                 unique_targets.append(target)
 
         report_status = status
-        report_error = error
+        primary_error = error
         last_write_error: BaseException | None = None
         for target in unique_targets:
-            payload = build_report(report_status, report_error, target)
+            payload = build_report(report_status, primary_error, target)
             try:
                 _write_json(target, payload)
                 return payload
             except BaseException as write_error:
                 last_write_error = write_error
-                report_status = "failed"
-                if failed_stage is None:
-                    failed_stage = "report"
-                detail = _safe_error(write_error)
-                if report_error is None:
-                    report_error = RuntimeError(
-                        f"Bootstrap report persistence failed: {detail}"
-                    )
+                if report_persistence_error is None:
+                    report_persistence_error = write_error
                 else:
-                    report_error = RuntimeError(
-                        f"{_safe_error(report_error)}; bootstrap report persistence "
-                        f"also failed: {detail}"
+                    report_persistence_error = RuntimeError(
+                        f"{_safe_error(report_persistence_error)}; another report "
+                        f"target also failed: {_safe_error(write_error)}"
+                    )
+                report_status = "failed"
+                if primary_error is None:
+                    failed_stage = "report"
+                    primary_error = RuntimeError(
+                        "Bootstrap report persistence failed: "
+                        f"{_safe_error(write_error)}"
                     )
         assert last_write_error is not None
-        raise last_write_error
-
-    def report(status: str, error: BaseException | None = None) -> dict[str, object]:
-        return persist_report(status, error, preferred=report_path)
+        return build_report(report_status, primary_error, unique_targets[-1])
 
     current_stage: str | None = "preflight"
     lock_entered = False
@@ -801,8 +1000,13 @@ def run_bootstrap(
         failed_stage = "preflight"
         return persist_report("failed", error, preferred=None)
 
+    primary_error: BaseException | None = None
+    final_status = "failed"
+    lock: BootstrapWriterLock | None = None
     try:
-        with BootstrapWriterLock(lock_path):
+        lock = BootstrapWriterLock(lock_path)
+        lock.acquire()
+        try:
             lock_entered = True
             try:
                 current_stage = "preflight"
@@ -917,8 +1121,9 @@ def run_bootstrap(
                     available = deps.available_bytes
                 disk = require_disk(estimate.request, available_bytes=available)
 
-                metadata_root.mkdir(parents=True, exist_ok=True)
-                options.runs_root.mkdir(parents=True, exist_ok=True)
+                _ensure_durable_directory(options.data_root)
+                _ensure_durable_directory(metadata_root)
+                _ensure_durable_directory(options.runs_root)
                 state = BootstrapStateStore(state_path)
                 if options.restart_stage is not None:
                     state.invalidate_from(options.restart_stage, STAGE_ORDER)
@@ -957,10 +1162,15 @@ def run_bootstrap(
                     )
                     return (preflight_path,)
 
-                def run_environment() -> Sequence[Path]:
+                def environment_payload() -> dict[str, object]:
                     nonlocal compute
-                    compute = dict(deps.compute_resolver(options.compute))
-                    _write_json(environment_path, compute)
+                    if compute is None:
+                        resolved_compute = dict(deps.compute_resolver(options.compute))
+                        compute = _environment_manifest(options, resolved_compute)
+                    return compute
+
+                def run_environment() -> Sequence[Path]:
+                    _write_json(environment_path, environment_payload())
                     return (environment_path,)
 
                 def run_acquire() -> Sequence[Path]:
@@ -1140,6 +1350,7 @@ def run_bootstrap(
                                 "destination": str(destination),
                                 "sha256": digest,
                             }
+                        _make_content_durable(candidate, kind)
                         dataset_report = _sanitized_report_mapping(
                             dataset_report,
                             f"{dataset} acquisition",
@@ -1372,6 +1583,7 @@ def run_bootstrap(
                             f"{dataset} extraction",
                         )
                         _reject_excluded_capture_files(candidate)
+                        _make_tree_durable(candidate)
                         tree_sha256 = _tree_digest(candidate)[0]
                         dataset_report["tree_sha256"] = tree_sha256
                         intent: dict[str, object] = {
@@ -1419,8 +1631,8 @@ def run_bootstrap(
                     return tuple(outputs)
 
                 def run_inspect() -> Sequence[Path]:
-                    manifest_root.mkdir(parents=True, exist_ok=True)
-                    schema_root.mkdir(parents=True, exist_ok=True)
+                    _ensure_durable_directory(manifest_root)
+                    _ensure_durable_directory(schema_root)
                     outputs: list[Path] = []
                     for dataset in options.datasets:
                         spec: DatasetSpec = registry[dataset]
@@ -1471,7 +1683,7 @@ def run_bootstrap(
                     ),
                     Stage(
                         "environment",
-                        lambda: _json_signature({"compute": options.compute}),
+                        lambda: _json_signature(environment_payload()),
                         run_environment,
                     ),
                     Stage(
@@ -1558,10 +1770,32 @@ def run_bootstrap(
                                 schema_root / f"{dataset}-{source_token}.json"
                             )
 
-                return report("sources_verified")
+                final_status = "sources_verified"
             except BaseException as error:
                 failed_stage = current_stage
-                return report("failed", error)
+                primary_error = error
+                final_status = "failed"
+        finally:
+            if lock_entered:
+                assert lock is not None
+                released = lock.release()
+                if not released:
+                    raise RuntimeError(
+                        f"Bootstrap writer lock {lock_path} could not be released "
+                        "with verified ownership."
+                    )
     except BaseException as error:
-        failed_stage = "lock-release" if lock_entered else "preflight"
-        return persist_report("failed", error, preferred=None)
+        final_status = "failed"
+        if lock_entered:
+            lock_release_error = error
+            if primary_error is None:
+                failed_stage = "lock-release"
+                primary_error = error
+        else:
+            failed_stage = "preflight"
+            primary_error = error
+    return persist_report(
+        final_status,
+        primary_error,
+        preferred=report_path if lock_entered else None,
+    )
