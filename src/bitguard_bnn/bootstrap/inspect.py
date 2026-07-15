@@ -7,6 +7,7 @@ import datetime as dt
 import itertools
 import math
 import os
+import re
 import sqlite3
 import stat
 import tempfile
@@ -103,6 +104,18 @@ class SchemaInspectionReport:
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _MISSING_NUMERIC = {"", "na", "n/a", "nan", "null", "none", "?"}
+_INFINITY_NUMERIC = {
+    "inf",
+    "+inf",
+    "-inf",
+    "infinity",
+    "+infinity",
+    "-infinity",
+}
+_ASCII_DECIMAL = re.compile(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
+    re.ASCII,
+)
 _DEFAULT_REQUIRED = {
     "nbaiot": (),
     "botiot": ("category", "subcategory", "saddr", "stime"),
@@ -372,11 +385,21 @@ def _numeric_convertible(value: str) -> bool:
     token = value.strip().casefold()
     if token in _MISSING_NUMERIC:
         return False
-    try:
-        float(token)
-    except ValueError:
+    # Keep bootstrap column eligibility synchronized with data._numeric_features,
+    # which uses pandas.to_numeric(errors="coerce") and selects columns with any
+    # non-missing result.  The adapter-relevant CSV scalar grammar is deliberately
+    # ASCII-only: pandas-recognized infinity spellings are non-missing, while NaN,
+    # Python-only underscores, grouping separators, hex, and decimal overflow are
+    # ineligible.  The record-size ceiling bounds this per-cell linear parse.
+    if token in _INFINITY_NUMERIC:
+        return True
+    if _ASCII_DECIMAL.fullmatch(token) is None:
         return False
-    return True
+    try:
+        numeric = float(token)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(numeric)
 
 
 def _timestamp_valid(value: str) -> bool:

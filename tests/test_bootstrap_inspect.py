@@ -11,6 +11,7 @@ from unittest.mock import patch
 from bitguard_bnn.bootstrap.inspect import (
     SchemaInspectionError,
     _BoundedLines,
+    _numeric_convertible,
     inspect_csv_dataset,
 )
 
@@ -201,6 +202,75 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertEqual(report.rejected_rows, 0)
             self.assertEqual(report.feature_columns, ("x", "y"))
             self.assertEqual(report.unusable_columns, ())
+
+    def test_numeric_eligibility_matches_adapter_scalar_boundaries(self) -> None:
+        # These are the scalar forms relevant to data._numeric_features: pandas
+        # to_numeric(errors="coerce") must produce a non-missing value, while a
+        # decimal that overflows Python's finite range is deliberately excluded.
+        accepted = (
+            "0",
+            " +1 ",
+            "-2",
+            ".5",
+            "5.",
+            "6e-2",
+            "-7E+2",
+            "+inf",
+            "-INF",
+            "Infinity",
+            "-infinity",
+        )
+        rejected = (
+            "",
+            "NA",
+            "nan",
+            "+nan",
+            "-NaN",
+            "1_000",
+            "1,000",
+            "0x10",
+            "1e309",
+            "-1e309",
+            "1e",
+            ".",
+        )
+
+        for token in accepted:
+            with self.subTest(token=token, expected=True):
+                self.assertTrue(_numeric_convertible(token))
+        for token in rejected:
+            with self.subTest(token=token, expected=False):
+                self.assertFalse(_numeric_convertible(token))
+
+    def test_pandas_divergent_numeric_forms_are_unusable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rows.csv").write_text(
+                "anchor,underscore,grouped,hex,overflow,signed_nan\n"
+                '1,1_000,"1,000",0x10,1e309,+nan\n'
+                '2,-1_000,"-1,000",-0x10,-1e309,-NaN\n',
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset("nbaiot", root)
+
+            self.assertEqual(report.feature_columns, ("anchor",))
+            self.assertEqual(
+                report.unusable_columns,
+                ("grouped", "hex", "overflow", "signed_nan", "underscore"),
+            )
+
+    def test_only_pandas_divergent_numeric_forms_fail_as_no_numeric(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rows.csv").write_text(
+                "underscore,overflow\n1_000,1e309\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(
+                SchemaInspectionError, "no numeric feature columns"
+            ):
+                inspect_csv_dataset("nbaiot", root)
 
     def test_all_missing_candidate_is_reported_as_unusable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
