@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -527,6 +528,7 @@ def _build_iteration_plan(
     class_limit = cfg.get("max_rows_per_class") if apply_sampling_caps else None
     class_limit = int(class_limit) if class_limit is not None else None
     file_plans: list[_FilePlan] = []
+    has_rows = False
     for path, relative_path in zip(source.files, source.relative_paths):
         selected_rows = _scan_selected_rows(
             path,
@@ -538,13 +540,12 @@ def _build_iteration_plan(
         schema, timestamp = _plan_schema_and_timestamp(
             source.kind, path, selected_rows, cfg, chunk_size
         )
-        if selected_rows == frozenset():
-            continue
         file_plans.append(
             _FilePlan(path, relative_path, selected_rows, schema, timestamp)
         )
+        has_rows = has_rows or selected_rows != frozenset()
     files = tuple(file_plans)
-    if not files:
+    if not has_rows:
         if class_limit is not None:
             if class_limit <= 0:
                 raise ValueError("max_rows_per_class must be positive or null")
@@ -573,25 +574,31 @@ def _build_iteration_plan(
     )
 
 
+def _iter_planned_file_chunks(
+    config: dict[str, Any], plan: _IterationPlan, file_plan: _FilePlan
+) -> Iterator[NormalizedChunk]:
+    chunk_size = int(config["dataset"]["chunk_size"])
+    for chunk in _iter_file_normalized(file_plan, plan.source, chunk_size):
+        frame = _filter_retained(chunk.frame, plan.retained_uids)
+        if frame.empty:
+            continue
+        for column in plan.feature_columns:
+            if column in frame:
+                frame[column] = pd.to_numeric(
+                    frame[column], errors="coerce"
+                ).astype(np.float32)
+        yield NormalizedChunk(
+            frame=frame,
+            source_relative_path=chunk.source_relative_path,
+            source_row_start=chunk.source_row_start,
+        )
+
+
 def _iter_planned_chunks(
     config: dict[str, Any], plan: _IterationPlan
 ) -> Iterator[NormalizedChunk]:
-    chunk_size = int(config["dataset"]["chunk_size"])
     for file_plan in plan.files:
-        for chunk in _iter_file_normalized(file_plan, plan.source, chunk_size):
-            frame = _filter_retained(chunk.frame, plan.retained_uids)
-            if frame.empty:
-                continue
-            for column in plan.feature_columns:
-                if column in frame:
-                    frame[column] = pd.to_numeric(
-                        frame[column], errors="coerce"
-                    ).astype(np.float32)
-            yield NormalizedChunk(
-                frame=frame,
-                source_relative_path=chunk.source_relative_path,
-                source_row_start=chunk.source_row_start,
-            )
+        yield from _iter_planned_file_chunks(config, plan, file_plan)
 
 
 def iter_normalized_chunks(
@@ -615,10 +622,28 @@ def load_normalized_dataset(
     """Materialize normalized chunks at the legacy in-memory compatibility boundary."""
 
     plan = _build_iteration_plan(config, path_override, True, dataset_type)
-    chunks = list(_iter_planned_chunks(config, plan))
-    if not chunks:
+    frames: list[pd.DataFrame] = []
+    for file_plan in plan.files:
+        if (
+            file_plan.selected_rows == frozenset()
+            and plan.materialization_order is None
+        ):
+            header = pd.read_csv(file_plan.path, nrows=0, low_memory=False)
+            frames.append(_normalize_frame(header, file_plan, plan.source))
+            continue
+        frames.extend(
+            chunk.frame
+            for chunk in _iter_planned_file_chunks(config, plan, file_plan)
+        )
+    if not frames:
         raise ValueError("dataset contains no rows")
-    combined = pd.concat([chunk.frame for chunk in chunks], ignore_index=True)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The behavior of DataFrame concatenation with empty or all-NA",
+            category=FutureWarning,
+        )
+        combined = pd.concat(frames, ignore_index=True)
     if plan.materialization_order is not None:
         order = {
             uid: position

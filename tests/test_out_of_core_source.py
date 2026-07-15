@@ -353,6 +353,88 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
         self.assertEqual(len(loaded.frame), 2)
         self.assertEqual(loaded.provenance["files"], 2)
 
+    def test_header_only_schema_frames_influence_only_uncapped_materialization(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "csv",
+                "behavior_label,b,z\n",
+                {"behavior_label": ["benign"], "a": [1], "b": [2]},
+                load_generic_csv,
+            ),
+            (
+                "nbaiot",
+                "b,z\n",
+                {"a": [1], "b": [2]},
+                load_nbaiot,
+            ),
+            (
+                "botiot",
+                "category,b,z\n",
+                {"category": ["Normal"], "a": [1], "b": [2]},
+                load_botiot,
+            ),
+        )
+        metadata = [
+            "dataset",
+            "source_file",
+            "sequence_index",
+            "device_id",
+            "raw_attack",
+            "behavior_label",
+            "timestamp",
+            "row_uid",
+        ]
+        for dataset_type, header, row, typed_loader in cases:
+            for class_cap, expected_columns, expected_features in (
+                (None, ["b", "z", *metadata, "a"], ["b", "a"]),
+                (2, ["a", "b", *metadata], ["a", "b"]),
+            ):
+                for loader in (load_dataset, typed_loader):
+                    with (
+                        self.subTest(
+                            dataset_type=dataset_type,
+                            class_cap=class_cap,
+                            loader=loader.__name__,
+                        ),
+                        tempfile.TemporaryDirectory() as directory,
+                    ):
+                        root = Path(directory)
+                        if dataset_type == "nbaiot":
+                            dataset = root / "dataset"
+                            dataset.mkdir()
+                            path = "dataset"
+                        else:
+                            dataset = root
+                            path = "*.csv"
+                        (dataset / "00-header.csv").write_text(
+                            header, encoding="utf-8"
+                        )
+                        pd.DataFrame(row).to_csv(
+                            dataset / "01-data.csv", index=False
+                        )
+                        config = _base_config(root, dataset_type, path)
+                        config["dataset"]["max_rows_per_class"] = class_cap
+
+                        loaded = loader(config)
+
+                        self.assertEqual(
+                            loaded.frame.columns.tolist(), expected_columns
+                        )
+                        self.assertEqual(
+                            loaded.feature_columns, expected_features
+                        )
+                        self.assertEqual(
+                            loaded.frame[expected_features]
+                            .dtypes.astype(str)
+                            .tolist(),
+                            ["float32"] * len(expected_features),
+                        )
+                        if class_cap is None:
+                            self.assertEqual(str(loaded.frame["z"].dtype), "object")
+                            self.assertTrue(loaded.frame["z"].isna().all())
+
     def test_only_header_files_report_no_numeric_features(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
