@@ -501,6 +501,34 @@ class StagingCleanupFailureTest(unittest.TestCase):
         self.assertIn(str(cleanup_paths[0]), notes)
         self.assertTrue(all(handle.closed for handle in handles))
 
+    def test_cleanup_context_falls_back_when_add_note_is_unavailable(self) -> None:
+        class Python310StyleInterrupt(BaseException):
+            add_note = None
+
+        primary = Python310StyleInterrupt("legacy interruption")
+        caught: BaseException | None = None
+        try:
+            try:
+                raise primary
+            finally:
+                with patch.object(
+                    extract_module,
+                    "_cleanup_staging",
+                    side_effect=PermissionError("legacy cleanup denied"),
+                ):
+                    extract_module._cleanup_staging_after_operation(
+                        Path("retained-staging"), object()
+                    )
+        except Python310StyleInterrupt as error:
+            caught = error
+
+        self.assertIs(caught, primary)
+        self.assertEqual(str(caught), "legacy interruption")
+        notes = getattr(caught, "__bitguard_cleanup_notes__", ())
+        self.assertEqual(len(notes), 1)
+        self.assertIn("legacy cleanup denied", notes[0])
+        self.assertIn("retained-staging", notes[0])
+
 
 class RarExtractionTest(unittest.TestCase):
     LISTING = """

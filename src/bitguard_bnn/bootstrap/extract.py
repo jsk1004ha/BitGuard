@@ -511,12 +511,29 @@ def _cleanup_staging(staging: Path, expected: os.stat_result) -> None:
     shutil.rmtree(staging)
 
 
+def _attach_cleanup_context(primary: BaseException, message: str) -> None:
+    """Attach recovery detail without relying on Python 3.11 exception notes."""
+
+    try:
+        add_note = getattr(primary, "add_note", None)
+        if callable(add_note):
+            add_note(message)
+            return
+        existing = getattr(primary, "__bitguard_cleanup_notes__", ())
+        if not isinstance(existing, tuple):
+            existing = ()
+        setattr(primary, "__bitguard_cleanup_notes__", (*existing, message))
+    except Exception:
+        # Cleanup diagnostics must never replace the exception already unwinding.
+        return
+
+
 def _cleanup_staging_after_operation(
     staging: Path, expected: os.stat_result
 ) -> None:
     """Clean staging without replacing an exception already leaving extraction."""
 
-    primary = sys.exception()
+    primary = sys.exc_info()[1]
     try:
         _cleanup_staging(staging, expected)
     except Exception as cleanup_error:
@@ -527,7 +544,7 @@ def _cleanup_staging_after_operation(
             f"{type(cleanup_error).__name__}: {cleanup_error}"
         )
         if primary is not None:
-            primary.add_note(recovery)
+            _attach_cleanup_context(primary, recovery)
             return
         raise ArchiveExtractionError(recovery) from cleanup_error
 
