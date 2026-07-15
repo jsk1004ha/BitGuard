@@ -990,7 +990,7 @@ def verify_torch_compute(
                 f"CUDA device-name verification failed: invalid name {device_name!r}."
             )
         try:
-            torch_module.cuda.synchronize()
+            torch_module.cuda.synchronize(selected_index)
         except Exception as error:
             raise RuntimeError(f"CUDA synchronization verification failed: {error}.") from error
     else:

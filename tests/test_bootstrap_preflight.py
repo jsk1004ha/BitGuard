@@ -647,6 +647,7 @@ class _FakeCuda:
         self._available = available
         self._sync_error = sync_error
         self.synchronized = False
+        self.synchronized_indices: list[int] = []
         self.device_name_indices: list[int] = []
 
     def is_available(self) -> bool:
@@ -656,7 +657,8 @@ class _FakeCuda:
         self.device_name_indices.append(index)
         return "Fake GPU" if index == 0 else f"Fake GPU {index}"
 
-    def synchronize(self) -> None:
+    def synchronize(self, index: int) -> None:
+        self.synchronized_indices.append(index)
         if self._sync_error is not None:
             raise self._sync_error
         self.synchronized = True
@@ -705,6 +707,7 @@ class TorchVerificationTests(unittest.TestCase):
 
         self.assertEqual(torch.allocations, [((1,), "cuda:0")])
         self.assertTrue(torch.cuda.synchronized)
+        self.assertEqual(torch.cuda.synchronized_indices, [0])
         self.assertEqual(verification.selected_profile, "cu124")
         self.assertEqual(verification.device, "cuda:0")
         self.assertEqual(verification.device_name, "Fake GPU")
@@ -723,6 +726,7 @@ class TorchVerificationTests(unittest.TestCase):
 
         self.assertEqual(torch.allocations, [((1,), "cuda:1")])
         self.assertEqual(torch.cuda.device_name_indices, [1])
+        self.assertEqual(torch.cuda.synchronized_indices, [1])
         self.assertEqual(verification.device, "cuda:1")
         self.assertEqual(verification.device_index, 1)
         self.assertEqual(verification.device_name, "Fake GPU 1")
@@ -781,6 +785,7 @@ class TorchVerificationTests(unittest.TestCase):
         self.assertEqual(verification.selected_profile, "cpu")
         self.assertEqual(torch.allocations, [((1,), "cpu")])
         self.assertFalse(torch.cuda.synchronized)
+        self.assertEqual(torch.cuda.synchronized_indices, [])
 
     def test_import_allocation_and_sync_failures_are_actionable(self):
         with self.assertRaisesRegex(RuntimeError, "Torch import failed.*not installed"):
@@ -801,6 +806,7 @@ class TorchVerificationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "CUDA synchronization.*sync failed"):
             verify_torch_compute("cu124", torch_module=broken_sync)
+        self.assertEqual(broken_sync.cuda.synchronized_indices, [0])
 
     def test_failed_tensor_operation_is_actionable(self):
         class WrongTensor(_FakeTensor):
