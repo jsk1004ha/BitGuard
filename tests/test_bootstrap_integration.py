@@ -1438,6 +1438,92 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
             ["preflight", "environment", "acquire", "extract", "inspect"],
         )
 
+    def assert_unverifiable_canonical_report_fails_closed(
+        self,
+        verification_error: OSError,
+    ) -> None:
+        from bitguard_bnn.bootstrap import orchestrator as orchestrator_module
+
+        canonical = self.data_root / ".bitguard" / "bootstrap-report.json"
+        fallback_paths = orchestrator_module._fallback_report_paths(self.options)
+        original_fsync_parent = orchestrator_module._fsync_parent_directory
+        original_read_text = Path.read_text
+        original_write_json = orchestrator_module._write_json
+        canonical_write_attempts = 0
+        invalidation_attempts = 0
+
+        def fail_canonical_report_fsync(path):
+            if Path(path) == canonical:
+                raise OSError("injected post-replace report fsync failure")
+            return original_fsync_parent(path)
+
+        def fail_reconciliation_before_publication(path, value):
+            nonlocal canonical_write_attempts
+            if Path(path) == canonical:
+                canonical_write_attempts += 1
+                if canonical_write_attempts == 2:
+                    raise orchestrator_module.AtomicJsonWriteError(
+                        canonical,
+                        published=False,
+                        published_identity=None,
+                        cause=OSError("injected reconciliation failure"),
+                    )
+            return original_write_json(path, value)
+
+        def fail_invalidation(_path, _expected_identity):
+            nonlocal invalidation_attempts
+            invalidation_attempts += 1
+            raise OSError("injected canonical invalidation failure")
+
+        def fail_verification_read(path, *args, **kwargs):
+            if Path(path) == canonical and invalidation_attempts >= 2:
+                raise verification_error
+            return original_read_text(path, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(
+                    orchestrator_module,
+                    "_fsync_parent_directory",
+                    side_effect=fail_canonical_report_fsync,
+                ),
+                patch.object(
+                    orchestrator_module,
+                    "_write_json",
+                    side_effect=fail_reconciliation_before_publication,
+                ),
+                patch.object(
+                    orchestrator_module,
+                    "_invalidate_published_json",
+                    side_effect=fail_invalidation,
+                ),
+                patch.object(Path, "read_text", new=fail_verification_read),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Could not verify canonical bootstrap report state",
+                ):
+                    run_bootstrap(self.options, dependencies=self.dependencies())
+
+            canonical_payload = json.loads(canonical.read_text(encoding="utf-8"))
+            self.assertEqual(canonical_payload["status"], "sources_verified")
+            self.assertEqual(invalidation_attempts, 2)
+            for fallback in fallback_paths:
+                self.assertFalse(fallback.exists())
+        finally:
+            for fallback in fallback_paths:
+                fallback.unlink(missing_ok=True)
+
+    def test_missing_canonical_during_failed_invalidation_fails_closed(self) -> None:
+        self.assert_unverifiable_canonical_report_fails_closed(
+            FileNotFoundError("injected canonical namespace substitution")
+        )
+
+    def test_unreadable_canonical_during_failed_invalidation_fails_closed(self) -> None:
+        self.assert_unverifiable_canonical_report_fails_closed(
+            PermissionError("injected canonical read denial")
+        )
+
     def test_stage_failure_remains_primary_when_report_persistence_also_fails(
         self,
     ) -> None:

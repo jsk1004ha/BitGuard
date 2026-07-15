@@ -1172,8 +1172,16 @@ def run_bootstrap(
                     if invalidation_error is not None:
                         try:
                             visible = json.loads(target.read_text(encoding="utf-8"))
-                        except (OSError, UnicodeError, json.JSONDecodeError):
-                            continue
+                        except (
+                            OSError,
+                            UnicodeError,
+                            json.JSONDecodeError,
+                        ) as verification_error:
+                            raise RuntimeError(
+                                "Could not verify canonical bootstrap report state at "
+                                f"{target} after invalidation failed; refusing fallback "
+                                f"publication: {_safe_error(verification_error)}"
+                            ) from verification_error
                         if (
                             isinstance(visible, dict)
                             and visible.get("status") == "sources_verified"
