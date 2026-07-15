@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import heapq
+import hashlib
+import os
+import stat
 import warnings
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Iterator
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO, Iterator
 
 import numpy as np
 import pandas as pd
 from pandas.tseries.api import guess_datetime_format
 
-from bitguard_bnn import data as data_module
 from bitguard_bnn.config import resolve_path
 from bitguard_bnn.constants import (
     META_COLUMNS,
@@ -18,6 +20,17 @@ from bitguard_bnn.constants import (
     canonicalize_behavior,
     nbaiot_behavior,
     normalize_token,
+)
+from bitguard_bnn.out_of_core.common import (
+    FileFingerprint,
+    LoadedDataset,
+    append_metadata,
+    find_column,
+    logical_source_id,
+    normalize_logical_path,
+    numeric_features,
+    resolve_csv_files,
+    source_sampling_key,
 )
 
 
@@ -35,7 +48,7 @@ class _SourceSpec:
     kind: str
     files: tuple[Path, ...]
     relative_paths: tuple[str, ...]
-    root: Path | None
+    anchor: Path
     label_overrides: dict[str, str]
 
 
@@ -57,6 +70,8 @@ class _TimestampPlan:
 class _FilePlan:
     path: Path
     relative_path: str
+    logical_identity: str
+    fingerprint: FileFingerprint
     selected_rows: frozenset[int] | None
     schema: _Schema
     timestamp: _TimestampPlan | None
@@ -87,11 +102,188 @@ class _SourceRowBudget:
             )
 
 
-def _relative_path(path: Path, root: Path) -> str:
-    try:
-        return path.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError:
-        return path.name
+@dataclass(frozen=True, slots=True)
+class _PinnedStat:
+    device: int
+    inode: int
+    mode: int
+    byte_size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+class _HashingReader:
+    def __init__(self, handle: BinaryIO) -> None:
+        self._handle = handle
+        self._digest = hashlib.sha256()
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        block = self._handle.read(size)
+        self._digest.update(block)
+        self.bytes_read += len(block)
+        return block
+
+    @property
+    def sha256(self) -> str:
+        return self._digest.hexdigest()
+
+
+def _pinned_stat(path: Path) -> _PinnedStat:
+    path_stat = path.lstat()
+    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+        raise ValueError(f"dataset source must be a regular file: {path}")
+    return _PinnedStat(
+        int(path_stat.st_dev),
+        int(path_stat.st_ino),
+        int(path_stat.st_mode),
+        int(path_stat.st_size),
+        int(path_stat.st_mtime_ns),
+        int(path_stat.st_ctime_ns),
+    )
+
+
+def _assert_source_stat(
+    path: Path,
+    expected: _PinnedStat | FileFingerprint,
+    actual: os.stat_result,
+    phase: str,
+) -> None:
+    identity = (
+        int(actual.st_dev),
+        int(actual.st_ino),
+        int(actual.st_mode),
+        int(actual.st_size),
+        int(actual.st_mtime_ns),
+    )
+    pinned = (
+        expected.device,
+        expected.inode,
+        expected.mode,
+        expected.byte_size,
+        expected.mtime_ns,
+    )
+    if identity != pinned:
+        raise RuntimeError(f"dataset source changed during {phase}: {path}")
+
+
+class _VerifiedCsvPass:
+    def __init__(
+        self,
+        path: Path,
+        pinned: _PinnedStat | FileFingerprint,
+        *,
+        chunk_size: int,
+        phase: str,
+        expected_sha256: str | None,
+    ) -> None:
+        self.path = path
+        self.pinned = pinned
+        self.chunk_size = chunk_size
+        self.phase = phase
+        self.expected_sha256 = expected_sha256
+        self.fingerprint: FileFingerprint | None = None
+
+    def __iter__(self) -> Iterator[pd.DataFrame]:
+        completed = False
+        with self.path.open("rb", buffering=0) as handle:
+            _assert_source_stat(self.path, self.pinned, os.fstat(handle.fileno()), self.phase)
+            _assert_source_stat(self.path, self.pinned, self.path.lstat(), self.phase)
+            hashing_reader = _HashingReader(handle)
+            reader = pd.read_csv(
+                hashing_reader,
+                chunksize=self.chunk_size,
+                low_memory=False,
+            )
+            try:
+                for chunk in reader:
+                    _assert_source_stat(
+                        self.path,
+                        self.pinned,
+                        os.fstat(handle.fileno()),
+                        self.phase,
+                    )
+                    _assert_source_stat(
+                        self.path,
+                        self.pinned,
+                        self.path.lstat(),
+                        self.phase,
+                    )
+                    yield chunk
+                completed = True
+            finally:
+                _close_reader(reader)
+                if completed:
+                    _assert_source_stat(
+                        self.path,
+                        self.pinned,
+                        os.fstat(handle.fileno()),
+                        self.phase,
+                    )
+                    _assert_source_stat(
+                        self.path,
+                        self.pinned,
+                        self.path.lstat(),
+                        self.phase,
+                    )
+                    if hashing_reader.bytes_read != self.pinned.byte_size:
+                        raise RuntimeError(
+                            f"dataset source changed during {self.phase}: {self.path}"
+                        )
+                    digest = hashing_reader.sha256
+                    if (
+                        self.expected_sha256 is not None
+                        and digest != self.expected_sha256
+                    ):
+                        raise RuntimeError(
+                            f"dataset source changed during {self.phase}: {self.path}"
+                        )
+                    self.fingerprint = FileFingerprint(
+                        self.pinned.device,
+                        self.pinned.inode,
+                        self.pinned.mode,
+                        self.pinned.byte_size,
+                        self.pinned.mtime_ns,
+                        self.pinned.ctime_ns,
+                        digest,
+                    )
+
+
+def _glob_anchor(path: Path) -> Path:
+    text = str(path)
+    wildcard_positions = [text.find(char) for char in "*?[" if char in text]
+    if not wildcard_positions:
+        return path if path.is_dir() else path.parent
+    prefix = text[: min(wildcard_positions)]
+    separator = max(prefix.rfind("/"), prefix.rfind("\\"))
+    if separator < 0:
+        return Path(path.anchor or ".")
+    return Path(prefix[:separator] or path.anchor)
+
+
+def _logical_paths(files: tuple[Path, ...], anchor: Path) -> tuple[str, ...]:
+    relative_paths: list[str] = []
+    seen: dict[str, str] = {}
+    resolved_anchor = anchor.resolve()
+    if resolved_anchor == Path(resolved_anchor.anchor):
+        raise ValueError(f"dataset source anchor is too broad: {resolved_anchor}")
+    for path in files:
+        try:
+            relative = path.resolve().relative_to(resolved_anchor).as_posix()
+        except ValueError as exc:
+            raise ValueError(
+                f"dataset source escapes its selected root {resolved_anchor}: {path}"
+            ) from exc
+        logical = normalize_logical_path(relative)
+        duplicate_key = logical.casefold()
+        if duplicate_key in seen:
+            raise ValueError(
+                "duplicate logical source path after normalization: "
+                f"{seen[duplicate_key]!r} and {logical!r}"
+            )
+        seen[duplicate_key] = logical
+        relative_paths.append(logical)
+    return tuple(relative_paths)
 
 
 def _resolve_source(
@@ -114,23 +306,23 @@ def _resolve_source(
     if kind == "nbaiot":
         root = path_override or resolve_path(config, cfg["path"])
         assert root is not None
-        root = Path(root)
-        files = tuple(sorted(root.rglob("*.csv")))
+        anchor = Path(root)
+        files = tuple(sorted(anchor.rglob("*.csv")))
         if not files:
-            raise FileNotFoundError(f"no N-BaIoT CSV files under {root}")
-        relative_paths = tuple(path.relative_to(root).as_posix() for path in files)
-        return _SourceSpec(kind, files, relative_paths, root, label_overrides)
+            raise FileNotFoundError(f"no N-BaIoT CSV files under {anchor}")
+        relative_paths = _logical_paths(files, anchor)
+        return _SourceSpec(kind, files, relative_paths, anchor, label_overrides)
     pattern = path_override or cfg["path"]
-    files = tuple(data_module._resolve_glob(config, pattern))
+    files = resolve_csv_files(config, pattern)
     if not files:
         if kind == "botiot":
             raise FileNotFoundError(f"no BoT-IoT CSV files match {pattern}")
         raise FileNotFoundError(f"no CSV files match {pattern}")
     selected = resolve_path(config, pattern)
-    selected_root = Path(selected) if selected is not None and Path(selected).is_dir() else None
-    relative_root = selected_root or Path(config.get("_project_root", "."))
-    relative_paths = tuple(_relative_path(path, relative_root) for path in files)
-    return _SourceSpec(kind, files, relative_paths, selected_root, label_overrides)
+    assert selected is not None
+    anchor = _glob_anchor(Path(selected))
+    relative_paths = _logical_paths(files, anchor)
+    return _SourceSpec(kind, files, relative_paths, anchor, label_overrides)
 
 
 def _close_reader(reader: object) -> None:
@@ -141,70 +333,80 @@ def _close_reader(reader: object) -> None:
 
 def _scan_selected_rows(
     path: Path,
+    relative_path: str,
+    kind: str,
+    pinned: _PinnedStat,
     *,
     chunk_size: int,
     max_rows: int | None,
     seed: int,
     budget: _SourceRowBudget,
-) -> frozenset[int] | None:
+) -> tuple[frozenset[int] | None, FileFingerprint, str]:
     if max_rows is not None and max_rows <= 0:
         raise ValueError("max_rows must be positive or null")
-    rng = np.random.default_rng(seed)
-    retained: list[tuple[float, int]] = []
     offset = 0
-    reader = pd.read_csv(path, chunksize=chunk_size, low_memory=False)
-    try:
-        for chunk in reader:
-            rows = len(chunk)
-            budget.consume(rows)
-            if max_rows is not None:
-                for source_index, key in zip(
-                    range(offset, offset + rows), rng.random(rows)
-                ):
-                    entry = (-float(key), -source_index)
-                    if len(retained) < max_rows:
-                        heapq.heappush(retained, entry)
-                    elif entry > retained[0]:
-                        heapq.heapreplace(retained, entry)
-            offset += rows
-    finally:
-        _close_reader(reader)
+    csv_pass = _VerifiedCsvPass(
+        path,
+        pinned,
+        chunk_size=chunk_size,
+        phase="source planning",
+        expected_sha256=None,
+    )
+    for chunk in csv_pass:
+        rows = len(chunk)
+        budget.consume(rows)
+        offset += rows
+    fingerprint = csv_pass.fingerprint
+    assert fingerprint is not None
+    identity = logical_source_id(kind, relative_path, fingerprint.sha256)
     if offset == 0:
-        return frozenset()
+        return frozenset(), fingerprint, identity
     if max_rows is None or offset <= max_rows:
-        return None
-    return frozenset(-source_index for _, source_index in retained)
+        return None, fingerprint, identity
+    retained: list[tuple[int, int]] = []
+    for source_index in range(offset):
+        key = source_sampling_key(seed, identity, source_index)
+        entry = (-key, -source_index)
+        if len(retained) < max_rows:
+            heapq.heappush(retained, entry)
+        elif entry > retained[0]:
+            heapq.heapreplace(retained, entry)
+    return (
+        frozenset(-source_index for _, source_index in retained),
+        fingerprint,
+        identity,
+    )
 
 
 def _iter_selected_raw(
-    plan: _FilePlan | tuple[Path, frozenset[int] | None],
+    plan: _FilePlan,
     chunk_size: int,
+    *,
+    include_empty: bool = False,
 ) -> Iterator[tuple[int, pd.DataFrame]]:
-    if isinstance(plan, _FilePlan):
-        path = plan.path
-        selected_rows = plan.selected_rows
-    else:
-        path, selected_rows = plan
     offset = 0
-    reader = pd.read_csv(path, chunksize=chunk_size, low_memory=False)
-    try:
-        for chunk in reader:
-            source_row_start = offset
-            positions = np.arange(offset, offset + len(chunk), dtype=np.int64)
-            offset += len(chunk)
-            frame = chunk.copy()
-            frame["__source_row_index"] = positions
-            if selected_rows is not None:
-                mask = np.fromiter(
-                    (int(position) in selected_rows for position in positions),
-                    dtype=bool,
-                    count=len(positions),
-                )
-                frame = frame.loc[mask].copy()
-            if not frame.empty:
-                yield source_row_start, frame
-    finally:
-        _close_reader(reader)
+    csv_pass = _VerifiedCsvPass(
+        plan.path,
+        plan.fingerprint,
+        chunk_size=chunk_size,
+        phase="CSV normalization pass",
+        expected_sha256=plan.fingerprint.sha256,
+    )
+    for chunk in csv_pass:
+        source_row_start = offset
+        positions = np.arange(offset, offset + len(chunk), dtype=np.int64)
+        offset += len(chunk)
+        frame = chunk.copy()
+        frame["__source_row_index"] = positions
+        if plan.selected_rows is not None:
+            mask = np.fromiter(
+                (int(position) in plan.selected_rows for position in positions),
+                dtype=bool,
+                count=len(positions),
+            )
+            frame = frame.loc[mask].copy()
+        if include_empty or not frame.empty:
+            yield source_row_start, frame
 
 
 def _schema_for(
@@ -214,18 +416,18 @@ def _schema_for(
         return _Schema()
     if kind == "botiot":
         return _Schema(
-            label=data_module._find_column(
+            label=find_column(
                 frame, cfg.get("label_column"), ["category", "label", "attack"]
             ),
-            raw_attack=data_module._find_column(
+            raw_attack=find_column(
                 frame,
                 cfg.get("raw_attack_column"),
                 ["subcategory", "attack", "category"],
             ),
-            device=data_module._find_column(
+            device=find_column(
                 frame, cfg.get("device_column"), ["saddr", "srcip", "device_id"]
             ),
-            timestamp=data_module._find_column(
+            timestamp=find_column(
                 frame, cfg.get("time_column"), ["stime", "timestamp", "time"]
             ),
         )
@@ -245,17 +447,19 @@ def _schema_for(
 
 def _plan_schema_and_timestamp(
     kind: str,
-    path: Path,
-    selected_rows: frozenset[int] | None,
+    plan: _FilePlan,
     cfg: dict[str, Any],
     chunk_size: int,
 ) -> tuple[_Schema, _TimestampPlan | None]:
-    header = pd.read_csv(path, nrows=0, low_memory=False)
-    schema = _schema_for(kind, header, cfg, path)
+    schema: _Schema | None = None
     numeric_count = 0
     timestamp_count = 0
     first_timestamp: object | None = None
-    for _, frame in _iter_selected_raw((path, selected_rows), chunk_size):
+    for _, frame in _iter_selected_raw(plan, chunk_size, include_empty=True):
+        if schema is None:
+            schema = _schema_for(kind, frame, cfg, plan.path)
+        if frame.empty:
+            continue
         if schema.timestamp is None:
             continue
         values = frame[schema.timestamp]
@@ -266,6 +470,7 @@ def _plan_schema_and_timestamp(
             non_missing = values[values.notna()]
             if not non_missing.empty:
                 first_timestamp = non_missing.iloc[0]
+    assert schema is not None
     if schema.timestamp is None:
         return schema, None
     numeric_mode = timestamp_count > 0 and numeric_count / timestamp_count >= 0.95
@@ -296,9 +501,8 @@ def _coerce_planned_timestamp(
 
 
 def _nbaiot_metadata(plan: _FilePlan, source: _SourceSpec) -> tuple[str, str, str]:
-    assert source.root is not None
-    relative = plan.path.relative_to(source.root)
-    device = relative.parts[0] if len(relative.parts) > 1 else plan.path.parent.name
+    relative = PurePosixPath(plan.relative_path)
+    device = relative.parts[0] if len(relative.parts) > 1 else "source_root"
     stem = normalize_token(plan.path.stem)
     if "benign" in stem:
         raw_attack = "benign"
@@ -316,14 +520,14 @@ def _normalize_frame(
 ) -> pd.DataFrame:
     if source.kind == "nbaiot":
         device, raw_attack, behavior = _nbaiot_metadata(plan, source)
-        return data_module._append_metadata(
+        return append_metadata(
             frame,
             dataset="nbaiot",
-            source_file=plan.path,
+            logical_source=plan.relative_path,
+            source_id=plan.logical_identity,
             device_id=device,
             raw_attack=raw_attack,
             behavior_label=behavior,
-            row_prefix="nbaiot",
         )
     schema = plan.schema
     if source.kind == "botiot":
@@ -360,15 +564,15 @@ def _normalize_frame(
             schema.timestamp,
         } - {None}
         features = frame.drop(columns=list(metadata_sources), errors="ignore")
-        return data_module._append_metadata(
+        return append_metadata(
             features,
             dataset="botiot",
-            source_file=plan.path,
+            logical_source=plan.relative_path,
+            source_id=plan.logical_identity,
             device_id=devices,
             raw_attack=raw_attack.map(normalize_token),
             behavior_label=behaviors,
             timestamp=timestamps,
-            row_prefix="botiot",
         )
     assert schema.label is not None
     labels = frame[schema.label].map(canonicalize_behavior)
@@ -394,15 +598,15 @@ def _normalize_frame(
         schema.timestamp,
     } & set(frame.columns)
     features = frame.drop(columns=list(metadata_sources))
-    return data_module._append_metadata(
+    return append_metadata(
         features,
         dataset="csv",
-        source_file=plan.path,
+        logical_source=plan.relative_path,
+        source_id=plan.logical_identity,
         device_id=devices,
         raw_attack=raw,
         behavior_label=labels,
         timestamp=timestamps,
-        row_prefix="csv",
     )
 
 
@@ -530,19 +734,30 @@ def _build_iteration_plan(
     file_plans: list[_FilePlan] = []
     has_rows = False
     for path, relative_path in zip(source.files, source.relative_paths):
-        selected_rows = _scan_selected_rows(
+        pinned = _pinned_stat(path)
+        selected_rows, fingerprint, identity = _scan_selected_rows(
             path,
+            relative_path,
+            source.kind,
+            pinned,
             chunk_size=chunk_size,
             max_rows=max_rows,
-            seed=data_module._source_seed(int(config["experiment"]["seed"]), path),
+            seed=int(config["experiment"]["seed"]),
             budget=budget,
         )
+        file_plan = _FilePlan(
+            path,
+            relative_path,
+            identity,
+            fingerprint,
+            selected_rows,
+            _Schema(),
+            None,
+        )
         schema, timestamp = _plan_schema_and_timestamp(
-            source.kind, path, selected_rows, cfg, chunk_size
+            source.kind, file_plan, cfg, chunk_size
         )
-        file_plans.append(
-            _FilePlan(path, relative_path, selected_rows, schema, timestamp)
-        )
+        file_plans.append(replace(file_plan, schema=schema, timestamp=timestamp))
         has_rows = has_rows or selected_rows != frozenset()
     files = tuple(file_plans)
     if not has_rows:
@@ -618,7 +833,7 @@ def load_normalized_dataset(
     path_override: Path | None = None,
     *,
     dataset_type: str | None = None,
-) -> data_module.LoadedDataset:
+) -> LoadedDataset:
     """Materialize normalized chunks at the legacy in-memory compatibility boundary."""
 
     plan = _build_iteration_plan(config, path_override, True, dataset_type)
@@ -628,7 +843,17 @@ def load_normalized_dataset(
             file_plan.selected_rows == frozenset()
             and plan.materialization_order is None
         ):
-            header = pd.read_csv(file_plan.path, nrows=0, low_memory=False)
+            header: pd.DataFrame | None = None
+            header_pass = _VerifiedCsvPass(
+                file_plan.path,
+                file_plan.fingerprint,
+                chunk_size=int(config["dataset"]["chunk_size"]),
+                phase="header-only materialization",
+                expected_sha256=file_plan.fingerprint.sha256,
+            )
+            for frame in header_pass:
+                header = frame.iloc[0:0].copy()
+            assert header is not None
             frames.append(_normalize_frame(header, file_plan, plan.source))
             continue
         frames.extend(
@@ -657,20 +882,30 @@ def load_normalized_dataset(
         frac=1, random_state=int(config["experiment"]["seed"])
     ).reset_index(drop=True)
     cfg = config["dataset"]
-    features = data_module._numeric_features(combined, cfg.get("drop_columns", []))
+    features = numeric_features(combined, cfg.get("drop_columns", []))
     source = plan.source
-    digests: dict[str, str] = {}
-    for path, relative_path in zip(source.files, source.relative_paths):
-        digest_key = (
-            str(path.relative_to(source.root))
-            if source.kind == "nbaiot" and source.root is not None
-            else str(path)
-        )
-        digests[digest_key] = data_module._file_digest(path)
+    digests = {
+        file_plan.relative_path: file_plan.fingerprint.sha256
+        for file_plan in plan.files
+    }
     provenance: dict[str, Any] = {
         "type": source.kind,
         "files": len(source.files),
         "sha256": digests,
+        "source_identity": {
+            "algorithm": "bitguard.logical-source.v1",
+            "row_uid_algorithm": "bitguard.row-uid.v2",
+            "sampling_algorithm": "bitguard.source-sampling.v1",
+            "files": [
+                {
+                    "relative_path": file_plan.relative_path,
+                    "byte_size": file_plan.fingerprint.byte_size,
+                    "content_sha256": file_plan.fingerprint.sha256,
+                    "logical_source_id": file_plan.logical_identity,
+                }
+                for file_plan in plan.files
+            ],
+        },
         "has_wall_clock_time": (
             False
             if source.kind == "nbaiot"
@@ -680,11 +915,11 @@ def load_normalized_dataset(
     if source.kind == "nbaiot":
         provenance.update(
             {
-                "root": str(source.root),
+                "root": str(source.anchor),
                 "notes": "N-BaIoT sequence_index is not a wall-clock timestamp.",
                 "label_overrides": source.label_overrides,
             }
         )
     elif source.kind == "botiot":
         provenance["label_overrides"] = source.label_overrides
-    return data_module.LoadedDataset(combined, features, provenance)
+    return LoadedDataset(combined, features, provenance)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 import re
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from bitguard_bnn.data import (
     load_generic_csv,
     load_nbaiot,
 )
+from bitguard_bnn.out_of_core import source as source_module
 from bitguard_bnn.out_of_core.source import iter_normalized_chunks
 
 
@@ -184,6 +186,133 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
                 iter_normalized_chunks(config, apply_sampling_caps=False)
             )
             self.assertEqual(sum(len(chunk.frame) for chunk in uncapped), 12)
+
+    def test_logical_identity_is_stable_when_the_source_tree_moves(self) -> None:
+        snapshots: list[tuple[list[int], list[str], list[str]]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_bytes = pd.DataFrame(
+                {
+                    "behavior_label": ["benign", "scan_like"] * 10,
+                    "x": list(range(20)),
+                }
+            ).to_csv(index=False).encode("utf-8")
+            for location in (root / "first", root / "relocated" / "second"):
+                dataset = location / "dataset"
+                dataset.mkdir(parents=True)
+                (dataset / "rows.csv").write_bytes(csv_bytes)
+                config = _base_config(location, "csv", "dataset/*.csv")
+                config["dataset"]["max_rows_per_file"] = 5
+
+                loaded = load_dataset(config)
+
+                snapshots.append(
+                    (
+                        sorted(loaded.frame["sequence_index"].astype(int).tolist()),
+                        sorted(loaded.frame["row_uid"].astype(str).tolist()),
+                        sorted(loaded.frame["source_file"].astype(str).unique()),
+                    )
+                )
+
+        self.assertEqual(snapshots[0], snapshots[1])
+        self.assertEqual(snapshots[0][2], ["rows.csv"])
+
+    def test_logical_identity_changes_when_bytes_change_at_the_same_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            config = _base_config(root, "csv", "rows.csv")
+            pd.DataFrame(
+                {"behavior_label": ["benign"], "x": [1]}
+            ).to_csv(path, index=False)
+            first = load_dataset(config)
+            pd.DataFrame(
+                {"behavior_label": ["benign"], "x": [2]}
+            ).to_csv(path, index=False)
+
+            second = load_dataset(config)
+
+        self.assertNotEqual(
+            first.frame["row_uid"].tolist(), second.frame["row_uid"].tolist()
+        )
+
+    def test_iterator_rejects_append_after_the_planning_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 6, "x": list(range(6))}
+            ).to_csv(path, index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            config["dataset"]["max_loaded_rows"] = 6
+            iterator = iter_normalized_chunks(config)
+            next(iterator)
+
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write("benign,999\n")
+
+            with self.assertRaisesRegex(RuntimeError, "source changed"):
+                list(iterator)
+
+    def test_iterator_rejects_same_size_rewrite_with_restored_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 6, "x": list(range(6))}
+            ).to_csv(path, index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            original = path.read_bytes()
+            rewritten = original.replace(b"benign,3", b"benign,9", 1)
+            self.assertEqual(len(rewritten), len(original))
+            initial_stat = path.stat()
+            original_iter = source_module._iter_planned_chunks
+
+            def rewrite_before_emit(config: dict, plan: object):
+                path.write_bytes(rewritten)
+                os.utime(
+                    path,
+                    ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns),
+                )
+                yield from original_iter(config, plan)
+
+            with (
+                patch.object(
+                    source_module,
+                    "_iter_planned_chunks",
+                    rewrite_before_emit,
+                ),
+                self.assertRaisesRegex(RuntimeError, "source changed"),
+            ):
+                list(iter_normalized_chunks(config))
+
+    def test_iterator_rejects_same_path_replacement_before_emit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            replacement = root / "replacement.csv"
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 4, "x": list(range(4))}
+            ).to_csv(path, index=False)
+            pd.DataFrame(
+                {"behavior_label": ["benign"] * 4, "x": list(range(4, 8))}
+            ).to_csv(replacement, index=False)
+            config = _base_config(root, "csv", "rows.csv")
+            original_iter = source_module._iter_planned_chunks
+
+            def replace_before_emit(config: dict, plan: object):
+                replacement.replace(path)
+                yield from original_iter(config, plan)
+
+            with (
+                patch.object(
+                    source_module,
+                    "_iter_planned_chunks",
+                    replace_before_emit,
+                ),
+                self.assertRaisesRegex(RuntimeError, "source changed"),
+            ):
+                list(iter_normalized_chunks(config))
 
     def test_uncapped_iterator_still_enforces_schema(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -542,6 +671,25 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
             [chunk.source_relative_path for chunk in chunks],
             ["a/rows.csv", "b/rows.csv"],
         )
+
+    def test_duplicate_normalized_logical_paths_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rows.csv"
+            pd.DataFrame(
+                {"behavior_label": ["benign"], "x": [1]}
+            ).to_csv(path, index=False)
+            config = _base_config(root, "csv", "*.csv")
+
+            with (
+                patch.object(
+                    source_module,
+                    "resolve_csv_files",
+                    return_value=(path, path),
+                ),
+                self.assertRaisesRegex(ValueError, "duplicate logical source path"),
+            ):
+                list(iter_normalized_chunks(config))
 
     def test_typed_loaders_delegate_to_shared_materializer(self) -> None:
         sentinel = LoadedDataset(pd.DataFrame(), [], {})

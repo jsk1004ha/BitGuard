@@ -16,13 +16,7 @@ from .constants import (
     META_COLUMNS,
     normalize_token,
 )
-
-
-@dataclass
-class LoadedDataset:
-    frame: pd.DataFrame
-    feature_columns: list[str]
-    provenance: dict[str, Any]
+from .out_of_core.common import LoadedDataset
 
 
 @dataclass
