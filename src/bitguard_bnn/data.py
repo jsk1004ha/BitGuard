@@ -368,14 +368,9 @@ def load_generic_csv(config: dict[str, Any], path_override: Path | None = None) 
 
 
 def load_dataset(config: dict[str, Any], path_override: Path | None = None) -> LoadedDataset:
-    kind = str(config["dataset"]["type"]).lower()
-    if kind == "nbaiot":
-        return load_nbaiot(config, path_override)
-    if kind == "botiot":
-        return load_botiot(config, path_override)
-    if kind == "csv":
-        return load_generic_csv(config, path_override)
-    raise ValueError(f"unsupported dataset.type: {kind}")
+    from .out_of_core.source import load_normalized_dataset
+
+    return load_normalized_dataset(config, path_override)
 
 
 def _split_train_validation(
