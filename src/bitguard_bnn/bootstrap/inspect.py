@@ -629,7 +629,7 @@ def _promote_timestamp_series(values: object, witnesses: Sequence[object]):
     if not witnesses:
         return series
     column = series.name if series.name is not None else "__timestamp"
-    frames = [series.to_frame(name=column)]
+    frames = []
     for witness in witnesses:
         if isinstance(witness, pd.DataFrame):
             frame = witness.copy()
@@ -639,11 +639,12 @@ def _promote_timestamp_series(values: object, witnesses: Sequence[object]):
         else:
             frame = _pandas_series(witness).to_frame(name=column)
         frames.append(frame)
+    frames.append(series.to_frame(name=column))
     promoted = pd.concat(
         frames,
         ignore_index=True,
     )
-    return promoted[column].iloc[: len(series)].reset_index(drop=True)
+    return promoted[column].iloc[-len(series) :].reset_index(drop=True)
 
 
 def _pandas_inferred_chunk(
@@ -734,7 +735,7 @@ def _plan_file_inspection(
     numeric_keys: set[str] = set()
     timestamp_numeric = 0
     timestamp_total = 0
-    timestamp_witnesses: dict[str, object] = {}
+    timestamp_witnesses: dict[tuple[str, bool], object] = {}
     first_timestamp_value: object | None = None
     source_sha256 = ""
     try:
@@ -771,12 +772,17 @@ def _plan_file_inspection(
                     drop=True
                 )
                 dtype_key = str(timestamp_values.dtype)
-                if dtype_key not in timestamp_witnesses:
-                    timestamp_witnesses[dtype_key] = timestamp_values.iloc[
-                        :1
-                    ].to_frame()
+                non_missing = timestamp_values.notna().to_numpy().nonzero()[0]
+                all_missing = not len(non_missing)
+                witness_index = 0 if all_missing else int(non_missing[0])
+                witness = timestamp_values.iloc[[witness_index]].to_frame()
+                witness_key = (dtype_key, all_missing)
+                if witness_key not in timestamp_witnesses:
+                    # DataFrame concat distinguishes an all-NA block from the
+                    # same dtype carrying values. Keep one ordered witness for
+                    # each finite promotion category.
+                    timestamp_witnesses[witness_key] = witness
                 if first_timestamp_value is None:
-                    non_missing = timestamp_values.notna().to_numpy().nonzero()[0]
                     if len(non_missing):
                         first_timestamp_value = timestamp_values.iloc[
                             [int(non_missing[0])]
@@ -814,6 +820,11 @@ def _plan_file_inspection(
             context = promoted_context.iloc[0]
             if isinstance(context, str) and guess_datetime_format is not None:
                 datetime_format = guess_datetime_format(context)
+            if datetime_format is None:
+                # Pandas falls back to element-wise parsing when its first
+                # promoted value cannot establish a single format. Record that
+                # decision once so later chunks cannot infer a different policy.
+                datetime_format = "mixed"
     return _FileInspectionPlan(
         header=tuple(header),
         schema=schema,

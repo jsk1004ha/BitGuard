@@ -493,6 +493,178 @@ class SchemaInspectionTest(unittest.TestCase):
         self.assertEqual(report.accepted_rows, int(expected.sum()))
         self.assertEqual(report.rejected_rows, int((~expected).sum()))
 
+    def test_numeric_first_global_mixed_datetime_fallback_matches_adapter(
+        self,
+    ) -> None:
+        timestamps = (
+            "1",
+            "-2",
+            "",
+            "NA",
+            "2020-05-06T07:08:09Z",
+            "alpha",
+            "null",
+            "03/04/2020",
+        )
+        csv_text = (
+            "category,subcategory,saddr,stime,x\n"
+            + "".join(
+                f"Normal,Normal,device,{timestamp},{index}\n"
+                for index, timestamp in enumerate(timestamps, start=1)
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "flows.csv"
+            path.write_text(csv_text, encoding="utf-8")
+            inferred = pd.concat(
+                pd.read_csv(path, chunksize=4, low_memory=False),
+                ignore_index=True,
+            )["stime"]
+            expected = _coerce_timestamp(inferred).notna()
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                chunk_size=4,
+                fail_on_rejected=False,
+            )
+
+        self.assertEqual(
+            expected.tolist(),
+            [True, True, False, False, True, False, False, True],
+        )
+        self.assertEqual(report.accepted_rows, int(expected.sum()))
+        self.assertEqual(report.rejected_rows, int((~expected).sum()))
+
+    def test_global_datetime_policy_matches_adapter_for_first_value_contexts(
+        self,
+    ) -> None:
+        cases = {
+            "invalid_first": ("alpha", "2020-01-02", "03/04/2020", ""),
+            "numeric_first": ("1", "2020-01-02", "03/04/2020", ""),
+            "iso_first": ("2020-01-02", "03/04/2020", ""),
+            "slash_first": ("03/04/2020", "2020-01-02", ""),
+            "homogeneous": ("2020-01-02", "2020-02-03", ""),
+        }
+        for name, timestamps in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "flows.csv"
+                path.write_text(
+                    "category,subcategory,saddr,stime,x\n"
+                    + "".join(
+                        f"Normal,Normal,device,{timestamp},{index}\n"
+                        for index, timestamp in enumerate(timestamps, start=1)
+                    ),
+                    encoding="utf-8",
+                )
+                inferred = pd.concat(
+                    pd.read_csv(path, chunksize=2, low_memory=False),
+                    ignore_index=True,
+                )["stime"]
+                expected = _coerce_timestamp(inferred).notna()
+
+                report = inspect_csv_dataset(
+                    "botiot",
+                    root,
+                    chunk_size=2,
+                    fail_on_rejected=False,
+                    rejected_sample_limit=len(timestamps),
+                )
+
+                self.assertEqual(report.accepted_rows, int(expected.sum()))
+                self.assertEqual(report.rejected_rows, int((~expected).sum()))
+                self.assertEqual(
+                    {sample.row_number for sample in report.rejected_samples},
+                    {
+                        index + 2
+                        for index, valid in enumerate(expected.tolist())
+                        if not valid
+                    },
+                )
+
+    def test_non_missing_dtype_witness_matches_dataframe_concat_promotion(
+        self,
+    ) -> None:
+        timestamps = ("", "-2", "True")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "flows.csv"
+            path.write_text(
+                "category,subcategory,saddr,stime,x\n"
+                + "".join(
+                    f"Normal,Normal,device,{timestamp},{index}\n"
+                    for index, timestamp in enumerate(timestamps, start=1)
+                ),
+                encoding="utf-8",
+            )
+            inferred = pd.concat(
+                pd.read_csv(path, chunksize=2, low_memory=False),
+                ignore_index=True,
+            )["stime"]
+            expected = _coerce_timestamp(inferred).notna()
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                chunk_size=2,
+                fail_on_rejected=False,
+                rejected_sample_limit=3,
+            )
+
+        self.assertEqual(str(inferred.dtype), "float64")
+        self.assertEqual(inferred.tolist()[1:], [-2.0, 1.0])
+        self.assertEqual(expected.tolist(), [False, True, True])
+        self.assertEqual(report.accepted_rows, 2)
+        self.assertEqual(report.rejected_rows, 1)
+
+    def test_all_na_and_non_null_dtype_witnesses_remain_distinct(self) -> None:
+        timestamps = (
+            "1.5",
+            "True",
+            "NA",
+            "NA",
+            "1.5",
+            "1",
+            "NA",
+            "True",
+            "NA",
+            "NA",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "flows.csv"
+            path.write_text(
+                "category,subcategory,saddr,stime,x\n"
+                + "".join(
+                    f"Normal,Normal,device,{timestamp},{index}\n"
+                    for index, timestamp in enumerate(timestamps, start=1)
+                ),
+                encoding="utf-8",
+            )
+            inferred = pd.concat(
+                pd.read_csv(path, chunksize=1, low_memory=False),
+                ignore_index=True,
+            )["stime"]
+            expected = _coerce_timestamp(inferred).notna()
+
+            report = inspect_csv_dataset(
+                "botiot",
+                root,
+                chunk_size=1,
+                fail_on_rejected=False,
+                rejected_sample_limit=len(timestamps),
+            )
+
+        self.assertEqual(str(inferred.dtype), "object")
+        self.assertEqual(
+            expected.tolist(),
+            [True, False, False, False, True, True, False, False, False, False],
+        )
+        self.assertEqual(report.accepted_rows, 3)
+        self.assertEqual(report.rejected_rows, 7)
+
     def test_underscore_timestamp_is_rejected_during_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
