@@ -72,6 +72,50 @@ class SourceContext(TypedDict):
     source: Path | None
 
 
+def _group_preparation_disk_requirements(
+    estimates: Mapping[str, object],
+    *,
+    work_paths: Mapping[str, Path],
+    output_paths: Mapping[str, Path],
+    device_for: Callable[[Path], int],
+) -> dict[int, dict[str, object]]:
+    """Group preparation bytes where their temporary and final files live."""
+
+    groups: dict[int, dict[str, object]] = {}
+
+    def add(path: Path, required: int, dataset: str, kind: str) -> None:
+        device = int(device_for(path))
+        group = groups.setdefault(
+            device,
+            {"path": str(path), "required_bytes": 0, "datasets": {}},
+        )
+        group["required_bytes"] = cast(int, group["required_bytes"]) + required
+        datasets = cast(dict[str, dict[str, int]], group["datasets"])
+        values = datasets.setdefault(dataset, {})
+        values[kind] = values.get(kind, 0) + required
+
+    for dataset, estimate in estimates.items():
+        work_bytes = sum(
+            int(getattr(estimate, name))
+            for name in (
+                "source_snapshot_bytes",
+                "membership_sqlite_bytes",
+                "audit_sqlite_bytes",
+            )
+        )
+        output_bytes = sum(
+            int(getattr(estimate, name))
+            for name in (
+                "external_merge_bytes",
+                "staging_bytes",
+                "final_shard_bytes",
+            )
+        )
+        add(work_paths[dataset], work_bytes, dataset, "work")
+        add(output_paths[dataset], output_bytes, dataset, "output")
+    return groups
+
+
 def _default_compute_resolver(requested: str) -> dict[str, object]:
     driver = probe_nvidia_driver()
     if requested == "cpu":
@@ -1891,9 +1935,22 @@ def run_bootstrap(
                     return repository / "configs" / "full" / f"{dataset}.yaml"
 
                 def prepared_descriptor_path(dataset: str) -> Path:
-                    return prepared_descriptor_root / f"{dataset}.json"
+                    generation = preparation_generation(dataset)
+                    return prepared_descriptor_root / dataset / f"{generation}.json"
 
-                def preparation_signature() -> str:
+                def prepared_generation_output(dataset: str) -> Path:
+                    return prepared_output_root / dataset / preparation_generation(dataset)
+
+                def prepared_generation_work(dataset: str) -> Path:
+                    return preparation_work_root / dataset / preparation_generation(dataset)
+
+                preparation_signature_cache: dict[str, str] = {}
+                preparation_contract_cache: dict[str, object] | None = None
+
+                def preparation_contract() -> dict[str, object]:
+                    nonlocal preparation_contract_cache
+                    if preparation_contract_cache is not None:
+                        return preparation_contract_cache
                     from bitguard_bnn.out_of_core import (
                         prepare as prepare_module,
                         preprocess as preprocess_module,
@@ -1915,65 +1972,64 @@ def run_bootstrap(
                         }.items()
                     }
 
-                    return _json_signature(
+                    preparation_contract_cache = {
+                        "algorithm": prepare_module.PREPARATION_ALGORITHM,
+                        "algorithm_versions": {
+                            "source_normalization": "bitguard.normalization-signature.v1",
+                            "split": split_module.SPLIT_ALGORITHM,
+                            "split_membership": split_module.MEMBERSHIP_ALGORITHM,
+                            "quantile": (
+                                f"{quantiles_module.ALGORITHM}.v"
+                                f"{quantiles_module.VERSION}"
+                            ),
+                            "preprocess": preprocess_module.STREAMING_PREPROCESS_VERSION,
+                            "shard": shard_module.SHARD_ALGORITHM,
+                            "coverage": shard_module.COVERAGE_ALGORITHM,
+                        },
+                        "implementations": implementations,
+                        "dependency_token": deps.preparation_signature_token,
+                        "environment": _regular_digest(environment_path)[0],
+                    }
+                    return preparation_contract_cache
+
+                def dataset_preparation_signature(dataset: str) -> str:
+                    cached = preparation_signature_cache.get(dataset)
+                    if cached is not None:
+                        return cached
+                    signature = _json_signature(
                         {
-                            "datasets": {
-                                dataset: {
-                                    "raw": _tree_digest(raw_roots[dataset])[0],
-                                    "source_manifest": _regular_digest(
-                                        Path(manifests[dataset])
-                                    )[0],
-                                    "schema": _regular_digest(Path(schemas[dataset]))[0],
-                                    "config": _regular_digest(
-                                        full_config_path(dataset)
-                                    )[0],
-                                }
-                                for dataset in options.datasets
+                            "dataset": dataset,
+                            "inputs": {
+                                "raw": _tree_digest(raw_roots[dataset])[0],
+                                "source_manifest": _regular_digest(
+                                    Path(manifests[dataset])
+                                )[0],
+                                "schema": _regular_digest(Path(schemas[dataset]))[0],
+                                "config": _regular_digest(full_config_path(dataset))[0],
                             },
-                            "algorithm": prepare_module.PREPARATION_ALGORITHM,
-                            "algorithm_versions": {
-                                "source_normalization": "bitguard.normalization-signature.v1",
-                                "split": split_module.SPLIT_ALGORITHM,
-                                "split_membership": split_module.MEMBERSHIP_ALGORITHM,
-                                "quantile": (
-                                    f"{quantiles_module.ALGORITHM}.v"
-                                    f"{quantiles_module.VERSION}"
-                                ),
-                                "preprocess": preprocess_module.STREAMING_PREPROCESS_VERSION,
-                                "shard": shard_module.SHARD_ALGORITHM,
-                                "coverage": shard_module.COVERAGE_ALGORITHM,
-                            },
-                            "implementations": implementations,
-                            "dependency_token": deps.preparation_signature_token,
-                            "environment": _regular_digest(environment_path)[0],
+                            "contract": preparation_contract(),
                         }
                     )
+                    preparation_signature_cache[dataset] = signature
+                    return signature
+
+                def preparation_signature() -> str:
+                    return _json_signature(
+                        {
+                            dataset: dataset_preparation_signature(dataset)
+                            for dataset in options.datasets
+                        }
+                    )
+
+                def preparation_generation(dataset: str) -> str:
+                    return dataset_preparation_signature(dataset)
 
                 def preparation_disk_requirements() -> dict[str, object]:
                     from bitguard_bnn.out_of_core.prepare import (
                         estimate_preparation_disk,
                     )
 
-                    groups: dict[int, dict[str, object]] = {}
-
-                    def add(path: Path, required: int, dataset: str, kind: str) -> None:
-                        parent = _existing_parent(path)
-                        device = int(parent.stat().st_dev)
-                        group = groups.setdefault(
-                            device,
-                            {
-                                "path": str(parent),
-                                "required_bytes": 0,
-                                "datasets": {},
-                            },
-                        )
-                        group["required_bytes"] = (
-                            cast(int, group["required_bytes"]) + required
-                        )
-                        datasets = cast(dict[str, dict[str, int]], group["datasets"])
-                        values = datasets.setdefault(dataset, {})
-                        values[kind] = values.get(kind, 0) + required
-
+                    estimate_objects: dict[str, object] = {}
                     estimates: dict[str, dict[str, int]] = {}
                     for dataset in options.datasets:
                         estimate = estimate_preparation_disk(
@@ -1981,18 +2037,25 @@ def run_bootstrap(
                             Path(schemas[dataset]),
                             train_fraction=0.70,
                         )
+                        estimate_objects[dataset] = estimate
                         estimates[dataset] = estimate.as_dict()
-                        work_bytes = (
-                            estimate.source_snapshot_bytes
-                            + estimate.membership_sqlite_bytes
-                            + estimate.audit_sqlite_bytes
-                            + estimate.external_merge_bytes
-                        )
-                        final_bytes = estimate.staging_bytes + estimate.final_shard_bytes
-                        add(preparation_work_root / dataset, work_bytes, dataset, "work")
-                        add(prepared_output_root / dataset, final_bytes, dataset, "output")
+                    groups = _group_preparation_disk_requirements(
+                        estimate_objects,
+                        work_paths={
+                            dataset: prepared_generation_work(dataset)
+                            for dataset in options.datasets
+                        },
+                        output_paths={
+                            dataset: prepared_generation_output(dataset)
+                            for dataset in options.datasets
+                        },
+                        device_for=lambda path: int(
+                            _existing_parent(path).stat().st_dev
+                        ),
+                    )
                     for group in groups.values():
-                        probe = Path(str(group["path"]))
+                        probe = _existing_parent(Path(str(group["path"])))
+                        group["path"] = str(probe)
                         available_bytes = (
                             deps.available_bytes
                             if deps.available_bytes is not None
@@ -2027,14 +2090,16 @@ def run_bootstrap(
                     outputs: list[Path] = []
                     for dataset in options.datasets:
                         descriptor = prepared_descriptor_path(dataset)
+                        generation = preparation_generation(dataset)
                         preparer(
                             full_config_path(dataset),
                             raw_root=raw_roots[dataset],
                             source_manifest_path=Path(manifests[dataset]),
                             schema_report_path=Path(schemas[dataset]),
-                            output_dir=prepared_output_root / dataset,
+                            output_dir=prepared_generation_output(dataset),
                             descriptor_path=descriptor,
-                            work_dir=preparation_work_root / dataset,
+                            work_dir=prepared_generation_work(dataset),
+                            preparation_signature=generation,
                         )
                         if not descriptor.is_file() or descriptor.is_symlink():
                             raise RuntimeError(

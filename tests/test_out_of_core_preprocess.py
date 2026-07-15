@@ -268,6 +268,45 @@ def _builder_for_method(
 
 
 class OutOfCorePreprocessTests(unittest.TestCase):
+    def test_supplied_work_dir_owns_public_audit_lifecycle(self) -> None:
+        frame, features = _frame(12)
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "preparation-work"
+            with patch.object(
+                out_of_core_preprocess.tempfile,
+                "mkdtemp",
+                side_effect=AssertionError("system temp must not be used"),
+            ):
+                builder = StreamingFeaturePreprocessor(
+                    _config(),
+                    candidate_features=features,
+                    split_fingerprint="split-v1",
+                    expected_train_rows=len(frame),
+                    quantile_capacity=12,
+                    quantile_seed=1,
+                    work_dir=work,
+                )
+            audit_root = builder._audit_root
+            self.assertEqual(audit_root.parent, work.resolve())
+            self.assertTrue(audit_root.is_dir())
+            builder.close()
+            builder.close()
+            self.assertFalse(audit_root.exists())
+
+            with self.assertRaisesRegex(RuntimeError, "injected fit failure"):
+                with StreamingFeaturePreprocessor(
+                    _config(),
+                    candidate_features=features,
+                    split_fingerprint="split-v1",
+                    expected_train_rows=len(frame),
+                    quantile_capacity=12,
+                    quantile_seed=1,
+                    work_dir=work,
+                ) as failing:
+                    failed_root = failing._audit_root
+                    raise RuntimeError("injected fit failure")
+            self.assertFalse(failed_root.exists())
+
     def test_large_offset_moments_avoid_raw_sum_cancellation(self) -> None:
         levels = np.asarray(
             [1] * 2764 + [2] * 2317 + [-2] * 2315 + [0] * 2749,

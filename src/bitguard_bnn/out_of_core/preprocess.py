@@ -8,6 +8,7 @@ import math
 import shutil
 import sqlite3
 import tempfile
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -280,6 +281,7 @@ class StreamingFeaturePreprocessor:
         expected_train_rows: int,
         quantile_capacity: int,
         quantile_seed: int,
+        work_dir: Path | None = None,
     ) -> None:
         self.config = config
         self.original_candidate_features = tuple(str(name) for name in candidate_features)
@@ -321,7 +323,31 @@ class StreamingFeaturePreprocessor:
         self.feature_costs: NDArray[np.float64] | None = None
         self._final_result: FeaturePreprocessor | None = None
 
-        self._audit_root = Path(tempfile.mkdtemp(prefix="bitguard-preprocess-audit-"))
+        # Validate scientific configuration before allocating audit state.
+        FeaturePreprocessor(config)
+        if work_dir is None:
+            self._audit_root = Path(
+                tempfile.mkdtemp(prefix="bitguard-preprocess-audit-")
+            )
+        else:
+            audit_parent = Path(work_dir).expanduser().resolve()
+            audit_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not audit_parent.is_dir() or audit_parent.is_symlink():
+                raise RuntimeError(
+                    f"preprocessing work_dir must be a regular directory: {audit_parent}"
+                )
+            for _attempt in range(16):
+                candidate = audit_parent / (
+                    f"bitguard-preprocess-audit-{uuid.uuid4().hex}"
+                )
+                try:
+                    candidate.mkdir(mode=0o700)
+                except FileExistsError:
+                    continue
+                self._audit_root = candidate
+                break
+            else:  # pragma: no cover - UUID collision exhaustion
+                raise RuntimeError("unable to allocate preprocessing audit directory")
         self._audit_connection: sqlite3.Connection | None = sqlite3.connect(
             self._audit_root / "passes.sqlite3"
         )
@@ -331,9 +357,6 @@ class StreamingFeaturePreprocessor:
             "row_digest TEXT NOT NULL, PRIMARY KEY (phase, row_uid))"
         )
         self._audit_connection.commit()
-
-        # Fail early for invalid selection/scaler/encoder/cost configuration.
-        FeaturePreprocessor(config)
 
     def _require_state(self, expected: str) -> None:
         if self._state != expected:
@@ -959,20 +982,44 @@ class StreamingFeaturePreprocessor:
     def _finish_cleanup(self) -> FeaturePreprocessor:
         if self._state != "cleanup_pending" or self._final_result is None:
             raise RuntimeError("preprocessing result is not pending audit cleanup")
-        self._close_audit()
+        self.close()
         self._state = "finalized"
         return self._final_result
 
-    def _close_audit(self) -> None:
+    def close(self) -> None:
+        """Close and remove private audit state; safe to retry after cleanup failure."""
+
         if self._audit_connection is not None:
             self._audit_connection.close()
             self._audit_connection = None
         if self._audit_root.exists():
             shutil.rmtree(self._audit_root)
 
+    def __enter__(self) -> StreamingFeaturePreprocessor:
+        if self._audit_connection is None:
+            raise RuntimeError("preprocessing audit lifecycle is already closed")
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup:
+            if exception is None:
+                raise
+            if hasattr(exception, "add_note"):
+                exception.add_note(
+                    "preprocessing audit cleanup failed: "
+                    f"{type(cleanup).__name__}: {cleanup}"
+                )
+
     def __del__(self) -> None:
         try:
-            self._close_audit()
+            self.close()
         except Exception:
             pass
 

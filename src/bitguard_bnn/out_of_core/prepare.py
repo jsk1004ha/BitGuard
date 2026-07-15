@@ -40,9 +40,9 @@ from bitguard_bnn.out_of_core.source import (
 from bitguard_bnn.preprocess import FeaturePreprocessor
 
 
-PREPARED_DATASET_SCHEMA = "bitguard.prepared-dataset.v1"
+PREPARED_DATASET_SCHEMA = "bitguard.prepared-dataset.v2"
 FEATURE_ARTIFACT_SCHEMA = "bitguard.streaming-feature-artifact.v1"
-PREPARATION_ALGORITHM = "bitguard.full-dataset-preparation.v1"
+PREPARATION_ALGORITHM = "bitguard.full-dataset-preparation.v2"
 
 _PARTITIONS = ("train", "validation", "test")
 _MEMBERSHIP_COLUMNS = ("row_uid", "split", "behavior_label")
@@ -69,9 +69,14 @@ class PreparationDiskEstimate:
 class PreparedDataset:
     descriptor_path: str
     dataset: str
+    template_config_path: str
+    template_config_sha256: str
     resolved_config_path: str
     config_sha256: str
+    preparation_fingerprint: str
     raw_root: str
+    output_dir: str
+    work_dir: str
     source_manifest_path: str
     source_manifest_fingerprint: str
     schema_report_path: str
@@ -374,18 +379,20 @@ def _fit_preprocessor(
     plan: SplitPlan,
     membership: _MembershipIndex,
     config: dict[str, Any],
+    work_dir: Path,
 ) -> tuple[FeaturePreprocessor, Any]:
     features = list(source.proof.feature_names)
-    builder = StreamingFeaturePreprocessor(
+    builder_context = StreamingFeaturePreprocessor(
         config,
         candidate_features=features,
         split_fingerprint=plan.fingerprint,
         expected_train_rows=plan.train_count,
         quantile_capacity=int(config["dataset"]["quantile_sketch_capacity"]),
         quantile_seed=int(config["split"]["seed"]),
+        work_dir=work_dir,
     )
     sample = None
-    try:
+    with builder_context as builder:
         for uids, values, labels, partitions, _frame in _iter_train_batches(
             source, membership, features
         ):
@@ -427,16 +434,6 @@ def _fit_preprocessor(
         if sample is None:
             raise RuntimeError("no train sample was available for artifact parity")
         return result, sample
-    except BaseException as primary:
-        try:
-            builder._close_audit()
-        except BaseException as cleanup:
-            if hasattr(primary, "add_note"):
-                primary.add_note(
-                    f"preprocessing audit cleanup failed: {type(cleanup).__name__}: {cleanup}"
-                )
-            raise primary from cleanup
-        raise
 
 
 def _publish_preprocessor(
@@ -608,8 +605,18 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
     config_path = Path(prepared.resolved_config_path)
     if _sha256_file(config_path) != prepared.config_sha256:
         raise RuntimeError("prepared dataset config checksum mismatch")
+    if _sha256_file(Path(prepared.template_config_path)) != prepared.template_config_sha256:
+        raise RuntimeError("prepared dataset template config checksum mismatch")
     config = load_config(config_path)
     _validate_full_config(config)
+    configured_raw = resolve_path(config, config["dataset"].get("path"))
+    configured_shards = resolve_path(config, config["dataset"].get("shard_manifest"))
+    if configured_raw != Path(prepared.raw_root).resolve():
+        raise RuntimeError("prepared resolved config raw path mismatch")
+    if configured_shards != Path(prepared.shard_manifest_path).resolve():
+        raise RuntimeError("prepared resolved config shard manifest mismatch")
+    if Path(prepared.output_dir).resolve() != Path(prepared.shard_manifest_path).resolve().parent:
+        raise RuntimeError("prepared output directory mismatch")
     _validate_source_contract_against_disk(prepared)
 
     split = SplitPlan(
@@ -696,11 +703,13 @@ def prepare_full_dataset(
     output_dir: Path | str | None = None,
     descriptor_path: Path | str | None = None,
     work_dir: Path | str | None = None,
+    preparation_signature: str | None = None,
 ) -> PreparedDataset:
     """Prepare all verified source rows into immutable Parquet shards."""
 
-    resolved_config = Path(config_path).expanduser().resolve(strict=True)
-    config = load_config(resolved_config)
+    template_config = Path(config_path).expanduser().resolve(strict=True)
+    template_config_sha = _sha256_file(template_config)
+    config = load_config(template_config)
     _validate_full_config(config)
     dataset = str(config["dataset"]["type"]).lower()
     if dataset not in {"nbaiot", "botiot"}:
@@ -725,31 +734,67 @@ def prepare_full_dataset(
         if work_dir is not None
         else output / ".work"
     )
+    source_manifest, schema, schema_fingerprint = _load_source_contract(
+        source_manifest_path, schema_report_path
+    )
+    requested_fingerprint = stable_fingerprint(
+        {
+            "algorithm": PREPARATION_ALGORITHM,
+            "template_config_path": str(template_config),
+            "template_config_sha256": template_config_sha,
+            "raw_root": str(source_root),
+            "source_manifest_path": str(source_manifest_path),
+            "source_manifest_fingerprint": source_manifest.content_sha256,
+            "schema_report_path": str(schema_report_path),
+            "schema_report_fingerprint": schema_fingerprint,
+            "output_dir": str(output),
+            "work_dir": str(work),
+            "caller_signature": preparation_signature,
+        }
+    )
     if descriptor.exists():
         existing = verify_prepared_dataset(descriptor)
         requested_paths = {
-            "resolved_config_path": resolved_config,
+            "template_config_path": template_config,
             "raw_root": source_root,
             "source_manifest_path": source_manifest_path,
             "schema_report_path": schema_report_path,
+            "output_dir": output,
+            "work_dir": work,
         }
         for field, requested in requested_paths.items():
             if Path(str(getattr(existing, field))).resolve() != requested:
                 raise RuntimeError(
                     f"prepared descriptor {field} does not match requested input"
                 )
-        if Path(existing.shard_manifest_path).resolve().parent != output:
-            raise RuntimeError("prepared descriptor output does not match requested output")
+        if existing.preparation_fingerprint != requested_fingerprint:
+            raise RuntimeError(
+                "prepared descriptor preparation_fingerprint does not match requested input"
+            )
         return existing
 
     output.mkdir(parents=True, exist_ok=True)
     descriptor.parent.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True, mode=0o700)
-    source_manifest, schema, schema_fingerprint = _load_source_contract(
-        source_manifest_path, schema_report_path
-    )
     if source_manifest.dataset_name != dataset:
         raise RuntimeError("source manifest dataset does not match full config")
+
+    resolved_config = output / "resolved_config.yaml"
+    resolved_payload = _clean_config(config)
+    resolved_dataset = dict(resolved_payload["dataset"])
+    resolved_dataset["path"] = str(source_root)
+    resolved_dataset["storage"] = "parquet"
+    resolved_dataset["shard_manifest"] = str(output / "shard_manifest.json")
+    resolved_payload["dataset"] = resolved_dataset
+    _publish_json_immutable(resolved_config, resolved_payload)
+    config = load_config(resolved_config)
+    _validate_full_config(config)
+    if resolve_path(config, config["dataset"]["path"]) != source_root:
+        raise RuntimeError("generated resolved config raw path did not round trip")
+    if resolve_path(config, config["dataset"]["shard_manifest"]) != (
+        output / "shard_manifest.json"
+    ).resolve():
+        raise RuntimeError("generated resolved config shard path did not round trip")
 
     split_dir = output / "split"
     preprocessor_path = output / "preprocessor.joblib"
@@ -777,7 +822,7 @@ def prepare_full_dataset(
                 batch_rows=int(config["dataset"]["record_batch_rows"]),
             ) as membership:
                 processor, sample = _fit_preprocessor(
-                    source, split, membership, config
+                    source, split, membership, config, work
                 )
             processor, preprocessor_sha = _publish_preprocessor(
                 processor, sample, preprocessor_path
@@ -811,9 +856,14 @@ def prepare_full_dataset(
             prepared = PreparedDataset(
                 descriptor_path=str(descriptor),
                 dataset=dataset,
+                template_config_path=str(template_config),
+                template_config_sha256=template_config_sha,
                 resolved_config_path=str(resolved_config),
                 config_sha256=_sha256_file(resolved_config),
+                preparation_fingerprint=requested_fingerprint,
                 raw_root=str(source_root),
+                output_dir=str(output),
+                work_dir=str(work),
                 source_manifest_path=str(source_manifest_path),
                 source_manifest_fingerprint=source_manifest.content_sha256,
                 schema_report_path=str(schema_report_path),
