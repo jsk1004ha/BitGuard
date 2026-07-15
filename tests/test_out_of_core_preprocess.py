@@ -6,15 +6,19 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 from sklearn.feature_selection import f_classif
+from sklearn.preprocessing import StandardScaler
 
 from bitguard_bnn.config import DEFAULTS
 from bitguard_bnn.out_of_core.preprocess import (
     ClassSufficientStatistics,
     StreamingFeaturePreprocessor,
+    _MomentAccumulator,
 )
 from bitguard_bnn.out_of_core.quantiles import PriorityRowSketch
 from bitguard_bnn.preprocess import FeaturePreprocessor
@@ -154,6 +158,91 @@ def _artifact_signature(processor: FeaturePreprocessor) -> str:
 
 
 class OutOfCorePreprocessTests(unittest.TestCase):
+    def test_large_offset_moments_avoid_raw_sum_cancellation(self) -> None:
+        levels = np.asarray(
+            [1] * 2764 + [2] * 2317 + [-2] * 2315 + [0] * 2749,
+            dtype=np.float32,
+        )
+        values = (
+            np.float32(101_000_000.0) + np.float32(8.0) * levels
+        ).astype(np.float32)[:, None]
+        expected = StandardScaler().fit(values)
+        raw = values.astype(np.float64)
+        naive_variance = float(np.mean(np.square(raw)) - np.square(np.mean(raw)))
+
+        whole = _MomentAccumulator(1)
+        whole.update(values)
+        left = _MomentAccumulator(1)
+        right = _MomentAccumulator(1)
+        left.update(values[:5000])
+        right.update(values[5000:])
+        left.merge(right)
+        whole_mean, whole_variance = whole.finalize()
+        merged_mean, merged_variance = left.finalize()
+
+        self.assertAlmostEqual(float(expected.var_[0]), 129.556745320016)
+        self.assertEqual(naive_variance, 128.0)
+        np.testing.assert_allclose(whole_mean, expected.mean_, rtol=0, atol=0)
+        np.testing.assert_allclose(whole_variance, expected.var_, rtol=1e-12)
+        np.testing.assert_allclose(merged_mean, expected.mean_, rtol=0, atol=0)
+        np.testing.assert_allclose(merged_variance, expected.var_, rtol=1e-9)
+
+    def test_large_offset_statistics_match_centered_float64_references(self) -> None:
+        values = (100_000_000.0 + np.arange(38)).astype(np.float32)[:, None]
+        class_indices: NDArray[np.int64] = np.repeat(
+            np.arange(3), [13, 13, 12]
+        )
+        labels = np.asarray(
+            [("benign", "scan_like", "flood_like")[index] for index in class_indices]
+        )
+        active = ("benign", "scan_like", "flood_like")
+        whole = ClassSufficientStatistics(active, 1)
+        left = ClassSufficientStatistics(active, 1)
+        right = ClassSufficientStatistics(active, 1)
+
+        whole.update(values, labels)
+        left.update(values[::2], labels[::2])
+        right.update(values[1::2], labels[1::2])
+        left.merge(right)
+
+        centered = values.astype(np.float64) - values.astype(np.float64).mean(axis=0)
+        expected_f, _ = f_classif(centered, class_indices)
+        direct_float32_f, _ = f_classif(values, class_indices)
+        self.assertFalse(np.allclose(direct_float32_f, expected_f, rtol=0.1, atol=0.1))
+        np.testing.assert_allclose(whole.finalize_f_scores(), expected_f, rtol=1e-9)
+        np.testing.assert_allclose(left.finalize_f_scores(), expected_f, rtol=2e-9)
+
+        frame = pd.DataFrame(
+            {
+                "offset": values[:, 0],
+                "row_uid": [f"offset-{index:04d}" for index in range(len(values))],
+                "behavior_label": labels,
+            }
+        )
+        processor, _ = _fit_streaming(
+            frame,
+            ["offset"],
+            _config(feature_budget=1, scaler="standard", encoder="none"),
+        )
+        expected_scaler = StandardScaler().fit(values)
+        self.assertAlmostEqual(float(expected_scaler.var_[0]), 127.68975069252076)
+        self.assertNotEqual(float(expected_scaler.var_[0]), 128.0)
+        np.testing.assert_allclose(processor.scaler.mean_, expected_scaler.mean_, rtol=0)
+        np.testing.assert_allclose(processor.scaler.var_, expected_scaler.var_, rtol=1e-9)
+        np.testing.assert_allclose(processor.scaler.scale_, expected_scaler.scale_, rtol=1e-9)
+
+    def test_statistics_update_failure_is_transactional(self) -> None:
+        stats = ClassSufficientStatistics(("benign", "scan_like"), 2)
+        stats.update([[1.0, 2.0], [3.0, 4.0]], ["benign", "scan_like"])
+        before = (stats.counts.copy(), stats.means.copy(), stats.m2.copy())
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            stats.update([[5.0, np.inf]], ["benign"])
+
+        np.testing.assert_array_equal(stats.counts, before[0])
+        np.testing.assert_array_equal(stats.means, before[1])
+        np.testing.assert_array_equal(stats.m2, before[2])
+
     def test_no_missing_selection_matches_in_memory_preprocessor(self) -> None:
         frame, features = _frame()
         config = _config(feature_budget=3)
@@ -270,6 +359,76 @@ class OutOfCorePreprocessTests(unittest.TestCase):
                 self.assertTrue(np.isfinite(transformed).all())
                 self.assertEqual(processor.imputer.n_features_in_, len(features))
                 self.assertEqual(processor.scaler.n_features_in_, 2)
+
+    def test_full_retention_calibration_matches_in_memory_for_all_modes(self) -> None:
+        frame, features = _frame(72)
+        selected = ["signal", "secondary"]
+        for scaler in ("robust", "standard", "none"):
+            for encoder in ("sign", "thermometer", "hybrid", "none"):
+                with self.subTest(scaler=scaler, encoder=encoder):
+                    config = _config(
+                        selection="expert",
+                        scaler=scaler,
+                        encoder=encoder,
+                        feature_budget=2,
+                        bits=3,
+                    )
+                    preprocess_config = config["preprocess"]
+                    assert isinstance(preprocess_config, dict)
+                    preprocess_config["expert_features"] = selected
+                    expected = FeaturePreprocessor(copy.deepcopy(config)).fit(frame, features)
+                    actual, _ = _fit_streaming(
+                        frame,
+                        features,
+                        copy.deepcopy(config),
+                        capacity=len(frame),
+                    )
+
+                    self.assertEqual(actual.selected_features, expected.selected_features)
+                    for attribute in ("center_", "mean_", "var_", "scale_"):
+                        expected_value = getattr(expected.scaler, attribute, None)
+                        actual_value = getattr(actual.scaler, attribute, None)
+                        if expected_value is None:
+                            self.assertIsNone(actual_value)
+                        else:
+                            np.testing.assert_allclose(
+                                actual_value, expected_value, rtol=1e-12, atol=1e-12
+                            )
+                    if expected.encoder.thresholds is None:
+                        self.assertIsNone(actual.encoder.thresholds)
+                    else:
+                        np.testing.assert_array_equal(
+                            actual.encoder.thresholds, expected.encoder.thresholds
+                        )
+                    np.testing.assert_array_equal(actual.transform(frame), expected.transform(frame))
+                    np.testing.assert_array_equal(actual.benign_center, expected.benign_center)
+                    self.assertAlmostEqual(
+                        actual.open_distance_threshold,
+                        expected.open_distance_threshold,
+                        places=7,
+                    )
+
+    def test_all_selection_modes_preserve_existing_rank_semantics(self) -> None:
+        frame, features = _frame(90)
+        for selection in ("f_score", "variance", "cost_aware", "expert"):
+            with self.subTest(selection=selection):
+                config = _config(selection=selection, feature_budget=2)
+                if selection == "expert":
+                    preprocess_config = config["preprocess"]
+                    assert isinstance(preprocess_config, dict)
+                    preprocess_config["expert_features"] = ["secondary", "signal"]
+                expected = FeaturePreprocessor(copy.deepcopy(config)).fit(frame, features)
+                actual, _ = _fit_streaming(
+                    frame, features, copy.deepcopy(config), capacity=len(frame)
+                )
+                self.assertEqual(actual.selected_features, expected.selected_features)
+                np.testing.assert_allclose(
+                    actual.selection_scores,
+                    expected.selection_scores,
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
+                np.testing.assert_array_equal(actual.feature_costs, expected.feature_costs)
 
     def test_joblib_roundtrip_preserves_transform_and_export_attributes(self) -> None:
         frame, features = _frame(60, missing=True)
@@ -424,6 +583,51 @@ class OutOfCorePreprocessTests(unittest.TestCase):
         self.assertEqual(provenance["passes"], 3)
         self.assertIn("approximate_fields", provenance)
         self.assertIn("exact_fields", provenance)
+
+    def test_provenance_is_immutable_and_reflects_actual_retention(self) -> None:
+        frame, features = _frame(60)
+        exact, _ = _fit_streaming(
+            frame, features, _config(), capacity=len(frame)
+        )
+        first = exact.feature_manifest()
+        provenance = first["fit_provenance"]
+        self.assertEqual(provenance["approximate_fields"], [])
+        for name in ("imputation", "selected", "benign"):
+            sketch = provenance["sketches"][name]
+            self.assertEqual(sketch["retained_rows"], sketch["total_rows"])
+            self.assertTrue(sketch["exact"])
+            self.assertIn("confidence", sketch)
+
+        provenance["exact_fields"].append("mutated")
+        provenance["sketches"]["benign"]["confidence"]["confidence"] = 0.1
+        self.assertNotIn(
+            "mutated", exact.feature_manifest()["fit_provenance"]["exact_fields"]
+        )
+        self.assertEqual(
+            exact.feature_manifest()["fit_provenance"]["sketches"]["benign"][
+                "confidence"
+            ]["confidence"],
+            0.95,
+        )
+
+        assigned: dict[str, Any] = {
+            "fit_mode": "external",
+            "nested": {"items": [1]},
+        }
+        exact.fit_provenance = assigned
+        assigned["nested"]["items"].append(2)
+        exposed: dict[str, Any] = exact.fit_provenance
+        exposed["nested"]["items"].append(3)
+        self.assertEqual(exact.fit_provenance["nested"]["items"], [1])
+
+        sampled, _ = _fit_streaming(frame, features, _config(), capacity=7)
+        sampled_provenance = sampled.feature_manifest()["fit_provenance"]
+        self.assertIn("imputation_medians", sampled_provenance["approximate_fields"])
+        self.assertIn(
+            "benign_center_and_distance_quantile",
+            sampled_provenance["approximate_fields"],
+        )
+        self.assertFalse(sampled_provenance["sketches"]["benign"]["exact"])
 
     def test_in_memory_manifest_declares_exact_fit_mode(self) -> None:
         frame, features = _frame(30)

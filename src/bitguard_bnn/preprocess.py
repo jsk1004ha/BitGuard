@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,21 @@ class FeaturePreprocessor:
             "validation_calibration_used": False,
         }
         self.fitted = False
+
+    @property
+    def fit_provenance(self) -> dict[str, Any]:
+        provenance = getattr(
+            self,
+            "_fit_provenance",
+            {"fit_mode": "in_memory_exact", "validation_calibration_used": False},
+        )
+        return copy.deepcopy(provenance)
+
+    @fit_provenance.setter
+    def fit_provenance(self, value: dict[str, Any]) -> None:
+        if not isinstance(value, dict):
+            raise TypeError("fit_provenance must be a dictionary")
+        self._fit_provenance = copy.deepcopy(value)
 
     def _cost_lookup(self, features: list[str]) -> np.ndarray:
         path_value = self.config["preprocess"].get("feature_cost_csv")
@@ -331,11 +347,7 @@ class FeaturePreprocessor:
     def feature_manifest(self) -> dict[str, Any]:
         self._check_fitted()
         assert self.feature_costs is not None and self.selection_scores is not None
-        provenance = getattr(
-            self,
-            "fit_provenance",
-            {"fit_mode": "in_memory_exact", "validation_calibration_used": False},
-        )
+        provenance = self.fit_provenance
         return {
             "fit_mode": str(provenance.get("fit_mode", "in_memory_exact")),
             "fit_provenance": provenance,

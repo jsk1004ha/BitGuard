@@ -56,7 +56,7 @@ def _row_value_digest(label: str, values: NDArray[np.float64]) -> str:
 
 
 class ClassSufficientStatistics:
-    """Mergeable per-class count/sum/squared-sum feature statistics."""
+    """Mergeable per-class count/mean/M2 feature statistics."""
 
     def __init__(self, labels: Sequence[str], width: int) -> None:
         self.labels = tuple(str(label) for label in labels)
@@ -67,10 +67,10 @@ class ClassSufficientStatistics:
         self.width = width
         self.label_to_index = {label: index for index, label in enumerate(self.labels)}
         self.counts: NDArray[np.int64] = np.zeros(len(self.labels), dtype=np.int64)
-        self.sums: NDArray[np.float64] = np.zeros(
+        self.means: NDArray[np.float64] = np.zeros(
             (len(self.labels), width), dtype=np.float64
         )
-        self.squared_sums: NDArray[np.float64] = np.zeros_like(self.sums)
+        self.m2: NDArray[np.float64] = np.zeros_like(self.means)
 
     def update(self, values: object, labels: object) -> None:
         label_values = np.asarray(labels, dtype=object)
@@ -82,18 +82,34 @@ class ClassSufficientStatistics:
         unknown = sorted(set(label_values.astype(str)).difference(self.labels))
         if unknown:
             raise ValueError(f"labels are not active training classes: {unknown}")
+        next_counts = self.counts.copy()
+        next_means = self.means.copy()
+        next_m2 = self.m2.copy()
+        string_labels = label_values.astype(str)
         for label, class_index in self.label_to_index.items():
-            selected = matrix[label_values.astype(str) == label]
+            selected = matrix[string_labels == label]
             if not len(selected):
                 continue
             prospective = int(self.counts[class_index]) + len(selected)
             if prospective > np.iinfo(np.int64).max:
                 raise OverflowError("class count exceeds int64")
-            self.counts[class_index] = prospective
-            self.sums[class_index] += selected.sum(axis=0, dtype=np.float64)
-            self.squared_sums[class_index] += np.square(selected).sum(
-                axis=0, dtype=np.float64
+            batch_mean, batch_m2 = _centered_batch_moments(selected)
+            combined_mean, combined_m2 = _merge_centered_moments(
+                int(self.counts[class_index]),
+                self.means[class_index],
+                self.m2[class_index],
+                len(selected),
+                batch_mean,
+                batch_m2,
             )
+            next_counts[class_index] = prospective
+            next_means[class_index] = combined_mean
+            next_m2[class_index] = combined_m2
+        if not np.isfinite(next_means).all() or not np.isfinite(next_m2).all():
+            raise OverflowError("updated sufficient statistics are non-finite")
+        self.counts = next_counts
+        self.means = next_means
+        self.m2 = next_m2
 
     def merge(self, other: "ClassSufficientStatistics") -> "ClassSufficientStatistics":
         if not isinstance(other, ClassSufficientStatistics):
@@ -106,13 +122,22 @@ class ClassSufficientStatistics:
         if any(count > np.iinfo(np.int64).max for count in prospective):
             raise OverflowError("merged class count exceeds int64")
         next_counts = np.asarray(prospective, dtype=np.int64)
-        next_sums = self.sums + other.sums
-        next_squared = self.squared_sums + other.squared_sums
-        if not np.isfinite(next_sums).all() or not np.isfinite(next_squared).all():
+        next_means = self.means.copy()
+        next_m2 = self.m2.copy()
+        for index in range(len(self.labels)):
+            next_means[index], next_m2[index] = _merge_centered_moments(
+                int(self.counts[index]),
+                self.means[index],
+                self.m2[index],
+                int(other.counts[index]),
+                other.means[index],
+                other.m2[index],
+            )
+        if not np.isfinite(next_means).all() or not np.isfinite(next_m2).all():
             raise OverflowError("merged sufficient statistics are non-finite")
         self.counts = next_counts
-        self.sums = next_sums
-        self.squared_sums = next_squared
+        self.means = next_means
+        self.m2 = next_m2
         return self
 
     @property
@@ -123,10 +148,26 @@ class ClassSufficientStatistics:
         total = self.total_rows
         if total == 0:
             return np.zeros(self.width, dtype=np.float64)
-        sums = self.sums.sum(axis=0)
-        squared = self.squared_sums.sum(axis=0)
-        variance = squared / total - np.square(sums / total)
-        return np.maximum(variance, 0.0)
+        _, total_m2 = self._combined_centered_moments()
+        return np.maximum(total_m2 / total, 0.0)
+
+    def _combined_centered_moments(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        count = 0
+        mean: NDArray[np.float64] = np.zeros(self.width, dtype=np.float64)
+        m2: NDArray[np.float64] = np.zeros(self.width, dtype=np.float64)
+        for index in range(len(self.labels)):
+            mean, m2 = _merge_centered_moments(
+                count,
+                mean,
+                m2,
+                int(self.counts[index]),
+                self.means[index],
+                self.m2[index],
+            )
+            count += int(self.counts[index])
+        return mean, m2
 
     def finalize_f_scores(self) -> NDArray[np.float64]:
         total = self.total_rows
@@ -134,11 +175,11 @@ class ClassSufficientStatistics:
         if total <= class_count or np.any(self.counts == 0):
             return np.zeros(self.width, dtype=np.float64)
         counts = self.counts.astype(np.float64)
-        means = self.sums / counts[:, None]
-        grand_mean = self.sums.sum(axis=0) / total
-        between = np.sum(counts[:, None] * np.square(means - grand_mean), axis=0)
-        within_parts = self.squared_sums - np.square(self.sums) / counts[:, None]
-        within = np.maximum(within_parts, 0.0).sum(axis=0)
+        grand_mean, _ = self._combined_centered_moments()
+        between = np.sum(
+            counts[:, None] * np.square(self.means - grand_mean), axis=0
+        )
+        within = np.maximum(self.m2, 0.0).sum(axis=0)
         between_mean = between / (class_count - 1)
         within_mean = within / (total - class_count)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -146,28 +187,85 @@ class ClassSufficientStatistics:
         return np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _centered_batch_moments(
+    values: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    mean = values.mean(axis=0, dtype=np.float64)
+    centered = values - mean
+    correction = centered.sum(axis=0, dtype=np.float64)
+    m2 = np.square(centered).sum(axis=0, dtype=np.float64)
+    m2 -= np.square(correction) / len(values)
+    return mean, np.maximum(m2, 0.0)
+
+
+def _merge_centered_moments(
+    left_count: int,
+    left_mean: NDArray[np.float64],
+    left_m2: NDArray[np.float64],
+    right_count: int,
+    right_mean: NDArray[np.float64],
+    right_m2: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    if right_count == 0:
+        return left_mean.copy(), left_m2.copy()
+    if left_count == 0:
+        return right_mean.copy(), right_m2.copy()
+    total = left_count + right_count
+    delta = right_mean - left_mean
+    mean = left_mean + delta * (right_count / total)
+    m2 = left_m2 + right_m2
+    m2 += np.square(delta) * (left_count * right_count / total)
+    return mean, np.maximum(m2, 0.0)
+
+
 class _MomentAccumulator:
     def __init__(self, width: int) -> None:
         self.width = width
         self.count = 0
-        self.sums: NDArray[np.float64] = np.zeros(width, dtype=np.float64)
-        self.squared_sums: NDArray[np.float64] = np.zeros(width, dtype=np.float64)
+        self.mean: NDArray[np.float64] = np.zeros(width, dtype=np.float64)
+        self.m2: NDArray[np.float64] = np.zeros(width, dtype=np.float64)
 
     def update(self, values: NDArray[np.float64]) -> None:
         if values.ndim != 2 or values.shape[1] != self.width:
             raise ValueError("moment batch width mismatch")
         if not np.isfinite(values).all():
             raise ValueError("moments require finite imputed values")
+        if not len(values):
+            return
+        if self.count + len(values) > np.iinfo(np.int64).max:
+            raise OverflowError("moment count exceeds int64")
+        batch_mean, batch_m2 = _centered_batch_moments(values)
+        next_mean, next_m2 = _merge_centered_moments(
+            self.count, self.mean, self.m2, len(values), batch_mean, batch_m2
+        )
+        if not np.isfinite(next_mean).all() or not np.isfinite(next_m2).all():
+            raise OverflowError("updated moments are non-finite")
         self.count += len(values)
-        self.sums += values.sum(axis=0, dtype=np.float64)
-        self.squared_sums += np.square(values).sum(axis=0, dtype=np.float64)
+        self.mean = next_mean
+        self.m2 = next_m2
+
+    def merge(self, other: "_MomentAccumulator") -> "_MomentAccumulator":
+        if not isinstance(other, _MomentAccumulator):
+            raise TypeError("other must be _MomentAccumulator")
+        if self.width != other.width:
+            raise ValueError("incompatible moment accumulators")
+        prospective = self.count + other.count
+        if prospective > np.iinfo(np.int64).max:
+            raise OverflowError("merged moment count exceeds int64")
+        next_mean, next_m2 = _merge_centered_moments(
+            self.count, self.mean, self.m2, other.count, other.mean, other.m2
+        )
+        if not np.isfinite(next_mean).all() or not np.isfinite(next_m2).all():
+            raise OverflowError("merged moments are non-finite")
+        self.count = prospective
+        self.mean = next_mean
+        self.m2 = next_m2
+        return self
 
     def finalize(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         if self.count <= 0:
             raise ValueError("moment accumulator is empty")
-        mean = self.sums / self.count
-        variance = np.maximum(self.squared_sums / self.count - np.square(mean), 0.0)
-        return mean, variance
+        return self.mean.copy(), np.maximum(self.m2 / self.count, 0.0)
 
 
 class StreamingFeaturePreprocessor:
@@ -556,77 +654,33 @@ class StreamingFeaturePreprocessor:
             result.scaler.n_samples_seen_ = np.int64(self._selected_moments.count)
             result.scaler.n_features_in_ = width
         elif scaler_name == "robust":
-            q25 = np.asarray(
-                [self.selected_calibration.quantile(index, 0.25) for index in range(width)]
-            )
-            center = np.asarray(
-                [self.selected_calibration.quantile(index, 0.5) for index in range(width)]
-            )
-            q75 = np.asarray(
-                [self.selected_calibration.quantile(index, 0.75) for index in range(width)]
-            )
-            scale = q75 - q25
-            scale[scale < 10.0 * np.finfo(np.float64).eps] = 1.0
-            result.scaler.center_ = center
-            result.scaler.scale_ = scale
-            result.scaler.n_features_in_ = width
+            result.scaler.fit(self._retained_matrix(self.selected_calibration))
         elif scaler_name == "none":
             result.scaler.n_features_in_ = width
         else:  # Constructor validation should make this unreachable.
             raise ValueError(f"unsupported scaler: {scaler_name}")
 
-    def _scaled_quantiles(
-        self, result: FeaturePreprocessor, quantiles: NDArray[np.float64]
-    ) -> NDArray[np.float64]:
-        assert self.selected_calibration is not None
-        raw = np.column_stack(
-            [
-                [self.selected_calibration.quantile(column, float(q)) for column in range(len(self.selected_features))]
-                for q in quantiles
-            ]
-        ).T
-        scaled = result.scaler.transform(raw).astype(np.float64)
-        return scaled.T
+    @staticmethod
+    def _retained_matrix(sketch: PriorityRowSketch) -> NDArray[np.float32]:
+        retained = sketch.retained_rows()
+        if not retained:
+            raise ValueError("calibration sketch has no retained rows")
+        return np.stack([values for _, values in retained]).astype(np.float32)
 
     def _hydrate_encoder(self, result: FeaturePreprocessor) -> None:
-        kind = result.encoder.kind
-        if kind == "none":
-            result.encoder.thresholds = None
-            return
-        if kind == "sign":
-            levels = np.asarray([0.5], dtype=np.float64)
-        elif kind == "thermometer":
-            levels = np.arange(1, result.encoder.bits + 1, dtype=np.float64) / (
-                result.encoder.bits + 1
-            )
-        elif kind == "hybrid":
-            count = 2**result.encoder.bits
-            levels = np.arange(1, count, dtype=np.float64) / count
-        else:
-            raise ValueError(f"unsupported encoder: {kind}")
-        thresholds = self._scaled_quantiles(result, levels)
-        result.encoder.thresholds = (
-            thresholds[:, 0].astype(np.float32)
-            if kind == "sign"
-            else thresholds.astype(np.float32)
-        )
+        assert self.selected_calibration is not None
+        retained = self._retained_matrix(self.selected_calibration)
+        scaled = result.scaler.transform(retained).astype(np.float32)
+        result.encoder.fit(scaled)
 
     def _hydrate_open_set(self, result: FeaturePreprocessor) -> None:
         assert self.benign_calibration is not None
         if self.benign_calibration.total_rows == 0:
             raise ValueError("open-set calibration requires benign training rows")
-        raw_center = np.asarray(
-            [
-                self.benign_calibration.quantile(column, 0.5)
-                for column in range(len(self.selected_features))
-            ],
-            dtype=np.float64,
-        )
-        center = result.scaler.transform(raw_center[None, :])[0].astype(np.float32)
-        distances: list[float] = []
-        for _, raw_row in self.benign_calibration.retained_rows():
-            scaled = result.scaler.transform(raw_row[None, :])[0]
-            distances.append(float(np.mean(np.abs(scaled - center))))
+        retained = self._retained_matrix(self.benign_calibration)
+        scaled = result.scaler.transform(retained).astype(np.float32)
+        center = np.median(scaled, axis=0).astype(np.float32)
+        distances = np.mean(np.abs(scaled - center), axis=1)
         quantile = float(
             self.config["preprocess"]["open_set"].get(
                 "benign_distance_quantile", 0.99
@@ -636,9 +690,18 @@ class StreamingFeaturePreprocessor:
             raise ValueError("benign_distance_quantile must be in [0.5, 1.0)")
         result.benign_center = center
         result.open_distance_threshold = max(
-            float(np.quantile(np.asarray(distances, dtype=np.float64), quantile)),
+            float(np.quantile(distances, quantile)),
             1e-6,
         )
+
+    @staticmethod
+    def _sketch_provenance(sketch: PriorityRowSketch) -> dict[str, Any]:
+        return {
+            "total_rows": sketch.total_rows,
+            "retained_rows": sketch.retained_count,
+            "exact": sketch.retained_count == sketch.total_rows,
+            "confidence": sketch.confidence_metadata(confidence=0.95),
+        }
 
     def finalize(self) -> FeaturePreprocessor:
         self._require_state("calibration")
@@ -669,7 +732,33 @@ class StreamingFeaturePreprocessor:
         self._hydrate_scaler(result)
         self._hydrate_encoder(result)
         self._hydrate_open_set(result)
-        confidence = self.imputation_sketch.confidence_metadata(confidence=0.95)
+        sketches = {
+            "imputation": self._sketch_provenance(self.imputation_sketch),
+            "selected": self._sketch_provenance(self.selected_calibration),
+            "benign": self._sketch_provenance(self.benign_calibration),
+        }
+        exact_fields = [
+            "train_membership_and_pass_identity",
+            "finite_missing_counts",
+            "class_counts",
+            "anova_sufficient_statistics_after_frozen_imputation",
+            "feature_costs_and_stable_ranking",
+        ]
+        approximate_fields: list[str] = []
+        quantile_fields = [
+            ("imputation_medians", "imputation"),
+            ("benign_center_and_distance_quantile", "benign"),
+        ]
+        scaler_name = str(self.config["preprocess"].get("scaler", "robust"))
+        if scaler_name == "standard":
+            exact_fields.append("standard_scaler_moments")
+        elif scaler_name == "robust":
+            quantile_fields.append(("robust_scaler_quantiles", "selected"))
+        if result.encoder.kind != "none":
+            quantile_fields.append(("encoder_quantile_thresholds", "selected"))
+        for field, sketch_name in quantile_fields:
+            target = exact_fields if sketches[sketch_name]["exact"] else approximate_fields
+            target.append(field)
         missing_seen = bool(np.any(self.imputation_sketch.missing_counts > 0))
         result.fit_provenance = {
             "fit_mode": "streaming_priority_sketch",
@@ -683,26 +772,16 @@ class StreamingFeaturePreprocessor:
             "quantile_algorithm_version": self.imputation_sketch.version,
             "quantile_capacity": self.quantile_capacity,
             "quantile_seed": self.quantile_seed,
-            "quantile_confidence": confidence,
+            "quantile_confidence": sketches["imputation"]["confidence"],
+            "benign_quantile_confidence": sketches["benign"]["confidence"],
+            "sketches": sketches,
             "retained_counts": {
                 "imputation": self.imputation_sketch.retained_count,
                 "selected": self.selected_calibration.retained_count,
                 "benign": self.benign_calibration.retained_count,
             },
-            "exact_fields": [
-                "train_membership_and_pass_identity",
-                "finite_missing_counts",
-                "class_counts",
-                "anova_sufficient_statistics_after_frozen_imputation",
-                "feature_costs_and_stable_ranking",
-                "standard_scaler_moments",
-            ],
-            "approximate_fields": [
-                "imputation_medians",
-                "robust_scaler_quantiles",
-                "encoder_quantile_thresholds",
-                "benign_center_and_distance_quantile",
-            ],
+            "exact_fields": exact_fields,
+            "approximate_fields": approximate_fields,
             "anova_imputation_semantics": (
                 "ANOVA is exact for the frozen imputed values; medians are priority-sketch "
                 "approximations when missing values are present."
