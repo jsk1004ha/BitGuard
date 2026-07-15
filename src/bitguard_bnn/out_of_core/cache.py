@@ -388,8 +388,8 @@ def _encode_identifiers(
         raise ValueError(f"{name} must be a sequence of strings")
     if len(value) != rows:
         raise ValueError(f"{name} length does not match the committed range")
-    encoded = np.zeros((rows, width), dtype=np.uint8)
-    lengths = np.zeros(rows, dtype=np.uint32)
+    encoded: np.ndarray[Any, Any] = np.zeros((rows, width), dtype=np.uint8)
+    lengths: np.ndarray[Any, Any] = np.zeros(rows, dtype=np.uint32)
     for index, item in enumerate(value):
         if not isinstance(item, str):
             raise ValueError(f"{name} must contain only strings")
