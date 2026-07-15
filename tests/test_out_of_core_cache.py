@@ -79,12 +79,22 @@ class CalibrationCacheTests(unittest.TestCase):
             "source_id": [f"source\x00{index}" for index in range(start, start + rows)],
         }
 
-    def _routing_batch(self, rows: int) -> dict[str, object]:
+    def _routing_batch(
+        self, start: int, rows: int, positions: list[int] | None = None
+    ) -> dict[str, object]:
+        ordinal: np.ndarray[tuple[int], np.dtype[np.float32]] = np.arange(
+            start, start + rows, dtype=np.float32
+        )
+        first = 0.50 + 0.05 * (ordinal % 5)
         return {
-            "routed_probabilities": np.tile(
-                np.asarray([[0.70, 0.20, 0.10]], dtype=np.float32), (rows, 1)
+            "cache_position": np.asarray(
+                positions if positions is not None else range(start, start + rows),
+                dtype=np.int64,
             ),
-            "exit_stage": np.zeros(rows, dtype=np.int16),
+            "routed_probabilities": np.column_stack(
+                (first, np.full(rows, 0.25, dtype=np.float32), 0.75 - first)
+            ).astype(np.float32),
+            "exit_stage": np.arange(start, start + rows, dtype=np.int16),
         }
 
     def _commit_full_inference(self, cache: CalibrationCache) -> None:
@@ -99,6 +109,8 @@ class CalibrationCacheTests(unittest.TestCase):
             self.assertEqual(cache.arrays["uid_digest"].shape, (5, 32))
             self.assertEqual(cache.arrays["known_probabilities"].shape, (5, 2))
             self.assertEqual(cache.arrays["routed_probabilities"].shape, (5, 3))
+            self.assertEqual(cache.arrays["routing_position"].shape, (5,))
+            self.assertEqual(cache.arrays["routing_owner"].shape, (5,))
             for name, array in cache.arrays.items():
                 self.assertEqual((cache.root / f"{name}.bin").stat().st_size, array.nbytes)
             cache.close()
@@ -134,10 +146,10 @@ class CalibrationCacheTests(unittest.TestCase):
                 self.assertEqual(cache.committed_rows, 5)
                 self.assertEqual(cache.routed_committed_rows, 0)
                 cache.commit_routing_range(
-                    0, self._routing_batch(2), routing_contract_fingerprint="routing-v1"
+                    0, self._routing_batch(0, 2), routing_contract_fingerprint="routing-v1"
                 )
                 cache.commit_routing_range(
-                    2, self._routing_batch(3), routing_contract_fingerprint="routing-v1"
+                    2, self._routing_batch(2, 3), routing_contract_fingerprint="routing-v1"
                 )
             with CalibrationCache.open_readonly(
                 root, layout, expected_routing_contract_fingerprint="routing-v1"
@@ -151,6 +163,41 @@ class CalibrationCacheTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     cache.commit_inference_range(5, self._inference_batch(5, 1))
 
+    def test_temporal_order_scatters_outputs_to_cache_positions_across_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "cache"
+            layout = self._layout()
+            with CalibrationCache.create(root, layout) as cache:
+                self._commit_full_inference(cache)
+                cache.commit_routing_range(
+                    0,
+                    self._routing_batch(0, 2, [2, 0]),
+                    routing_contract_fingerprint="routing-v1",
+                )
+            with CalibrationCache.open_resume(
+                root, layout, expected_routing_contract_fingerprint="routing-v1"
+            ) as cache:
+                cache.commit_routing_range(
+                    2,
+                    self._routing_batch(2, 3, [4, 1, 3]),
+                    routing_contract_fingerprint="routing-v1",
+                )
+            with CalibrationCache.open_readonly(
+                root, layout, expected_routing_contract_fingerprint="routing-v1"
+            ) as cache:
+                np.testing.assert_array_equal(
+                    cache.arrays["routing_position"],
+                    np.asarray([2, 0, 4, 1, 3], dtype=np.int64),
+                )
+                np.testing.assert_array_equal(
+                    cache.arrays["exit_stage"],
+                    np.asarray([1, 3, 0, 4, 2], dtype=np.int16),
+                )
+                np.testing.assert_array_equal(
+                    cache.arrays["routing_owner"],
+                    np.asarray([2, 4, 1, 5, 3], dtype=np.uint64),
+                )
+
     def test_routing_requires_complete_inference_and_matching_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "cache"
@@ -159,14 +206,14 @@ class CalibrationCacheTests(unittest.TestCase):
                 cache.commit_inference_range(0, self._inference_batch(0, 2))
                 with self.assertRaisesRegex(ValueError, "complete inference"):
                     cache.commit_routing_range(
-                        0, self._routing_batch(2), routing_contract_fingerprint="routing-v1"
+                        0, self._routing_batch(0, 2), routing_contract_fingerprint="routing-v1"
                     )
                 cache.commit_inference_range(2, self._inference_batch(2, 3))
                 with self.assertRaisesRegex(ValueError, "non-empty"):
                     cache.commit_routing_range(
-                        0, self._routing_batch(2), routing_contract_fingerprint=""
+                        0, self._routing_batch(0, 2), routing_contract_fingerprint=""
                     )
-                invalid_routing = self._routing_batch(2)
+                invalid_routing = self._routing_batch(0, 2)
                 invalid_routing["routed_probabilities"] = np.asarray(
                     [[0.9, 0.2, -0.1], [0.7, 0.2, 0.1]], dtype=np.float32
                 )
@@ -176,12 +223,20 @@ class CalibrationCacheTests(unittest.TestCase):
                         invalid_routing,
                         routing_contract_fingerprint="routing-v1",
                     )
+                for positions in ([1, 1], [0, 5]):
+                    with self.subTest(positions=positions):
+                        with self.assertRaises(ValueError):
+                            cache.commit_routing_range(
+                                0,
+                                self._routing_batch(0, 2, positions),
+                                routing_contract_fingerprint="routing-v1",
+                            )
                 cache.commit_routing_range(
-                    0, self._routing_batch(2), routing_contract_fingerprint="routing-v1"
+                    0, self._routing_batch(0, 2), routing_contract_fingerprint="routing-v1"
                 )
                 with self.assertRaisesRegex(ValueError, "routing contract"):
                     cache.commit_routing_range(
-                        2, self._routing_batch(3), routing_contract_fingerprint="routing-v2"
+                        2, self._routing_batch(2, 3), routing_contract_fingerprint="routing-v2"
                     )
             with self.assertRaisesRegex(RuntimeError, "routing contract"):
                 CalibrationCache.open_resume(
@@ -227,7 +282,7 @@ class CalibrationCacheTests(unittest.TestCase):
             with mock.patch.object(cache_module, "_write_journal", side_effect=OSError("before")):
                 with self.assertRaisesRegex(OSError, "before"):
                     cache.commit_routing_range(
-                        0, self._routing_batch(2), routing_contract_fingerprint="routing-v1"
+                        0, self._routing_batch(0, 2), routing_contract_fingerprint="routing-v1"
                     )
             with self.assertRaisesRegex(RuntimeError, "unusable"):
                 _ = cache.routed_committed_rows
@@ -235,6 +290,12 @@ class CalibrationCacheTests(unittest.TestCase):
                 self.assertEqual(resumed.committed_rows, 5)
                 self.assertEqual(resumed.routed_committed_rows, 0)
                 self.assertIsNone(resumed.routing_contract_fingerprint)
+                resumed.commit_routing_range(
+                    0,
+                    self._routing_batch(0, 2, [4, 3]),
+                    routing_contract_fingerprint="routing-v1",
+                )
+                self.assertEqual(resumed.routed_committed_rows, 2)
 
     def test_routing_journal_failure_after_replace_reopens_new_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -245,7 +306,7 @@ class CalibrationCacheTests(unittest.TestCase):
             with mock.patch.object(cache_module, "_fsync_directory", side_effect=OSError("after")):
                 with self.assertRaisesRegex(OSError, "after"):
                     cache.commit_routing_range(
-                        0, self._routing_batch(2), routing_contract_fingerprint="routing-v1"
+                        0, self._routing_batch(0, 2), routing_contract_fingerprint="routing-v1"
                     )
             with self.assertRaisesRegex(RuntimeError, "unusable"):
                 _ = cache.arrays
@@ -255,7 +316,7 @@ class CalibrationCacheTests(unittest.TestCase):
                 self.assertEqual(resumed.routed_committed_rows, 2)
                 np.testing.assert_allclose(
                     resumed.arrays["routed_probabilities"][:2],
-                    self._routing_batch(2)["routed_probabilities"],
+                    self._routing_batch(0, 2)["routed_probabilities"],
                 )
 
     def test_mismatch_tamper_and_truncation_fail_closed(self) -> None:
@@ -269,6 +330,34 @@ class CalibrationCacheTests(unittest.TestCase):
                 handle.write(b"\xff")
             with self.assertRaisesRegex(RuntimeError, "committed range fingerprint"):
                 CalibrationCache.open_readonly(root, layout)
+
+    def test_routing_position_owner_and_scattered_value_tamper_fail_closed(self) -> None:
+        for filename in (
+            "routing_position.bin",
+            "routing_owner.bin",
+            "routed_probabilities.bin",
+        ):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "cache"
+                layout = self._layout()
+                with CalibrationCache.create(root, layout) as cache:
+                    self._commit_full_inference(cache)
+                    cache.commit_routing_range(
+                        0,
+                        self._routing_batch(0, 2, [2, 0]),
+                        routing_contract_fingerprint="routing-v1",
+                    )
+                path = root / filename
+                with path.open("r+b") as handle:
+                    original = handle.read(1)
+                    handle.seek(0)
+                    handle.write(bytes([original[0] ^ 0xFF]))
+                with self.assertRaises(RuntimeError):
+                    CalibrationCache.open_readonly(
+                        root,
+                        layout,
+                        expected_routing_contract_fingerprint="routing-v1",
+                    )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "cache"
             layout = self._layout()

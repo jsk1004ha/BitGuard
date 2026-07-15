@@ -20,13 +20,14 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
-CACHE_ALGORITHM = "bitguard.calibration-cache.v2"
-_LAYOUT_SCHEMA = "bitguard.calibration-cache-layout.v2"
+CACHE_ALGORITHM = "bitguard.calibration-cache.v3"
+_LAYOUT_SCHEMA = "bitguard.calibration-cache-layout.v3"
 _INFERENCE_JOURNAL_SCHEMA = "bitguard.calibration-cache-inference-journal.v1"
-_ROUTING_JOURNAL_SCHEMA = "bitguard.calibration-cache-routing-journal.v1"
+_ROUTING_JOURNAL_SCHEMA = "bitguard.calibration-cache-routing-journal.v2"
 _LAYOUT_FILE = "layout.json"
 _INFERENCE_JOURNAL_FILE = "inference_journal.json"
 _ROUTING_JOURNAL_FILE = "routing_journal.json"
+_ROUTING_CHUNK_ROWS = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +186,8 @@ def _inference_array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
 
 def _routing_array_specs(layout: CacheLayout) -> dict[str, _ArraySpec]:
     return {
+        "routing_position": _ArraySpec("<i8", (layout.row_count,)),
+        "routing_owner": _ArraySpec("<u8", (layout.row_count,)),
         "routed_probabilities": _ArraySpec(
             "<f4", (layout.row_count, len(layout.routed_class_labels))
         ),
@@ -355,7 +358,13 @@ class CalibrationCache:
             _verify_committed_ranges(
                 root, _inference_array_specs(stored), inference_commits
             )
-            _verify_committed_ranges(root, _routing_array_specs(stored), routing_commits)
+            _verify_routing_committed_ranges(
+                arrays, routing_commits, stored.row_count
+            )
+            if not readonly:
+                _clear_stale_routing_owners(
+                    root, arrays, routed_committed_rows, stored.row_count
+                )
         except BaseException:
             _close_memmaps(arrays.values())
             raise
@@ -451,21 +460,31 @@ class CalibrationCache:
         end = start + rows
         if end > self.layout.row_count:
             raise ValueError("routing commit exceeds the declared row count")
-        specs = _routing_array_specs(self.layout)
-        self._write_phase_range(start, end, prepared, specs)
-        commit = {
-            "start": start,
-            "end": end,
-            "sha256": _range_digest(self.root, specs, start, end),
-        }
-        commits = [*self._routing_commits, commit]
-        journal = _routing_journal_payload(
-            self.layout.fingerprint,
-            routing_contract_fingerprint,
-            end,
-            commits,
-        )
-        self._publish_journal(_ROUTING_JOURNAL_FILE, journal)
+        positions = prepared.pop("cache_position")
+        self._claim_routing_positions(start, positions)
+        try:
+            self._scatter_routing_values(positions, prepared)
+            specs = _routing_array_specs(self.layout)
+            self._flush_phase(specs)
+            commit = {
+                "start": start,
+                "end": end,
+                "sha256": _routing_range_digest(
+                    self._arrays, start, end, self.layout.row_count
+                ),
+            }
+            commits = [*self._routing_commits, commit]
+            journal = _routing_journal_payload(
+                self.layout.fingerprint,
+                routing_contract_fingerprint,
+                end,
+                commits,
+            )
+            self._publish_journal(_ROUTING_JOURNAL_FILE, journal)
+        except BaseException:
+            if not self._poisoned:
+                self._poison()
+            raise
         self._routing_commits = commits
         self._routed_committed_rows = end
         self._routing_contract_fingerprint = routing_contract_fingerprint
@@ -484,11 +503,61 @@ class CalibrationCache:
     ) -> None:
         for name, array in prepared.items():
             self._arrays[name][start:end] = array
+        self._flush_phase(specs)
+
+    def _flush_phase(self, specs: Mapping[str, _ArraySpec]) -> None:
         for name in specs:
             array = self._arrays[name]
             if isinstance(array, np.memmap):
                 array.flush()
             _fsync_file(self.root / f"{name}.bin")
+
+    def _claim_routing_positions(
+        self, start: int, positions: np.ndarray[Any, Any]
+    ) -> None:
+        owner = self._arrays["routing_owner"]
+        sequence = self._arrays["routing_position"]
+        claimed_end = start
+        try:
+            for offset in range(0, len(positions), _ROUTING_CHUNK_ROWS):
+                chunk = positions[offset : offset + _ROUTING_CHUNK_ROWS]
+                if len(np.unique(chunk)) != len(chunk):
+                    raise ValueError("routing cache_position contains duplicates")
+                if np.any(owner[chunk] != 0):
+                    raise ValueError("routing cache_position is already owned")
+                ordinal_start = start + offset
+                ordinal_end = ordinal_start + len(chunk)
+                sequence[ordinal_start:ordinal_end] = chunk
+                owner[chunk] = np.arange(
+                    ordinal_start + 1, ordinal_end + 1, dtype=np.uint64
+                )
+                claimed_end = ordinal_end
+        except ValueError:
+            try:
+                _clear_routing_owner_range(self._arrays, start, claimed_end)
+            except BaseException:
+                self._poison()
+            raise
+        except BaseException:
+            try:
+                _clear_routing_owner_range(self._arrays, start, claimed_end)
+            except BaseException:
+                pass
+            self._poison()
+            raise
+
+    def _scatter_routing_values(
+        self,
+        positions: np.ndarray[Any, Any],
+        prepared: Mapping[str, np.ndarray[Any, Any]],
+    ) -> None:
+        for offset in range(0, len(positions), _ROUTING_CHUNK_ROWS):
+            chunk = positions[offset : offset + _ROUTING_CHUNK_ROWS]
+            end = offset + len(chunk)
+            self._arrays["routed_probabilities"][chunk] = prepared[
+                "routed_probabilities"
+            ][offset:end]
+            self._arrays["exit_stage"][chunk] = prepared["exit_stage"][offset:end]
 
     def _publish_journal(self, filename: str, journal: Mapping[str, Any]) -> None:
         try:
@@ -712,6 +781,7 @@ def _prepare_routing_batch(
     layout: CacheLayout, values: Mapping[str, object]
 ) -> tuple[dict[str, np.ndarray[Any, Any]], int]:
     if not isinstance(values, Mapping) or set(values) != {
+        "cache_position",
         "routed_probabilities",
         "exit_stage",
     }:
@@ -723,6 +793,9 @@ def _prepare_routing_batch(
     if rows <= 0:
         raise ValueError("routing commit range must not be empty")
     prepared = {
+        "cache_position": _require_array(
+            values, "cache_position", np.dtype("<i8"), (rows,)
+        ),
         "routed_probabilities": _require_array(
             values,
             "routed_probabilities",
@@ -731,6 +804,9 @@ def _prepare_routing_batch(
         ),
         "exit_stage": _require_array(values, "exit_stage", np.dtype("<i2"), (rows,)),
     }
+    positions = prepared["cache_position"]
+    if np.any(positions < 0) or np.any(positions >= layout.row_count):
+        raise ValueError("routing cache_position is outside the cache row range")
     _validate_probability_rows(
         prepared["routed_probabilities"], "routed_probabilities"
     )
@@ -981,6 +1057,84 @@ def _verify_committed_ranges(
             "sha256"
         ]:
             raise RuntimeError("calibration cache committed range fingerprint mismatch")
+
+
+def _routing_range_digest(
+    arrays: Mapping[str, np.ndarray[Any, Any]],
+    start: int,
+    end: int,
+    row_count: int,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"bitguard.routing-scatter.v1\x00")
+    for ordinal_start in range(start, end, _ROUTING_CHUNK_ROWS):
+        ordinal_end = min(ordinal_start + _ROUTING_CHUNK_ROWS, end)
+        positions = np.asarray(
+            arrays["routing_position"][ordinal_start:ordinal_end], dtype=np.int64
+        )
+        if np.any(positions < 0) or np.any(positions >= row_count):
+            raise RuntimeError("calibration cache routing position is out of range")
+        owners = np.asarray(arrays["routing_owner"][positions], dtype=np.uint64)
+        expected: np.ndarray[Any, Any] = np.arange(
+            ordinal_start + 1, ordinal_end + 1, dtype=np.uint64
+        )
+        if not np.array_equal(owners, expected):
+            raise RuntimeError("calibration cache routing owner mismatch")
+        probabilities = np.ascontiguousarray(
+            arrays["routed_probabilities"][positions]
+        )
+        stages = np.ascontiguousarray(arrays["exit_stage"][positions])
+        digest.update(positions.tobytes(order="C"))
+        digest.update(owners.tobytes(order="C"))
+        digest.update(probabilities.tobytes(order="C"))
+        digest.update(stages.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _verify_routing_committed_ranges(
+    arrays: Mapping[str, np.ndarray[Any, Any]],
+    commits: Sequence[Mapping[str, Any]],
+    row_count: int,
+) -> None:
+    for item in commits:
+        if _routing_range_digest(
+            arrays, int(item["start"]), int(item["end"]), row_count
+        ) != item["sha256"]:
+            raise RuntimeError("calibration cache committed routing fingerprint mismatch")
+
+
+def _clear_routing_owner_range(
+    arrays: Mapping[str, np.ndarray[Any, Any]], start: int, end: int
+) -> None:
+    for ordinal_start in range(start, end, _ROUTING_CHUNK_ROWS):
+        ordinal_end = min(ordinal_start + _ROUTING_CHUNK_ROWS, end)
+        positions = np.asarray(
+            arrays["routing_position"][ordinal_start:ordinal_end], dtype=np.int64
+        )
+        arrays["routing_owner"][positions] = 0
+    owner = arrays["routing_owner"]
+    if isinstance(owner, np.memmap):
+        owner.flush()
+
+
+def _clear_stale_routing_owners(
+    root: Path,
+    arrays: Mapping[str, np.ndarray[Any, Any]],
+    routed_committed_rows: int,
+    row_count: int,
+) -> None:
+    owner = arrays["routing_owner"]
+    changed = False
+    for offset in range(0, row_count, _ROUTING_CHUNK_ROWS):
+        values = owner[offset : offset + _ROUTING_CHUNK_ROWS]
+        stale = values > routed_committed_rows
+        if np.any(stale):
+            values[stale] = 0
+            changed = True
+    if changed:
+        if isinstance(owner, np.memmap):
+            owner.flush()
+        _fsync_file(root / "routing_owner.bin")
 
 
 def _close_memmaps(arrays: Sequence[np.memmap[Any, Any]] | Any) -> None:
