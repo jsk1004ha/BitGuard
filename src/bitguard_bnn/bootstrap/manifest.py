@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from .fsops import RetirementError, retire_owned_path
 from .registry import load_registry
 from .types import DatasetSpec
 
@@ -675,28 +676,18 @@ def _lstat_manifest_file(path: Path, *, subject: str) -> os.stat_result:
     return value
 
 
-def _unlink_owned_manifest_path(
+def _retire_owned_manifest_path(
     path: Path,
     expected_identity: tuple[int, int, int],
 ) -> None:
     try:
-        current = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise SourceManifestError(
-            f"Cannot inspect private manifest path {path}: {error}."
-        ) from error
-    if _inode_identity(current) != expected_identity:
-        raise SourceManifestError(
-            f"Private manifest path {path} changed identity and was preserved."
+        retire_owned_path(
+            path,
+            expected_identity,
+            purpose="private source manifest cleanup",
         )
-    try:
-        path.unlink()
-    except OSError as error:
-        raise SourceManifestError(
-            f"Cannot remove private manifest path {path}: {error}."
-        ) from error
+    except RetirementError as error:
+        raise SourceManifestError(str(error)) from error
 
 
 def _create_temporary(path: Path) -> tuple[Path, int]:
@@ -746,7 +737,7 @@ def _pin_manifest_temporary(
             descriptor_identity = _inode_identity(os.fstat(descriptor))
         except (OSError, SourceManifestError):
             if pin_identity == expected_identity:
-                _unlink_owned_manifest_path(pin, expected_identity)
+                _retire_owned_manifest_path(pin, expected_identity)
             raise
         if (
             pin_identity != expected_identity
@@ -754,7 +745,7 @@ def _pin_manifest_temporary(
             or descriptor_identity != expected_identity
         ):
             if pin_identity == expected_identity:
-                _unlink_owned_manifest_path(pin, expected_identity)
+                _retire_owned_manifest_path(pin, expected_identity)
             raise SourceManifestError(
                 f"Manifest temporary {temporary} changed identity while creating its pin."
             )
@@ -833,7 +824,7 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
 
         assert temporary_identity is not None
         assert pin is not None
-        _unlink_owned_manifest_path(temporary, temporary_identity)
+        _retire_owned_manifest_path(temporary, temporary_identity)
         prepared = True
     finally:
         if not prepared:
@@ -841,7 +832,7 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
                 if candidate is None or temporary_identity is None:
                     continue
                 try:
-                    _unlink_owned_manifest_path(candidate, temporary_identity)
+                    _retire_owned_manifest_path(candidate, temporary_identity)
                 except Exception:
                     pass
 
@@ -855,7 +846,7 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
             existing = _existing_manifest_bytes(target)
         finally:
             try:
-                _unlink_owned_manifest_path(pin, temporary_identity)
+                _retire_owned_manifest_path(pin, temporary_identity)
             except SourceManifestError:
                 pass
         if existing == payload:
@@ -866,7 +857,7 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
         ) from error
     except OSError as error:
         try:
-            _unlink_owned_manifest_path(pin, temporary_identity)
+            _retire_owned_manifest_path(pin, temporary_identity)
         except SourceManifestError:
             pass
         raise SourceManifestError(
@@ -877,14 +868,14 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
         final_stat = _lstat_manifest_file(target, subject="published source manifest")
     except SourceManifestError:
         try:
-            _unlink_owned_manifest_path(pin, temporary_identity)
+            _retire_owned_manifest_path(pin, temporary_identity)
         except SourceManifestError:
             pass
         raise
     final_identity = _inode_identity(final_stat)
     if final_identity != temporary_identity:
         try:
-            _unlink_owned_manifest_path(pin, temporary_identity)
+            _retire_owned_manifest_path(pin, temporary_identity)
         except SourceManifestError:
             pass
         raise SourceManifestError(
@@ -894,7 +885,7 @@ def write_source_manifest(path: Path | str, manifest: SourceManifest) -> bool:
 
     try:
         _fsync_parent_directory(target)
-        _unlink_owned_manifest_path(pin, temporary_identity)
+        _retire_owned_manifest_path(pin, temporary_identity)
         _fsync_parent_directory(target)
     except (OSError, SourceManifestError) as error:
         raise SourceManifestError(

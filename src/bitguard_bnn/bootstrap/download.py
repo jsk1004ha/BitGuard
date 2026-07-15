@@ -15,6 +15,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+from .fsops import RetirementError, retire_owned_path
+
 
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -351,21 +353,21 @@ def _stream_response(
     return _StreamResult(received=received, identity=opened_identity)
 
 
-def _unlink_private_candidate(candidate: Path, expected: tuple[int, int]) -> None:
+def _retire_private_candidate(
+    candidate: Path,
+    expected: tuple[int, int],
+    *,
+    reclaim_storage: bool = False,
+) -> None:
     try:
-        current = candidate.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise DownloadError(f"Cannot inspect private publish link {candidate}: {error}.") from error
-    if _file_identity(current) != expected:
-        raise DownloadError(
-            f"Private publish link {candidate} changed identity and was preserved."
+        retire_owned_path(
+            candidate,
+            expected,
+            purpose="private download cleanup",
+            reclaim_storage=reclaim_storage,
         )
-    try:
-        candidate.unlink()
-    except OSError as error:
-        raise DownloadError(f"Cannot remove private publish link {candidate}: {error}.") from error
+    except RetirementError as error:
+        raise DownloadError(str(error)) from error
 
 
 def _create_private_snapshot(partial: Path) -> tuple[Path, int]:
@@ -425,7 +427,7 @@ def _pin_private_snapshot(
             private_identity = _file_identity(private_stat)
         except DownloadError:
             if pin_identity == expected_identity:
-                _unlink_private_candidate(pin, expected_identity)
+                _retire_private_candidate(pin, expected_identity)
             raise
         if (
             pin_identity != expected_identity
@@ -433,7 +435,7 @@ def _pin_private_snapshot(
             or private_identity != expected_identity
         ):
             if pin_identity == expected_identity:
-                _unlink_private_candidate(pin, expected_identity)
+                _retire_private_candidate(pin, expected_identity)
             raise DownloadError(
                 f"Private verified snapshot {private} changed identity while it was pinned."
             )
@@ -533,7 +535,7 @@ def _snapshot_partial(
         assert private is not None
         assert private_identity is not None
         assert pin is not None
-        _unlink_private_candidate(private, private_identity)
+        _retire_private_candidate(private, private_identity)
         success = True
         return _VerifiedSnapshot(
             pin=pin,
@@ -551,7 +553,7 @@ def _snapshot_partial(
                 if candidate is None or identity is None:
                     continue
                 try:
-                    _unlink_private_candidate(candidate, identity)
+                    _retire_private_candidate(candidate, identity)
                 except Exception:
                     pass
 
@@ -570,13 +572,13 @@ def _publish_snapshot(
     try:
         os.link(snapshot.pin, destination)
     except FileExistsError as error:
-        _unlink_private_candidate(snapshot.pin, snapshot.identity)
+        _retire_private_candidate(snapshot.pin, snapshot.identity)
         raise DownloadError(
             f"Download destination {destination} already exists, possibly from a concurrent "
             f"publisher; the verified partial remains at {partial}."
         ) from error
     except OSError as error:
-        _unlink_private_candidate(snapshot.pin, snapshot.identity)
+        _retire_private_candidate(snapshot.pin, snapshot.identity)
         raise DownloadError(
             f"Cannot atomically publish verified snapshot of {partial} without overwriting "
             f"{destination}: {error}."
@@ -599,9 +601,12 @@ def _publish_snapshot(
         ) from error
 
     try:
-        _unlink_private_candidate(snapshot.pin, snapshot.identity)
-        _require_path_identity(partial, snapshot.source_identity, subject="Owned partial")
-        partial.unlink()
+        _retire_private_candidate(snapshot.pin, snapshot.identity)
+        _retire_private_candidate(
+            partial,
+            snapshot.source_identity,
+            reclaim_storage=True,
+        )
         _fsync_parent_directory(destination)
     except DownloadError:
         raise
@@ -800,7 +805,7 @@ def download_file(
     finally:
         if not published:
             try:
-                _unlink_private_candidate(snapshot.pin, snapshot.identity)
+                _retire_private_candidate(snapshot.pin, snapshot.identity)
             except Exception:
                 pass
     return DownloadResult(

@@ -17,6 +17,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from bitguard_bnn.bootstrap import download as download_module
+from bitguard_bnn.bootstrap import fsops as fsops_module
 from bitguard_bnn.bootstrap import manifest as manifest_module
 from bitguard_bnn.bootstrap.download import DownloadError, download_file, sanitize_url
 from bitguard_bnn.bootstrap.manifest import (
@@ -717,6 +718,49 @@ class DownloadFileTest(unittest.TestCase):
         self.assertEqual(self.partial.read_bytes(), PAYLOAD)
         self.assertFalse(self.destination.exists())
 
+    def test_partial_replacement_during_retirement_is_restored_and_never_deleted(
+        self,
+    ) -> None:
+        foreign_bytes = b"foreign partial replacement must survive retirement"
+        foreign = self.root / "foreign-partial"
+        displaced = self.root / "owned-complete-partial"
+        foreign.write_bytes(foreign_bytes)
+        real_rename = fsops_module._rename_noreplace
+        substituted = False
+
+        def substitute_before_retirement(
+            source: object,
+            target: object,
+            directory_descriptor: int | None,
+        ) -> None:
+            nonlocal substituted
+            if Path(source) == self.partial and not substituted:
+                substituted = True
+                self.partial.replace(displaced)
+                foreign.replace(self.partial)
+            real_rename(Path(source), Path(target), directory_descriptor)
+
+        with _RangeServer() as server:
+            with patch.object(
+                fsops_module,
+                "_rename_noreplace",
+                side_effect=substitute_before_retirement,
+            ):
+                with self.assertRaisesRegex(
+                    DownloadError,
+                    "foreign|recovery|restored|retire",
+                ):
+                    download_file(server.url, self.destination)
+
+        self.assertTrue(substituted)
+        self.assertEqual(self.destination.read_bytes(), PAYLOAD)
+        self.assertEqual(displaced.read_bytes(), PAYLOAD)
+        self.assertEqual(self.partial.read_bytes(), foreign_bytes)
+        recovery_files = list(self.root.glob(".bitguard-retired-*/artifact"))
+        self.assertTrue(
+            any(path.read_bytes() == foreign_bytes for path in recovery_files)
+        )
+
     def test_valid_416_complete_partial_publishes_and_incomplete_retries_once(self) -> None:
         self.partial.write_bytes(PAYLOAD)
         with _RangeServer(mode="range-416") as server:
@@ -1289,6 +1333,50 @@ class SourceManifestTest(unittest.TestCase):
         self.assertTrue(substituted)
         self.assertEqual(path.read_bytes(), attacker)
         self.assertEqual(displaced.read_bytes(), manifest_json_bytes(manifest))
+
+    def test_manifest_temp_replacement_during_retirement_is_never_deleted(self) -> None:
+        manifest = self.official_manifest()
+        path = self.root.parent / "source-manifest.json"
+        foreign_bytes = b'{"foreign-retirement":true}\n'
+        foreign = self.root.parent / "foreign-retirement-manifest"
+        displaced = self.root.parent / "owned-retired-manifest"
+        foreign.write_bytes(foreign_bytes)
+        real_rename = fsops_module._rename_noreplace
+        substituted_path: Path | None = None
+
+        def substitute_before_retirement(
+            source: object,
+            target: object,
+            directory_descriptor: int | None,
+        ) -> None:
+            nonlocal substituted_path
+            source_path = Path(source)
+            if source_path.name.endswith(".tmp") and substituted_path is None:
+                substituted_path = source_path
+                source_path.replace(displaced)
+                foreign.replace(source_path)
+            real_rename(Path(source), Path(target), directory_descriptor)
+
+        with patch.object(
+            fsops_module,
+            "_rename_noreplace",
+            side_effect=substitute_before_retirement,
+        ):
+            with self.assertRaisesRegex(
+                SourceManifestError,
+                "foreign|recovery|restored|retire",
+            ):
+                write_source_manifest(path, manifest)
+
+        self.assertIsNotNone(substituted_path)
+        assert substituted_path is not None
+        self.assertEqual(substituted_path.read_bytes(), foreign_bytes)
+        self.assertEqual(displaced.read_bytes(), manifest_json_bytes(manifest))
+        self.assertFalse(path.exists())
+        recovery_files = list(path.parent.glob(".bitguard-retired-*/artifact"))
+        self.assertTrue(
+            any(candidate.read_bytes() == foreign_bytes for candidate in recovery_files)
+        )
 
     def test_foreign_manifest_replacement_after_link_is_preserved(self) -> None:
         manifest = self.official_manifest()
