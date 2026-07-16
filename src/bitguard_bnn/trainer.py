@@ -93,8 +93,12 @@ def _process_resource_summary(artifact: Path) -> dict[str, Any]:
     try:
         import resource
 
-        maximum_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-        rss_bytes: int | None = maximum_rss if sys.platform == "darwin" else maximum_rss * 1024
+        getrusage = getattr(resource, "getrusage")
+        rusage_self = getattr(resource, "RUSAGE_SELF")
+        maximum_rss = int(getrusage(rusage_self).ru_maxrss)
+        rss_bytes: int | None = (
+            maximum_rss if sys.platform == "darwin" else maximum_rss * 1024
+        )
     except ImportError:
         rss_bytes = None
     return {
@@ -146,9 +150,7 @@ def _safe_torch_load(path: Path, device: Any) -> dict[str, Any]:
     import torch
 
     version = str(getattr(torch, "__version__", ""))
-    match = re.fullmatch(
-        r"\s*(\d+)\.(\d+)(?:\.\d+)?(?:[A-Za-z0-9_.+-]*)\s*", version
-    )
+    match = re.fullmatch(r"\s*(\d+)\.(\d+)(?:\.\d+)?(?:[A-Za-z0-9_.+-]*)\s*", version)
     if match is None:
         raise RuntimeError(
             "unable to verify a safe PyTorch version before checkpoint loading"
@@ -310,7 +312,9 @@ def _validate_training_rng(
                     value.detach().cpu()
                 )
         except RuntimeError as error:
-            raise ValueError("training checkpoint CUDA RNG states are invalid") from error
+            raise ValueError(
+                "training checkpoint CUDA RNG states are invalid"
+            ) from error
     return _validated_numpy_rng_state(torch_module, state)
 
 
@@ -326,7 +330,9 @@ def _model_state_fingerprint(model: Any | None) -> str | None:
         digest.update(b"\0")
         digest.update(str(tensor.dtype).encode("ascii"))
         digest.update(b"\0")
-        digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(
+            json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii")
+        )
         digest.update(b"\0")
         digest.update(bytes(tensor.untyped_storage()))
     return digest.hexdigest()
@@ -584,8 +590,7 @@ def _validated_array_training_state(
         if float(record["learning_rate"]) < 0.0:
             raise ValueError("training checkpoint learning rate is invalid")
         if any(
-            not 0.0 <= float(record[name]) <= 1.0
-            for name in _NEURAL_VALIDATION_FIELDS
+            not 0.0 <= float(record[name]) <= 1.0 for name in _NEURAL_VALIDATION_FIELDS
         ):
             raise ValueError("training checkpoint validation metric is out of range")
         records.append(record)
@@ -633,7 +638,9 @@ def _validated_array_training_state(
     try:
         torch_module.Generator(device="cpu").set_state(generator_state.detach().cpu())
     except RuntimeError as error:
-        raise ValueError("training checkpoint data generator state is invalid") from error
+        raise ValueError(
+            "training checkpoint data generator state is invalid"
+        ) from error
     _validate_training_rng(torch_module, state, device_type)
 
     reference = model.state_dict()
@@ -689,7 +696,9 @@ def _fit_neural(
         weight_decay=float(training_cfg["weight_decay"]),
     )
     epochs = int(training_cfg["epochs"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(epochs, 1)
+    )
     batch_size = min(int(training_cfg["batch_size"]), len(x_train))
     seed = int(config["experiment"]["seed"])
     generator = torch.Generator().manual_seed(seed)
@@ -729,7 +738,9 @@ def _fit_neural(
     )
     if resume_from is not None:
         if not resume_from.exists():
-            raise FileNotFoundError(f"training resume checkpoint not found: {resume_from}")
+            raise FileNotFoundError(
+                f"training resume checkpoint not found: {resume_from}"
+            )
         state = _safe_torch_load(resume_from, device)
         required = {
             "format_version",
@@ -770,7 +781,9 @@ def _fit_neural(
                 "run with its original total epoch count"
             )
         if state["device_type"] != device.type:
-            raise ValueError("training resume checkpoint device type does not match this run")
+            raise ValueError(
+                "training resume checkpoint device type does not match this run"
+            )
         if state["training_signature"] != training_signature:
             raise ValueError(
                 "training resume checkpoint does not match the current model, data split, "
@@ -793,7 +806,9 @@ def _fit_neural(
         try:
             model.load_state_dict(state["model_state_dict"])
         except RuntimeError as error:
-            raise ValueError("training resume checkpoint does not match the model") from error
+            raise ValueError(
+                "training resume checkpoint does not match the model"
+            ) from error
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])
         scaler.load_state_dict(state["scaler_state_dict"])
@@ -801,7 +816,9 @@ def _fit_neural(
         _restore_training_rng(torch, state)
         start_epoch = completed_epoch + 1
     checkpoint_interval = max(int(training_cfg.get("checkpoint_every_epochs", 1)), 1)
-    run_end_epoch = epochs if stop_after_epoch is None else min(int(stop_after_epoch), epochs)
+    run_end_epoch = (
+        epochs if stop_after_epoch is None else min(int(stop_after_epoch), epochs)
+    )
     if run_end_epoch < start_epoch - 1:
         raise ValueError("stop_after_epoch precedes the resume checkpoint epoch")
     should_stop = bool(records) and stale >= patience
@@ -811,8 +828,7 @@ def _fit_neural(
                 break
             model.train()
             totals = {
-                name: 0.0
-                for name in ("loss", "detection", "feature_cost", "fn", "fp")
+                name: 0.0 for name in ("loss", "detection", "feature_cost", "fn", "fp")
             }
             seen = 0
             for features, target in loader:
@@ -846,10 +862,7 @@ def _fit_neural(
                 **validation_metrics,
             }
             record.update(
-                {
-                    f"train_{key}": value / max(seen, 1)
-                    for key, value in totals.items()
-                }
+                {f"train_{key}": value / max(seen, 1) for key, value in totals.items()}
             )
             records.append(record)
             should_stop = False
@@ -933,9 +946,7 @@ def _make_grad_scaler(torch_module: Any, device_type: str, enabled: bool) -> Any
 def _restore_training_rng(torch_module: Any, state: dict[str, Any]) -> None:
     import random
 
-    numpy_state = _validate_training_rng(
-        torch_module, state, str(state["device_type"])
-    )
+    numpy_state = _validate_training_rng(torch_module, state, str(state["device_type"]))
     random.setstate(state["python_rng_state"])
     np.random.set_state(numpy_state)
     torch_module.set_rng_state(state["torch_rng_state"].cpu())
@@ -1002,9 +1013,7 @@ def _save_training_state(
     )
 
 
-def _save_training_progress(
-    path: Path, records: list[dict[str, float | int]]
-) -> None:
+def _save_training_progress(path: Path, records: list[dict[str, float | int]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     pd.DataFrame(records).to_csv(temporary, index=False)
@@ -1049,7 +1058,9 @@ def _build_neural(
         all_groups = preprocessor.input_groups[input_indices]
         unique = sorted(set(int(item) for item in all_groups))
         remap = {old: new for new, old in enumerate(unique)}
-        input_groups = np.asarray([remap[int(item)] for item in all_groups], dtype=np.int64)
+        input_groups = np.asarray(
+            [remap[int(item)] for item in all_groups], dtype=np.int64
+        )
         input_dim = len(input_indices)
         assert preprocessor.feature_costs is not None
         costs = preprocessor.feature_costs[unique]
@@ -1077,21 +1088,37 @@ def _checkpoint(
     import torch
 
     state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
-    torch.save(
+    groups = (
+        preprocessor.input_groups
+        if input_indices is None
+        else preprocessor.input_groups[input_indices]
+    )
+    costs = preprocessor.feature_costs
+    _atomic_torch_save(
+        path,
         {
             "state_dict": state,
             "model_type": config["model"]["type"],
-            "input_dim": len(input_indices) if input_indices is not None else preprocessor.encoded_dimension,
+            "input_dim": (
+                len(input_indices)
+                if input_indices is not None
+                else preprocessor.encoded_dimension
+            ),
             "output_dim": len(output_labels),
             "output_labels": output_labels,
             "hidden_dims": list(hidden_dims),
             "dropout": float(config["model"].get("dropout", 0.0)),
             "binary_first_layer": bool(config["model"].get("binary_first_layer", True)),
-            "input_indices": input_indices,
-            "input_groups": preprocessor.input_groups if input_indices is None else preprocessor.input_groups[input_indices],
-            "feature_costs": preprocessor.feature_costs,
+            "input_indices": (
+                None
+                if input_indices is None
+                else torch.as_tensor(input_indices, dtype=torch.int64)
+            ),
+            "input_groups": torch.as_tensor(groups, dtype=torch.int64),
+            "feature_costs": (
+                None if costs is None else torch.as_tensor(costs, dtype=torch.float32)
+            ),
         },
-        path,
     )
 
 
@@ -1122,7 +1149,9 @@ def _fit_classical(
         model.fit(x_train, y_train)
         return model
     if model_type == "hist_gradient_boosting":
-        model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.08, random_state=seed)
+        model = HistGradientBoostingClassifier(
+            max_iter=300, learning_rate=0.08, random_state=seed
+        )
         weights = class_weights(y_train, int(y_train.max()) + 1)[y_train]
         model.fit(x_train, y_train, sample_weight=weights)
         return model
@@ -1158,7 +1187,9 @@ def _to_full_probabilities(
     labels, _, active_plus_unknown = preprocessor.apply_open_set(
         known_probabilities, unencoded_values
     )
-    full = np.zeros((len(known_probabilities), len(CANONICAL_LABELS)), dtype=np.float32)
+    full: np.ndarray = np.zeros(
+        (len(known_probabilities), len(CANONICAL_LABELS)), dtype=np.float32
+    )
     for index, label in enumerate([*preprocessor.active_labels, "unknown_like"]):
         full[:, CANONICAL_LABELS.index(label)] = active_plus_unknown[:, index]
     full /= np.maximum(full.sum(axis=1, keepdims=True), 1e-12)
@@ -1176,7 +1207,9 @@ def _load_and_split(config: dict[str, Any]) -> tuple[DataSplit, list[str]]:
     cross_path = config["dataset"].get("cross_path")
     cross_type = config["dataset"].get("cross_type")
     if not cross_path or not cross_type:
-        raise ValueError("cross split requires dataset.cross_path and dataset.cross_type")
+        raise ValueError(
+            "cross split requires dataset.cross_path and dataset.cross_type"
+        )
     target_config = copy.deepcopy(config)
     target_config["dataset"]["type"] = cross_type
     target_config["dataset"]["path"] = cross_path
@@ -1189,6 +1222,10 @@ def _load_and_split(config: dict[str, Any]) -> tuple[DataSplit, list[str]]:
 
 def run_training(config_path: str | Path) -> Path:
     config = load_config(config_path)
+    if str(config["dataset"].get("storage", "csv")) == "parquet":
+        from .out_of_core.run import run_out_of_core_training
+
+        return run_out_of_core_training(Path(config_path), config=config)
     seed = int(config["experiment"]["seed"])
     seed_everything(seed)
     run_dir = create_run_dir(config)
@@ -1207,14 +1244,16 @@ def run_training(config_path: str | Path) -> Path:
     y_train = preprocessor.encode_labels(split.train)
     y_validation = preprocessor.encode_labels(split.validation)
     if np.any(y_validation < 0):
-        raise ValueError("validation contains a class absent from training; move it to held-out test")
+        raise ValueError(
+            "validation contains a class absent from training; move it to held-out test"
+        )
     resume_context = {
         "selected_features": list(preprocessor.selected_features),
         "active_labels": list(preprocessor.active_labels),
         "input_groups": preprocessor.input_groups.tolist(),
         "split_manifest": split.manifest,
     }
-    attack_prior = np.zeros(len(CANONICAL_LABELS), dtype=np.float64)
+    attack_prior: np.ndarray = np.zeros(len(CANONICAL_LABELS), dtype=np.float64)
     train_attack_counts = split.train.loc[
         split.train["behavior_label"] != "benign", "behavior_label"
     ].value_counts()
@@ -1247,7 +1286,9 @@ def run_training(config_path: str | Path) -> Path:
         teacher_model = None
         if float(config["loss"].get("distillation_alpha", 0.0)) > 0:
             if model_type == "fp32_mlp":
-                raise ValueError("distillation_alpha requires a BNN student, not fp32_mlp")
+                raise ValueError(
+                    "distillation_alpha requires a BNN student, not fp32_mlp"
+                )
             teacher_config = copy.deepcopy(config)
             teacher_config["model"]["type"] = "fp32_mlp"
             teacher_config["loss"]["distillation_alpha"] = 0.0
@@ -1268,7 +1309,9 @@ def run_training(config_path: str | Path) -> Path:
                 resume_context={**resume_context, "training_role": "teacher"},
             )
             teacher_model = teacher_fit.model
-            teacher_fit.history.to_csv(run_dir / "teacher_training_history.csv", index=False)
+            teacher_fit.history.to_csv(
+                run_dir / "teacher_training_history.csv", index=False
+            )
             _checkpoint(
                 teacher_model,
                 teacher_config,
@@ -1353,7 +1396,8 @@ def run_training(config_path: str | Path) -> Path:
         }:
             raise ValueError("cascade currently requires a neural Main model")
         tiny_budget = min(
-            int(config["cascade"]["tiny_feature_budget"]), len(preprocessor.selected_features)
+            int(config["cascade"]["tiny_feature_budget"]),
+            len(preprocessor.selected_features),
         )
         tiny_indices = preprocessor.encoder.encoded_indices_for_first(
             tiny_budget, len(preprocessor.selected_features)
@@ -1478,8 +1522,10 @@ def run_training(config_path: str | Path) -> Path:
         test_known = _predict_neural_probabilities(
             model, x_test, int(config["training"]["batch_size"])
         )
-    main_labels, test_full = _to_full_probabilities(preprocessor, test_known, x_test_raw)
-    exit_stage = np.full(len(split.test), 2, dtype=np.int8)
+    main_labels, test_full = _to_full_probabilities(
+        preprocessor, test_known, x_test_raw
+    )
+    exit_stage: np.ndarray = np.full(len(split.test), 2, dtype=np.int8)
 
     if tiny_model is not None:
         assert tiny_indices is not None
@@ -1527,7 +1573,9 @@ def run_training(config_path: str | Path) -> Path:
             "boolean_fast_path": boolean_calibration.to_dict(),
             "test_routing": routing_summary,
             "test_attack_escalation_recall": (
-                float(np.mean(exit_stage[attack_mask] == 2)) if attack_mask.any() else None
+                float(np.mean(exit_stage[attack_mask] == 2))
+                if attack_mask.any()
+                else None
             ),
             **cascade_operation_summary(
                 exit_stage,
@@ -1540,7 +1588,9 @@ def run_training(config_path: str | Path) -> Path:
 
     original_true = split.test["behavior_label"].astype(str).to_numpy()
     evaluation_true = np.where(
-        np.isin(original_true, preprocessor.active_labels), original_true, "unknown_like"
+        np.isin(original_true, preprocessor.active_labels),
+        original_true,
+        "unknown_like",
     ).astype(str)
     metadata_columns = [
         column
@@ -1561,11 +1611,13 @@ def run_training(config_path: str | Path) -> Path:
     predictions["predicted_label"] = main_labels
     predictions["exit_stage"] = exit_stage
     predictions["has_wall_clock_time"] = bool(
-        split.manifest.get("provenance", split.manifest.get("target_provenance", {})).get(
-            "has_wall_clock_time", False
-        )
+        split.manifest.get(
+            "provenance", split.manifest.get("target_provenance", {})
+        ).get("has_wall_clock_time", False)
     )
-    predictions["temporal_continuity"] = bool(split.manifest.get("temporal_continuity", False))
+    predictions["temporal_continuity"] = bool(
+        split.manifest.get("temporal_continuity", False)
+    )
     for index, label in enumerate(CANONICAL_LABELS):
         predictions[f"prob_{label}"] = test_full[:, index]
     metrics = classification_metrics(
@@ -1579,7 +1631,9 @@ def run_training(config_path: str | Path) -> Path:
     metrics["fixed_fpr"]["score_pipeline"] = (
         "cascade" if cascade_results is not None else "main_open_set"
     )
-    confusion_frame(evaluation_true, main_labels).to_csv(run_dir / "confusion_matrix.csv")
+    confusion_frame(evaluation_true, main_labels).to_csv(
+        run_dir / "confusion_matrix.csv"
+    )
     if bool(config["evaluation"].get("save_predictions", True)):
         predictions.to_csv(run_dir / "predictions.csv", index=False)
     plot_files: list[str] = []

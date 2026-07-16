@@ -10,6 +10,16 @@ from .config import load_config, save_json
 from .preprocess import FeaturePreprocessor
 
 
+def _load_checkpoint(path: Path) -> dict[str, Any]:
+    """Reuse training's pinned, version-gated tensor-only loader."""
+
+    import torch
+
+    from .trainer import _safe_torch_load
+
+    return _safe_torch_load(path, torch.device("cpu"))
+
+
 def fold_linear_batchnorm(linear: Any, batchnorm: Any) -> dict[str, np.ndarray]:
     """Fold BN + sign into a dot-product threshold and polarity."""
 
@@ -42,7 +52,9 @@ def fold_linear_batchnorm(linear: Any, batchnorm: Any) -> dict[str, np.ndarray]:
 def folded_sign(dot_product: np.ndarray, folded: dict[str, np.ndarray]) -> np.ndarray:
     threshold = folded["threshold"][None, :]
     polarity = folded["polarity"][None, :]
-    positive = np.where(polarity > 0, dot_product >= threshold, dot_product <= threshold)
+    positive = np.where(
+        polarity > 0, dot_product >= threshold, dot_product <= threshold
+    )
     output = np.where(positive, 1.0, -1.0).astype(np.float32)
     constant = folded["constant_output"]
     if np.any(constant):
@@ -50,7 +62,11 @@ def folded_sign(dot_product: np.ndarray, folded: dict[str, np.ndarray]) -> np.nd
     return output
 
 
-def _build_from_checkpoint(config: dict[str, Any], checkpoint: dict[str, Any], preprocessor: FeaturePreprocessor) -> Any:
+def _build_from_checkpoint(
+    config: dict[str, Any],
+    checkpoint: dict[str, Any],
+    preprocessor: FeaturePreprocessor,
+) -> Any:
     from .models import build_model
 
     config = dict(config)
@@ -60,7 +76,9 @@ def _build_from_checkpoint(config: dict[str, Any], checkpoint: dict[str, Any], p
     config["model"]["dropout"] = checkpoint["dropout"]
     config["model"]["binary_first_layer"] = checkpoint["binary_first_layer"]
     input_groups = np.asarray(checkpoint["input_groups"], dtype=np.int64)
-    costs = np.asarray(checkpoint.get("feature_costs", preprocessor.feature_costs), dtype=np.float32)
+    costs = np.asarray(
+        checkpoint.get("feature_costs", preprocessor.feature_costs), dtype=np.float32
+    )
     model = build_model(
         config,
         int(checkpoint["input_dim"]),
@@ -77,21 +95,23 @@ def _build_from_checkpoint(config: dict[str, Any], checkpoint: dict[str, Any], p
 def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
     import torch
 
-    from .models import BinaryLinear
+    from .models import BinaryLinear, classifier_active_inputs
 
     checkpoint_path = run_dir / "best_model.pt"
     if not checkpoint_path.exists():
-        raise FileNotFoundError("edge export requires a neural best_model.pt checkpoint")
+        raise FileNotFoundError(
+            "edge export requires a neural best_model.pt checkpoint"
+        )
     config = load_config(run_dir / "resolved_config.yaml")
     preprocessor = FeaturePreprocessor.load(run_dir / "preprocessor.joblib")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = _load_checkpoint(checkpoint_path)
     model = _build_from_checkpoint(config, checkpoint, preprocessor)
     if not hasattr(model, "blocks"):
         raise ValueError("packed export currently supports BNNClassifier, not FP32MLP")
     output_dir.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
     manifest: dict[str, Any] = {
-        "format_version": 1,
+        "format_version": 2,
         "bit_order": "little",
         "input_encoder": preprocessor.encoder.kind,
         "encoder_bits": preprocessor.encoder.bits,
@@ -101,15 +121,21 @@ def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
         "arithmetic": "See each layer's operation field; hybrid/none first inputs are not XNOR eligible.",
         "automatic_network_action": False,
     }
-    active_encoded = np.arange(preprocessor.encoded_dimension, dtype=np.int64)
-    active_groups = np.arange(len(preprocessor.selected_features), dtype=np.int64)
+    active_encoded: np.ndarray = np.arange(
+        preprocessor.encoded_dimension, dtype=np.int64
+    )
+    active_groups: np.ndarray = np.arange(
+        len(preprocessor.selected_features), dtype=np.int64
+    )
     if getattr(model, "feature_gate", None) is not None:
+        active_groups, active_encoded = classifier_active_inputs(model)
         probabilities = model.feature_gate.probabilities().detach().cpu().numpy()
         arrays["feature_gate_probability"] = probabilities.astype(np.float32)
         arrays["feature_gate_hard_mask"] = (probabilities >= 0.5).astype(np.uint8)
         manifest["feature_gate_scope_note"] = (
-            "The classifier applies the hard mask, but the open-set benign-distance detector uses "
-            "all selected features. Acquisition-cost claims must include those anomaly features."
+            "Inactive classifier columns are physically pruned. The open-set benign-distance "
+            "detector still uses all selected raw features, so acquisition-cost claims must "
+            "include the separate open-set requirement."
         )
     arrays["active_original_feature_indices"] = active_groups
     arrays["active_encoded_indices"] = active_encoded
@@ -119,11 +145,26 @@ def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
     ].astype(np.float32)
     scaler_center = getattr(preprocessor.scaler, "center_", None)
     if scaler_center is None:
-        scaler_center = getattr(preprocessor.scaler, "mean_", np.zeros(len(preprocessor.selected_features)))
-    scaler_scale = getattr(preprocessor.scaler, "scale_", np.ones(len(preprocessor.selected_features)))
+        scaler_center = getattr(
+            preprocessor.scaler, "mean_", np.zeros(len(preprocessor.selected_features))
+        )
+    scaler_scale = getattr(
+        preprocessor.scaler, "scale_", np.ones(len(preprocessor.selected_features))
+    )
     arrays["scaler_center"] = np.asarray(scaler_center, dtype=np.float32)[active_groups]
     arrays["scaler_scale"] = np.asarray(scaler_scale, dtype=np.float32)[active_groups]
-    arrays["open_set_benign_center"] = np.asarray(preprocessor.benign_center, dtype=np.float32)[active_groups]
+    all_groups: np.ndarray = np.arange(
+        len(preprocessor.selected_features), dtype=np.int64
+    )
+    arrays["open_set_original_feature_indices"] = all_groups
+    arrays["open_set_imputer_median"] = preprocessor.imputer.statistics_[
+        preprocessor.selected_indices
+    ].astype(np.float32)
+    arrays["open_set_scaler_center"] = np.asarray(scaler_center, dtype=np.float32)
+    arrays["open_set_scaler_scale"] = np.asarray(scaler_scale, dtype=np.float32)
+    arrays["open_set_benign_center"] = np.asarray(
+        preprocessor.benign_center, dtype=np.float32
+    )
     arrays["open_set_distance_threshold"] = np.asarray(
         [preprocessor.open_distance_threshold], dtype=np.float32
     )
@@ -131,7 +172,17 @@ def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
         thresholds = np.asarray(preprocessor.encoder.thresholds, dtype=np.float32)
         arrays["encoder_thresholds"] = thresholds[active_groups]
     manifest["preprocessing"] = {
-        "raw_feature_order": [preprocessor.selected_features[index] for index in active_groups],
+        "raw_feature_order": [
+            preprocessor.selected_features[index] for index in active_groups
+        ],
+        "classifier_raw_feature_order": [
+            preprocessor.selected_features[index] for index in active_groups
+        ],
+        "classifier_encoded_input_count": int(len(active_encoded)),
+        "open_set_raw_feature_order": list(preprocessor.selected_features),
+        "open_set_requires_all_selected_features": bool(
+            preprocessor.config["preprocess"]["open_set"].get("enabled", True)
+        ),
         "imputation": "median",
         "scaling": type(preprocessor.scaler).__name__,
         "open_set_confidence_threshold": float(
@@ -141,29 +192,36 @@ def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
     }
     manifest["temporal"] = config["temporal"]
     manifest["cascade_calibration_file"] = (
-        "cascade_calibration.json" if (run_dir / "cascade_calibration.json").exists() else None
+        "cascade_calibration.json"
+        if (run_dir / "cascade_calibration.json").exists()
+        else None
     )
     manifest["scope_note"] = (
         "Main BNN is bit-packed. A Tiny checkpoint/calibration is bundled when available, but a "
         "target-specific Tiny packed runtime is still required for a complete cascade deployment."
     )
-    scaled_reference = np.random.default_rng(2309).normal(
-        size=(64, len(preprocessor.selected_features))
-    ).astype(np.float32)
+    scaled_reference = (
+        np.random.default_rng(2309)
+        .normal(size=(64, len(preprocessor.selected_features)))
+        .astype(np.float32)
+    )
     reference = preprocessor.encoder.transform(scaled_reference)
     with torch.inference_mode():
         full_model_logits = model(torch.from_numpy(reference)).numpy()
         if getattr(model, "feature_gate", None) is not None:
             model_reference = model.feature_gate(torch.from_numpy(reference)).numpy()
+            exported_reference = reference[:, active_encoded].copy()
         else:
             model_reference = reference
-    exported_reference = model_reference.copy()
+            exported_reference = model_reference.copy()
     parity: list[bool] = []
     for index, block in enumerate(model.blocks):
         linear = block[0]
         batchnorm = block[1]
         folded = fold_linear_batchnorm(linear, batchnorm)
         layer_weight = folded["weight"]
+        if index == 0 and getattr(model, "feature_gate", None) is not None:
+            layer_weight = layer_weight[:, active_encoded]
         if index == 0:
             model_input = model_reference
             exported_input = exported_reference
@@ -175,14 +233,23 @@ def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
             arrays[f"layer_{index}_weight_bits"] = np.packbits(
                 signed_weight > 0, axis=1, bitorder="little"
             )
-            arrays[f"layer_{index}_input_bits"] = np.asarray([signed_weight.shape[1]], dtype=np.int32)
+            arrays[f"layer_{index}_input_bits"] = np.asarray(
+                [signed_weight.shape[1]], dtype=np.int32
+            )
             storage = "packed_binary"
             exported_dot = exported_input @ signed_weight.T
-            xnor_eligible = index > 0 or preprocessor.encoder.kind in {"sign", "thermometer"}
+            xnor_eligible = index > 0 or preprocessor.encoder.kind in {
+                "sign",
+                "thermometer",
+            }
             if xnor_eligible:
-                matches = (exported_input[:, None, :] > 0) == (signed_weight[None, :, :] > 0)
+                matches = (exported_input[:, None, :] > 0) == (
+                    signed_weight[None, :, :] > 0
+                )
                 xnor_dot = 2.0 * matches.sum(axis=2) - signed_weight.shape[1]
-                xnor_parity = bool(np.array_equal(xnor_dot.astype(np.float32), exported_dot))
+                xnor_parity = bool(
+                    np.array_equal(xnor_dot.astype(np.float32), exported_dot)
+                )
                 operation = "XNOR_popcount_threshold"
             else:
                 xnor_parity = None
@@ -216,13 +283,21 @@ def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
                 "parity_passed": layer_parity,
             }
         )
-    arrays["output_weight_fp32"] = model.output.weight.detach().cpu().numpy().astype(np.float32)
-    arrays["output_bias_fp32"] = model.output.bias.detach().cpu().numpy().astype(np.float32)
+    arrays["output_weight_fp32"] = (
+        model.output.weight.detach().cpu().numpy().astype(np.float32)
+    )
+    arrays["output_bias_fp32"] = (
+        model.output.bias.detach().cpu().numpy().astype(np.float32)
+    )
     exported_logits = (
         exported_reference @ arrays["output_weight_fp32"].T + arrays["output_bias_fp32"]
     )
-    logits_parity = bool(np.allclose(exported_logits, full_model_logits, atol=1e-5, rtol=1e-5))
-    np.savez_compressed(output_dir / "bitguard_edge_weights.npz", **arrays)
+    logits_parity = bool(
+        np.allclose(exported_logits, full_model_logits, atol=1e-5, rtol=1e-5)
+    )
+    np.savez_compressed(
+        output_dir / "bitguard_edge_weights.npz", **arrays  # type: ignore[arg-type]
+    )
     manifest["folding_parity_passed"] = bool(all(parity))
     manifest["end_to_end_logit_parity_passed"] = logits_parity
     manifest["files"] = ["bitguard_edge_weights.npz", "bitguard_edge_manifest.json"]
@@ -237,7 +312,9 @@ def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
             manifest["files"].append(optional_name)
     save_json(manifest, output_dir / "bitguard_edge_manifest.json")
     if not all(parity) or not logits_parity:
-        raise RuntimeError("edge export parity failed; files were written for diagnosis only")
+        raise RuntimeError(
+            "edge export parity failed; files were written for diagnosis only"
+        )
     return {
         "output_dir": str(output_dir),
         "weights": str(output_dir / "bitguard_edge_weights.npz"),

@@ -15,7 +15,7 @@ import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TypedDict, cast
 
 from .cleanup import inspection_command, scan_cleanup_debt
@@ -160,6 +160,8 @@ class BootstrapDependencies:
     preparer: Callable[..., object] | None = None
     prepared_verifier: Callable[[Path], object] | None = None
     preparation_signature_token: str | None = None
+    trainer: Callable[..., object] | None = None
+    summarizer: Callable[..., object] | None = None
 
 
 def _json_signature(value: object) -> str:
@@ -195,6 +197,398 @@ def _regular_digest(path: Path) -> tuple[str, int]:
     if identity(first) != identity(opened) or identity(first) != identity(final):
         raise RuntimeError(f"Bootstrap source changed while it was hashed: {path}")
     return digest.hexdigest(), size
+
+
+def _is_reparse_point(value: os.stat_result) -> bool:
+    attributes = int(getattr(value, "st_file_attributes", 0))
+    flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & flag)
+
+
+def _artifact_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(stat.S_IFMT(value.st_mode)),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_nlink),
+        int(getattr(value, "st_file_attributes", 0)),
+    )
+
+
+def _artifact_path_snapshot(
+    root: Path, path: Path, *, final_directory: bool = False
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Pin every non-link component of a training artifact locator."""
+
+    if any(part == ".." for part in path.parts):
+        raise RuntimeError(f"training artifact path is not canonical: {path}")
+    absolute_root = Path(os.path.abspath(root))
+    absolute_path = Path(os.path.abspath(path))
+    try:
+        relative = absolute_path.relative_to(absolute_root)
+    except ValueError as error:
+        raise RuntimeError(
+            f"training artifact escapes its run directory: {path}"
+        ) from error
+    components = (
+        absolute_root,
+        *[
+            absolute_root.joinpath(*relative.parts[:index])
+            for index in range(1, len(relative.parts) + 1)
+        ],
+    )
+    snapshots: list[tuple[str, tuple[int, ...]]] = []
+    for index, component in enumerate(components):
+        try:
+            observed = os.lstat(component)
+        except OSError as error:
+            raise RuntimeError(
+                f"unable to inspect training artifact component: {component}"
+            ) from error
+        final = index == len(components) - 1
+        if stat.S_ISLNK(observed.st_mode) or _is_reparse_point(observed):
+            raise RuntimeError(
+                f"training artifact path contains a link or reparse point: {component}"
+            )
+        if final and not final_directory:
+            if not stat.S_ISREG(observed.st_mode):
+                raise RuntimeError(
+                    f"training artifact must be a regular file: {component}"
+                )
+            if int(observed.st_nlink) != 1:
+                raise RuntimeError(
+                    f"training artifact must have exactly one hard link: {component}"
+                )
+        elif not stat.S_ISDIR(observed.st_mode):
+            raise RuntimeError(
+                f"training artifact parent must be a directory: {component}"
+            )
+        snapshots.append(
+            (os.path.normcase(str(component)), _artifact_identity(observed))
+        )
+    resolved_root = absolute_root.resolve(strict=True)
+    resolved_path = absolute_path.resolve(strict=True)
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as error:
+        raise RuntimeError(
+            f"training artifact escapes its run directory: {path}"
+        ) from error
+    if (
+        resolved_root != absolute_root.resolve(strict=True)
+        or resolved_path != absolute_path
+    ):
+        raise RuntimeError(f"training artifact locator changed while resolved: {path}")
+    return tuple(snapshots)
+
+
+def _artifact_digest(root: Path, path: Path) -> tuple[str, int]:
+    """Hash a single-link artifact through a handle pinned to its safe path."""
+
+    before = _artifact_path_snapshot(root, path)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as stream:
+            opened_before = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(opened_before.st_mode)
+                or _is_reparse_point(opened_before)
+                or int(opened_before.st_nlink) != 1
+                or _artifact_identity(opened_before) != before[-1][1]
+            ):
+                raise RuntimeError(
+                    f"training artifact changed while it was opened: {path}"
+                )
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+            opened_after = os.fstat(stream.fileno())
+    except OSError as error:
+        raise RuntimeError(f"unable to hash training artifact: {path}") from error
+    after = _artifact_path_snapshot(root, path)
+    if (
+        before != after
+        or _artifact_identity(opened_before) != _artifact_identity(opened_after)
+        or _artifact_identity(opened_after) != after[-1][1]
+    ):
+        raise RuntimeError(f"training artifact changed while it was hashed: {path}")
+    return digest.hexdigest(), size
+
+
+def _read_artifact_json_record(
+    root: Path, path: Path, *, subject: str
+) -> tuple[object, str, int, tuple[tuple[str, tuple[int, ...]], ...]]:
+    before = _artifact_path_snapshot(root, path)
+    try:
+        with path.open("rb") as stream:
+            opened_before = os.fstat(stream.fileno())
+            if _artifact_identity(opened_before) != before[-1][1]:
+                raise RuntimeError(
+                    f"training artifact changed while it was opened: {path}"
+                )
+            encoded = stream.read()
+            opened_after = os.fstat(stream.fileno())
+    except OSError as error:
+        raise RuntimeError(f"unable to read training artifact: {path}") from error
+    after = _artifact_path_snapshot(root, path)
+    if (
+        before != after
+        or _artifact_identity(opened_before) != _artifact_identity(opened_after)
+        or _artifact_identity(opened_after) != after[-1][1]
+    ):
+        raise RuntimeError(f"training artifact changed while it was read: {path}")
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"{subject} is not valid JSON") from error
+    return payload, hashlib.sha256(encoded).hexdigest(), len(encoded), before
+
+
+def _read_artifact_json(root: Path, path: Path) -> object:
+    payload, _digest, _size, _snapshot = _read_artifact_json_record(
+        root, path, subject="training export manifest"
+    )
+    return payload
+
+
+def _artifact_graph_snapshot(
+    root: Path, paths: Mapping[str, Path]
+) -> dict[str, tuple[tuple[str, tuple[int, ...]], ...]]:
+    return {name: _artifact_path_snapshot(root, path) for name, path in paths.items()}
+
+
+def _training_artifact_paths(
+    summary: Mapping[str, object], run_dir: Path
+) -> dict[str, Path]:
+    export = summary.get("export")
+    if not isinstance(export, Mapping):
+        raise RuntimeError("training summary has no export artifact mapping")
+    locators = {
+        "checkpoint": summary.get("best_checkpoint"),
+        "metrics": summary.get("metrics"),
+        "predictions": summary.get("predictions"),
+        "inference_contract": summary.get("inference_contract"),
+        "export_manifest": export.get("manifest"),
+    }
+    artifacts: dict[str, Path] = {}
+    root = Path(os.path.abspath(run_dir))
+    _artifact_path_snapshot(root, root, final_directory=True)
+
+    def contained_path(
+        name: str, value: object, *, final_directory: bool = False
+    ) -> tuple[Path, Path]:
+        if not isinstance(value, (str, os.PathLike)):
+            raise RuntimeError(f"training summary has no {name} artifact locator")
+        path = Path(value)
+        resolved = path.resolve(strict=True)
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise RuntimeError(
+                f"training {name} artifact escapes its run directory: {path}"
+            ) from error
+        _artifact_path_snapshot(root, path, final_directory=final_directory)
+        return path, resolved
+
+    for name, value in locators.items():
+        path, _resolved = contained_path(name, value)
+        artifacts[name] = path
+
+    output_dir, output_root = contained_path(
+        "export output directory", export.get("output_dir"), final_directory=True
+    )
+    _artifact_path_snapshot(root, output_dir, final_directory=True)
+    manifest_path = artifacts["export_manifest"]
+    manifest_resolved = manifest_path.resolve(strict=True)
+    if manifest_resolved.parent != output_root:
+        raise RuntimeError(
+            "training export manifest locator does not belong to its output directory"
+        )
+    manifest = _read_artifact_json(root, manifest_path)
+    if not isinstance(manifest, Mapping):
+        raise RuntimeError("training export manifest root must be an object")
+    declared = manifest.get("files")
+    if not isinstance(declared, list) or not declared:
+        raise RuntimeError(
+            "training export manifest must declare a non-empty files list"
+        )
+
+    declared_resolved: set[Path] = set()
+    declared_names: set[str] = set()
+    for value in declared:
+        if not isinstance(value, str):
+            raise RuntimeError(
+                "training export manifest file must be a canonical relative path"
+            )
+        relative = PurePosixPath(value)
+        if (
+            not value
+            or "\\" in value
+            or Path(value).is_absolute()
+            or relative.is_absolute()
+            or relative.as_posix() != value
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or value in declared_names
+        ):
+            raise RuntimeError(
+                "training export manifest file must be a unique canonical relative path"
+            )
+        declared_names.add(value)
+        path = manifest_path.parent.joinpath(*relative.parts)
+        resolved = path.resolve(strict=True)
+        try:
+            resolved.relative_to(output_root)
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise RuntimeError(
+                "training export manifest file escapes its output directory"
+            ) from error
+        _artifact_path_snapshot(root, path)
+        declared_resolved.add(resolved)
+        if resolved != manifest_resolved:
+            artifacts[f"export_file:{value}"] = path
+
+    weights_path, weights_resolved = contained_path(
+        "export weights", export.get("weights")
+    )
+    if weights_resolved not in declared_resolved:
+        raise RuntimeError(
+            f"training export weights are not declared by the manifest: {weights_path}"
+        )
+    _artifact_path_snapshot(root, root, final_directory=True)
+    _artifact_path_snapshot(root, output_dir, final_directory=True)
+    for path in artifacts.values():
+        _artifact_path_snapshot(root, path)
+    return artifacts
+
+
+def _completed_training_status(
+    dataset: str,
+    descriptor: Path,
+    run_dir: Path,
+    summary: Mapping[str, object],
+) -> dict[str, object]:
+    summary_path = run_dir / "run_summary.json"
+    pinned_summary, summary_sha256, summary_bytes, initial_summary_snapshot = (
+        _read_artifact_json_record(
+            run_dir, summary_path, subject="training run summary"
+        )
+    )
+    if not isinstance(pinned_summary, Mapping):
+        raise RuntimeError("training run summary root must be an object")
+    if dict(pinned_summary) != dict(summary):
+        raise RuntimeError("training run summary does not match its parsed payload")
+    verified_summary = dict(pinned_summary)
+    if verified_summary.get("prepared_descriptor") != str(descriptor):
+        raise RuntimeError("training summary prepared descriptor locator mismatch")
+    descriptor_sha256, descriptor_bytes = _regular_digest(descriptor)
+    artifact_paths = _training_artifact_paths(verified_summary, run_dir)
+    initial_graph = _artifact_graph_snapshot(
+        run_dir, {"run_summary": summary_path, **artifact_paths}
+    )
+    artifacts = {
+        name: {
+            "path": str(path),
+            "sha256": digest,
+            "bytes": size,
+        }
+        for name, path in artifact_paths.items()
+        for digest, size in [_artifact_digest(run_dir, path)]
+    }
+    final_paths = _training_artifact_paths(verified_summary, run_dir)
+    if {
+        name: os.path.normcase(os.path.abspath(path))
+        for name, path in artifact_paths.items()
+    } != {
+        name: os.path.normcase(os.path.abspath(path))
+        for name, path in final_paths.items()
+    }:
+        raise RuntimeError("training artifact graph changed while it was verified")
+    final_summary, final_summary_sha256, final_summary_bytes, final_summary_snapshot = (
+        _read_artifact_json_record(
+            run_dir, summary_path, subject="training run summary"
+        )
+    )
+    if (
+        not isinstance(final_summary, Mapping)
+        or dict(final_summary) != verified_summary
+        or final_summary_sha256 != summary_sha256
+        or final_summary_bytes != summary_bytes
+        or final_summary_snapshot != initial_summary_snapshot
+    ):
+        raise RuntimeError("training run summary changed while artifacts were verified")
+    final_graph = _artifact_graph_snapshot(
+        run_dir, {"run_summary": summary_path, **final_paths}
+    )
+    if initial_graph != final_graph:
+        raise RuntimeError("training artifact graph changed while it was verified")
+    return {
+        "status": "completed",
+        "dataset": dataset,
+        "descriptor": str(descriptor),
+        "descriptor_sha256": descriptor_sha256,
+        "descriptor_bytes": descriptor_bytes,
+        "run": str(run_dir),
+        "run_summary": {
+            "path": str(summary_path),
+            "sha256": summary_sha256,
+            "bytes": summary_bytes,
+        },
+        "checkpoint": verified_summary.get("best_checkpoint"),
+        "metrics": verified_summary.get("metrics"),
+        "predictions": verified_summary.get("predictions"),
+        "inference_contract": verified_summary.get("inference_contract"),
+        "export": verified_summary.get("export"),
+        "artifacts": artifacts,
+    }
+
+
+def _verified_completed_training_status(
+    dataset: str, descriptor: Path, value: object
+) -> dict[str, object] | None:
+    if not isinstance(value, Mapping) or value.get("status") != "completed":
+        return None
+    try:
+        if value.get("dataset") != dataset or value.get("descriptor") != str(
+            descriptor
+        ):
+            return None
+        descriptor_digest = _regular_digest(descriptor)
+        if (
+            value.get("descriptor_sha256") != descriptor_digest[0]
+            or value.get("descriptor_bytes") != descriptor_digest[1]
+        ):
+            return None
+        run_value = value.get("run")
+        if not isinstance(run_value, str):
+            return None
+        run_dir = Path(run_value)
+        if not run_dir.is_dir() or run_dir.is_symlink():
+            return None
+        summary_record = value.get("run_summary")
+        summary_path = run_dir / "run_summary.json"
+        if not isinstance(summary_record, Mapping) or summary_record.get("path") != str(
+            summary_path
+        ):
+            return None
+        summary_digest = _regular_digest(summary_path)
+        if (
+            summary_record.get("sha256") != summary_digest[0]
+            or summary_record.get("bytes") != summary_digest[1]
+        ):
+            return None
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if not isinstance(summary, Mapping):
+            return None
+        expected = _completed_training_status(dataset, descriptor, run_dir, summary)
+        if expected != dict(value):
+            return None
+        return expected
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _tree_digest(path: Path) -> tuple[str, int, tuple[Path, ...]]:
@@ -1027,6 +1421,7 @@ def run_bootstrap(
 
     deps = dependencies or BootstrapDependencies()
     preparation_enabled = dependencies is None or deps.preparer is not None
+    training_enabled = preparation_enabled and not options.prepare_only
     metadata_root = options.data_root / ".bitguard"
     report_path = metadata_root / "bootstrap-report.json"
     state_path = metadata_root / "bootstrap-state.json"
@@ -1042,6 +1437,8 @@ def run_bootstrap(
     schema_root = metadata_root / "schema"
     prepared_descriptor_root = metadata_root / "prepared"
     preparation_report_path = metadata_root / "preparation.json"
+    training_report_path = metadata_root / "training.json"
+    summary_report_path = metadata_root / "summary.json"
     preparation_work_root = metadata_root / "preparation-work"
     prepared_output_root = options.data_root / "prepared"
     original = {
@@ -1062,6 +1459,8 @@ def run_bootstrap(
     acquisition_journals: dict[str, str] = {}
     extraction_journals: dict[str, str] = {}
     prepared_datasets: dict[str, str] = {}
+    trained_runs: dict[str, str] = {}
+    dataset_statuses: dict[str, object] = {}
     cleanup_roots: set[Path] = {
         metadata_root,
         options.data_root,
@@ -1115,6 +1514,9 @@ def run_bootstrap(
         }
         if preparation_enabled:
             reports["preparation"] = existing_locator(preparation_report_path)
+        if training_enabled:
+            reports["training"] = existing_locator(training_report_path)
+            reports["summary"] = existing_locator(summary_report_path)
         result: dict[str, object] = {
             "version": REPORT_FORMAT_VERSION,
             "status": status,
@@ -1148,7 +1550,11 @@ def run_bootstrap(
         }
         if preparation_enabled:
             result["prepared_datasets"] = dict(prepared_datasets)
-            result["next_stage"] = "train" if status == "prepared" else None
+            result["trained_runs"] = dict(trained_runs)
+            result["dataset_statuses"] = dict(dataset_statuses)
+            result["next_stage"] = (
+                "train" if status == "prepared" and options.prepare_only else None
+            )
         redacted = _redact_report_value(result)
         if not isinstance(redacted, dict):  # pragma: no cover - fixed report shape
             raise TypeError("bootstrap report redaction produced a non-mapping")
@@ -1246,11 +1652,10 @@ def run_bootstrap(
                                 f"{target} after invalidation failed; refusing fallback "
                                 f"publication: {_safe_error(verification_error)}"
                             ) from verification_error
-                        if (
-                            isinstance(visible, dict)
-                            and visible.get("status")
-                            in {"sources_verified", "prepared"}
-                        ):
+                        if isinstance(visible, dict) and visible.get("status") in {
+                            "sources_verified",
+                            "prepared",
+                        }:
                             raise RuntimeError(
                                 "Could not invalidate a contradictory canonical "
                                 f"bootstrap success report at {target}: "
@@ -1940,10 +2345,16 @@ def run_bootstrap(
                     return prepared_descriptor_root / dataset / f"{generation}.json"
 
                 def prepared_generation_output(dataset: str) -> Path:
-                    return prepared_output_root / dataset / preparation_generation(dataset)
+                    return (
+                        prepared_output_root / dataset / preparation_generation(dataset)
+                    )
 
                 def prepared_generation_work(dataset: str) -> Path:
-                    return preparation_work_root / dataset / preparation_generation(dataset)
+                    return (
+                        preparation_work_root
+                        / dataset
+                        / preparation_generation(dataset)
+                    )
 
                 preparation_signature_cache: dict[str, str] = {}
                 preparation_contract_cache: dict[str, object] | None = None
@@ -2090,9 +2501,11 @@ def run_bootstrap(
                         available_bytes = (
                             deps.preparation_available_bytes
                             if deps.preparation_available_bytes is not None
-                            else deps.available_bytes
-                            if deps.available_bytes is not None
-                            else shutil.disk_usage(probe).free
+                            else (
+                                deps.available_bytes
+                                if deps.available_bytes is not None
+                                else shutil.disk_usage(probe).free
+                            )
                         )
                         required_bytes = cast(int, group["required_bytes"])
                         group["available_bytes"] = int(available_bytes)
@@ -2105,7 +2518,8 @@ def run_bootstrap(
                     return {
                         "estimates": estimates,
                         "device_groups": {
-                            str(device): value for device, value in sorted(groups.items())
+                            str(device): value
+                            for device, value in sorted(groups.items())
                         },
                         "pending_datasets": pending,
                         "excluded_verified_datasets": verified_existing,
@@ -2154,9 +2568,9 @@ def run_bootstrap(
                 def validate_signature() -> str:
                     return _json_signature(
                         {
-                            dataset: _regular_digest(
-                                prepared_descriptor_path(dataset)
-                            )[0]
+                            dataset: _regular_digest(prepared_descriptor_path(dataset))[
+                                0
+                            ]
                             for dataset in options.datasets
                         }
                     )
@@ -2190,6 +2604,171 @@ def run_bootstrap(
                         },
                     )
                     return (preparation_report_path,)
+
+                def training_order() -> tuple[str, ...]:
+                    priority = {"nbaiot": 0, "botiot": 1}
+                    return tuple(
+                        sorted(
+                            options.datasets,
+                            key=lambda name: (priority.get(name, 99), name),
+                        )
+                    )
+
+                def write_training_report(status: str) -> None:
+                    _write_json(
+                        training_report_path,
+                        {
+                            "status": status,
+                            "order": list(training_order()),
+                            "datasets": dict(dataset_statuses),
+                            "runs": dict(trained_runs),
+                        },
+                    )
+
+                def train_signature() -> str:
+                    return _json_signature(
+                        {
+                            dataset: _regular_digest(prepared_descriptor_path(dataset))[
+                                0
+                            ]
+                            for dataset in training_order()
+                        }
+                    )
+
+                def run_train() -> Sequence[Path]:
+                    from bitguard_bnn.config import load_config
+                    from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
+                    from bitguard_bnn.out_of_core.run import run_out_of_core_training
+
+                    verifier = deps.prepared_verifier or verify_prepared_dataset
+                    persisted_statuses: Mapping[str, object] = {}
+                    if (
+                        options.restart_stage != "train"
+                        and training_report_path.is_file()
+                    ):
+                        try:
+                            persisted_training = json.loads(
+                                training_report_path.read_text(encoding="utf-8")
+                            )
+                            if isinstance(persisted_training, Mapping):
+                                candidates = persisted_training.get("datasets", {})
+                                if isinstance(candidates, Mapping):
+                                    persisted_statuses = candidates
+                        except (OSError, UnicodeError, json.JSONDecodeError):
+                            persisted_statuses = {}
+                    for dataset in training_order():
+                        descriptor = prepared_descriptor_path(dataset)
+                        prepared = verifier(descriptor)
+                        try:
+                            completed = _verified_completed_training_status(
+                                dataset, descriptor, persisted_statuses.get(dataset)
+                            )
+                            if completed is not None:
+                                persisted_run = completed["run"]
+                                trained_runs[dataset] = str(persisted_run)
+                                dataset_statuses[dataset] = completed
+                                write_training_report("running")
+                                continue
+                            if deps.trainer is None:
+                                resolved_value = getattr(
+                                    prepared, "resolved_config_path", None
+                                )
+                                if not isinstance(resolved_value, (str, os.PathLike)):
+                                    raise RuntimeError(
+                                        "verified prepared descriptor has no resolved config"
+                                    )
+                                resolved_path = Path(resolved_value)
+                                training_config = load_config(resolved_path)
+                                training_config["experiment"]["output_dir"] = str(
+                                    options.runs_root
+                                )
+                                run_value: object = run_out_of_core_training(
+                                    resolved_path,
+                                    config=training_config,
+                                    prepared_descriptor_path=descriptor,
+                                )
+                            else:
+                                run_value = deps.trainer(
+                                    dataset=dataset,
+                                    descriptor_path=descriptor,
+                                    runs_root=options.runs_root,
+                                )
+                            run_dir = Path(str(run_value)).resolve()
+                            if not run_dir.is_dir() or run_dir.is_symlink():
+                                raise RuntimeError(
+                                    f"training did not publish a run directory: {run_dir}"
+                                )
+                            summary_path = run_dir / "run_summary.json"
+                            if not summary_path.is_file() or summary_path.is_symlink():
+                                raise RuntimeError(
+                                    f"training did not publish a run summary: {summary_path}"
+                                )
+                            summary = json.loads(
+                                summary_path.read_text(encoding="utf-8")
+                            )
+                            trained_runs[dataset] = str(run_dir)
+                            if not isinstance(summary, Mapping):
+                                raise RuntimeError(
+                                    "training run summary is not an object"
+                                )
+                            dataset_statuses[dataset] = _completed_training_status(
+                                dataset, descriptor, run_dir, summary
+                            )
+                            write_training_report("running")
+                        except BaseException as error:
+                            dataset_statuses[dataset] = {
+                                "status": "failed",
+                                "descriptor": str(descriptor),
+                                "error": _safe_error(error),
+                            }
+                            write_training_report("failed")
+                            raise
+                    write_training_report("completed")
+                    # Run summaries live under runs_root, which may be outside the
+                    # portable bootstrap state root. The durable in-root training
+                    # report owns those external locators.
+                    return (training_report_path,)
+
+                def summarize_signature() -> str:
+                    return _json_signature(
+                        {
+                            dataset: _regular_digest(Path(run) / "run_summary.json")[0]
+                            for dataset, run in sorted(trained_runs.items())
+                        }
+                    )
+
+                def run_summarize() -> Sequence[Path]:
+                    custom: dict[str, object] = {}
+                    if deps.summarizer is not None:
+                        value = deps.summarizer(
+                            dataset_statuses=dict(dataset_statuses),
+                            output_path=summary_report_path,
+                        )
+                        if value is not None and not summary_report_path.exists():
+                            candidate = Path(str(value))
+                            if candidate.is_file():
+                                shutil.copy2(candidate, summary_report_path)
+                        if (
+                            summary_report_path.is_file()
+                            and not summary_report_path.is_symlink()
+                        ):
+                            candidate_payload = json.loads(
+                                summary_report_path.read_text(encoding="utf-8")
+                            )
+                            if isinstance(candidate_payload, dict):
+                                custom.update(candidate_payload)
+                    _write_json(
+                        summary_report_path,
+                        {
+                            **custom,
+                            "status": "completed",
+                            "datasets": dict(dataset_statuses),
+                            "runs": dict(trained_runs),
+                            "manifests": dict(manifests),
+                            "prepared_datasets": dict(prepared_datasets),
+                        },
+                    )
+                    return (summary_report_path,)
 
                 stages: tuple[Stage, ...] = (
                     Stage(
@@ -2281,6 +2860,16 @@ def run_bootstrap(
                             always_run=True,
                         ),
                     )
+                if training_enabled:
+                    stages += (
+                        Stage("train", train_signature, run_train, always_run=True),
+                        Stage(
+                            "summarize",
+                            summarize_signature,
+                            run_summarize,
+                            always_run=True,
+                        ),
+                    )
 
                 for stage in stages:
                     current_stage = stage.name
@@ -2321,9 +2910,30 @@ def run_bootstrap(
                             prepared_datasets[dataset] = str(
                                 prepared_descriptor_path(dataset)
                             )
+                    if stage.name == "train" and reusable:
+                        persisted_training = json.loads(
+                            training_report_path.read_text(encoding="utf-8")
+                        )
+                        if not isinstance(persisted_training, Mapping):
+                            raise RuntimeError("persisted training report is invalid")
+                        persisted_runs = persisted_training.get("runs", {})
+                        persisted_statuses = persisted_training.get("datasets", {})
+                        if not isinstance(persisted_runs, dict) or not isinstance(
+                            persisted_statuses, dict
+                        ):
+                            raise RuntimeError("persisted training report is invalid")
+                        trained_runs.update(
+                            {
+                                str(key): str(value)
+                                for key, value in persisted_runs.items()
+                            }
+                        )
+                        dataset_statuses.update(persisted_statuses)
 
                 final_status = (
-                    "prepared" if preparation_enabled else "sources_verified"
+                    "completed"
+                    if training_enabled
+                    else ("prepared" if preparation_enabled else "sources_verified")
                 )
             except BaseException as error:
                 failed_stage = current_stage
