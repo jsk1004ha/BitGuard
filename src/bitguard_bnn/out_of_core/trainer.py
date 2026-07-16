@@ -3,42 +3,66 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import math
-import os
 import random
+import warnings
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
+from bitguard_bnn.config import _validated_selection_weights
 from bitguard_bnn.out_of_core.cache import class_weights_from_counts
 from bitguard_bnn.out_of_core.dataset import (
     DATASET_ALGORITHM,
     DataCursor,
     ParquetTrainingDataset,
+    _resume_layout,
     iter_ordered_batches,
 )
 from bitguard_bnn.out_of_core.manifest import stable_fingerprint
 from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
 from bitguard_bnn.trainer import (
     NeuralFitResult,
+    _atomic_torch_save,
     _close_training_iterator,
     _make_grad_scaler,
+    _model_state_fingerprint,
+    _replayed_best_state,
     _restore_training_rng,
+    _safe_torch_load,
     _save_training_progress,
+    _serialized_numpy_rng_state,
     _select_device,
+    _validate_training_rng,
+    _validated_model_state,
     neural_train_step,
 )
 
 
-STREAMING_CHECKPOINT_FORMAT = 3
+STREAMING_CHECKPOINT_FORMAT = 4
 _METRIC_NAMES = ("loss", "detection", "feature_cost", "fn", "fp")
 _VALIDATION_NAMES = (
     "validation_macro_f1",
     "validation_macro_auprc",
     "validation_attack_recall",
+)
+_HISTORY_FIELDS = frozenset(
+    {
+        "epoch",
+        "learning_rate",
+        "validation_macro_f1",
+        "validation_macro_auprc",
+        "validation_attack_recall",
+        "validation_selection_score",
+        "train_loss",
+        "train_detection",
+        "train_feature_cost",
+        "train_fn",
+        "train_fp",
+    }
 )
 
 ValidationCallback = Callable[[Any, Any], Mapping[str, float]]
@@ -62,6 +86,7 @@ def _streaming_signature(
     feature_indices: tuple[int, ...] | None,
     binary_attack_target: bool,
     teacher_fingerprint: str | None,
+    validation_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     prepared = verify_prepared_dataset(dataset.descriptor_path)
     if (
@@ -107,6 +132,7 @@ def _streaming_signature(
             "target": "benign-versus-attack" if binary_attack_target else "active-label-index",
             "teacher_fingerprint": teacher_fingerprint,
         },
+        "validation_contract": validation_contract,
     }
     canonical = _canonical(signature)
     canonical["fingerprint"] = stable_fingerprint(canonical)
@@ -122,10 +148,22 @@ def _validate_inputs(
     training_role: str,
     feature_indices: Sequence[int] | None,
     binary_attack_target: bool,
-) -> tuple[tuple[str, ...], tuple[int, ...] | None, np.ndarray]:
+) -> tuple[
+    tuple[str, ...], tuple[int, ...] | None, np.ndarray, dict[str, int]
+]:
     labels = tuple(active_labels)
     if not labels or labels[0] != "benign":
         raise ValueError("active_labels must start with benign")
+    if not isinstance(counts, Mapping) or set(counts) != set(labels):
+        raise ValueError("class_counts keys must exactly match active_labels")
+    normalized_counts: dict[str, int] = {}
+    for label in labels:
+        count = counts[label]
+        if isinstance(count, bool) or not isinstance(count, Integral) or int(count) <= 0:
+            raise ValueError("class_counts values must be positive integers")
+        normalized_counts[label] = int(count)
+    if sum(normalized_counts.values()) != dataset.row_count:
+        raise ValueError("class_counts total must match the prepared train row count")
     if dataset.split != "train":
         raise ValueError("fit_neural_streaming requires the prepared train split")
     training = config["training"]
@@ -141,22 +179,27 @@ def _validate_inputs(
     if feature_indices is None:
         indices = None
     else:
-        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in feature_indices):
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or int(value) < 0
+            for value in feature_indices
+        ):
             raise ValueError("feature_indices must contain non-negative integers")
-        indices = tuple(feature_indices)
+        indices = tuple(int(value) for value in feature_indices)
         if not indices or len(set(indices)) != len(indices):
             raise ValueError("feature_indices must be non-empty and unique")
     if not isinstance(binary_attack_target, bool):
         raise ValueError("binary_attack_target must be boolean")
     if binary_attack_target:
         binary_counts = {
-            "benign": int(counts[labels[0]]),
-            "attack": sum(int(counts[label]) for label in labels[1:]),
+            "benign": normalized_counts[labels[0]],
+            "attack": sum(normalized_counts[label] for label in labels[1:]),
         }
         weights = class_weights_from_counts(binary_counts, ("benign", "attack"))
     else:
-        weights = class_weights_from_counts(counts, labels)
-    return labels, indices, weights
+        weights = class_weights_from_counts(normalized_counts, labels)
+    return labels, indices, weights, normalized_counts
 
 
 def _validation_record(
@@ -165,21 +208,38 @@ def _validation_record(
     device: Any,
     selection_weights: Mapping[str, float],
 ) -> dict[str, float]:
+    import torch
+
     model.eval()
-    values = dict(callback(model, device))
+    with torch.inference_mode():
+        values = dict(callback(model, device))
     missing = sorted(set(_VALIDATION_NAMES) - set(values))
     if missing:
         raise ValueError(f"validation callback is missing metrics: {missing}")
+    if any(
+        isinstance(values[name], bool) or not isinstance(values[name], Real)
+        for name in _VALIDATION_NAMES
+    ):
+        raise ValueError("validation callback returned a non-numeric metric")
     metrics = {name: float(values[name]) for name in _VALIDATION_NAMES}
-    if any(not math.isfinite(value) for value in metrics.values()):
-        raise ValueError("validation callback returned a non-finite metric")
+    if any(
+        not math.isfinite(value) or not 0.0 <= value <= 1.0
+        for value in metrics.values()
+    ):
+        raise ValueError("validation callback metrics must be finite in [0, 1]")
+    normalized_weights = _validated_selection_weights(selection_weights)
     metrics["validation_selection_score"] = (
-        float(selection_weights["macro_f1"]) * metrics["validation_macro_f1"]
-        + float(selection_weights["macro_auprc"])
+        normalized_weights["macro_f1"] * metrics["validation_macro_f1"]
+        + normalized_weights["macro_auprc"]
         * metrics["validation_macro_auprc"]
-        + float(selection_weights["attack_recall"])
+        + normalized_weights["attack_recall"]
         * metrics["validation_attack_recall"]
     )
+    if (
+        not math.isfinite(metrics["validation_selection_score"])
+        or not 0.0 <= metrics["validation_selection_score"] <= 1.0
+    ):
+        raise ValueError("validation selection score must be finite in [0, 1]")
     return metrics
 
 
@@ -187,37 +247,6 @@ def _cpu_state(model: Any) -> dict[str, Any]:
     return {
         key: value.detach().cpu().clone() for key, value in model.state_dict().items()
     }
-
-
-def _model_fingerprint(model: Any | None) -> str | None:
-    if model is None:
-        return None
-    digest = hashlib.sha256()
-    for name, value in sorted(model.state_dict().items()):
-        array = value.detach().cpu().contiguous().numpy()
-        digest.update(name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(array.dtype).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(json.dumps(list(array.shape), separators=(",", ":")).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(array.tobytes(order="C"))
-    return digest.hexdigest()
-
-
-def _fsync_path(path: Path) -> None:
-    with path.open("r+b") as handle:
-        os.fsync(handle.fileno())
-
-
-def _fsync_parent(path: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _save_streaming_checkpoint(
@@ -243,10 +272,14 @@ def _save_streaming_checkpoint(
     import torch
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
     state = {
         "format_version": STREAMING_CHECKPOINT_FORMAT,
-        "cursor": cursor,
+        "cursor": {
+            "epoch": int(cursor.epoch),
+            "shard_position": int(cursor.shard_position),
+            "batch_position": int(cursor.batch_position),
+            "optimizer_step": int(cursor.optimizer_step),
+        },
         "global_optimizer_step": cursor.optimizer_step,
         "epoch_phase": epoch_phase,
         "partial_totals": {name: float(partial_totals[name]) for name in _METRIC_NAMES},
@@ -273,22 +306,75 @@ def _save_streaming_checkpoint(
             if device_type == "cuda" and torch.cuda.is_available()
             else []
         ),
-        "numpy_rng_state": np.random.get_state(),
+        "numpy_rng_state": _serialized_numpy_rng_state(),
         "python_rng_state": random.getstate(),
     }
-    try:
-        torch.save(state, temporary)
-        _fsync_path(temporary)
-        os.replace(temporary, path)
-        _fsync_parent(path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    _atomic_torch_save(path, state)
+
+
+def _validated_history_state(
+    state: Mapping[str, Any],
+) -> tuple[list[dict[str, float | int]], float, int, int]:
+    raw_history = state["history"]
+    if not isinstance(raw_history, list):
+        raise ValueError("streaming checkpoint history is invalid")
+    records: list[dict[str, float | int]] = []
+    for expected_epoch, raw_record in enumerate(raw_history, start=1):
+        if not isinstance(raw_record, Mapping) or set(raw_record) != _HISTORY_FIELDS:
+            raise ValueError("streaming checkpoint history record fields are invalid")
+        epoch = raw_record["epoch"]
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch != expected_epoch:
+            raise ValueError("streaming checkpoint history is not a completed epoch prefix")
+        record: dict[str, float | int] = {"epoch": epoch}
+        for name in _HISTORY_FIELDS - {"epoch"}:
+            value = raw_record[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("streaming checkpoint history metric is invalid")
+            normalized = float(value)
+            if not math.isfinite(normalized):
+                raise ValueError("streaming checkpoint history metric is non-finite")
+            record[name] = normalized
+        if float(record["learning_rate"]) < 0.0:
+            raise ValueError("streaming checkpoint learning rate is invalid")
+        for name in (*_VALIDATION_NAMES, "validation_selection_score"):
+            if not 0.0 <= float(record[name]) <= 1.0:
+                raise ValueError("streaming checkpoint validation metric is out of range")
+        records.append(record)
+
+    best_metric = state["best_metric"]
+    best_epoch = state["best_epoch"]
+    stale = state["stale_epochs"]
+    if (
+        isinstance(best_metric, bool)
+        or not isinstance(best_metric, (int, float))
+        or isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or isinstance(stale, bool)
+        or not isinstance(stale, int)
+        or stale < 0
+    ):
+        raise ValueError("streaming checkpoint best/stale state is invalid")
+    metric = float(best_metric)
+    if not records:
+        if metric != -math.inf or best_epoch != -1 or stale != 0:
+            raise ValueError("empty checkpoint history has inconsistent best/stale state")
+        return records, metric, best_epoch, stale
+    if not math.isfinite(metric) or not 1 <= best_epoch <= len(records):
+        raise ValueError("streaming checkpoint best epoch or metric is invalid")
+    expected_metric, expected_best_epoch, expected_stale = _replayed_best_state(records)
+    if (
+        best_epoch != expected_best_epoch
+        or metric != expected_metric
+        or stale != expected_stale
+    ):
+        raise ValueError("streaming checkpoint best/stale state is inconsistent")
+    return records, metric, best_epoch, stale
 
 
 def _load_streaming_checkpoint(
     path: Path,
     *,
+    dataset: ParquetTrainingDataset,
     model: Any,
     optimizer: Any,
     scheduler: Any,
@@ -311,7 +397,7 @@ def _load_streaming_checkpoint(
 
     if not path.is_file():
         raise FileNotFoundError(f"streaming training checkpoint not found: {path}")
-    state = torch.load(path, map_location=device, weights_only=False)
+    state = _safe_torch_load(path, device)
     required = {
         "format_version",
         "cursor",
@@ -338,28 +424,63 @@ def _load_streaming_checkpoint(
     }
     if not isinstance(state, dict) or set(state) != required:
         raise ValueError("streaming checkpoint fields are invalid")
-    if state["format_version"] != STREAMING_CHECKPOINT_FORMAT:
+    if (
+        isinstance(state["format_version"], bool)
+        or not isinstance(state["format_version"], int)
+        or state["format_version"] != STREAMING_CHECKPOINT_FORMAT
+    ):
         raise ValueError("unsupported streaming checkpoint format")
     if state["scientific_signature"] != scientific_signature:
         raise ValueError("streaming checkpoint scientific signature mismatch")
-    if int(state["target_epochs"]) != target_epochs:
+    if (
+        isinstance(state["target_epochs"], bool)
+        or not isinstance(state["target_epochs"], int)
+        or state["target_epochs"] != target_epochs
+    ):
         raise ValueError("training.epochs must match the streaming checkpoint target")
-    if str(state["device_type"]) != device.type:
+    if state["device_type"] != device.type:
         raise ValueError("streaming checkpoint device type mismatch")
-    cursor = state["cursor"]
-    if not isinstance(cursor, DataCursor):
+    raw_cursor = state["cursor"]
+    cursor_fields = {
+        "epoch",
+        "shard_position",
+        "batch_position",
+        "optimizer_step",
+    }
+    if not isinstance(raw_cursor, dict) or set(raw_cursor) != cursor_fields:
         raise ValueError("streaming checkpoint cursor is invalid")
-    if int(state["global_optimizer_step"]) != cursor.optimizer_step:
+    if any(
+        isinstance(raw_cursor[name], bool)
+        or not isinstance(raw_cursor[name], int)
+        or raw_cursor[name] < (1 if name == "epoch" else 0)
+        for name in cursor_fields
+    ):
+        raise ValueError("streaming checkpoint cursor is invalid")
+    cursor = DataCursor(
+        epoch=raw_cursor["epoch"],
+        shard_position=raw_cursor["shard_position"],
+        batch_position=raw_cursor["batch_position"],
+        optimizer_step=raw_cursor["optimizer_step"],
+    )
+    global_step = state["global_optimizer_step"]
+    if (
+        isinstance(global_step, bool)
+        or not isinstance(global_step, int)
+        or global_step != cursor.optimizer_step
+    ):
         raise ValueError("streaming checkpoint optimizer step and cursor mismatch")
     phase = state["epoch_phase"]
     if phase not in {"training", "validation", "epoch_boundary"}:
         raise ValueError("streaming checkpoint epoch phase is invalid")
-    records = list(state["history"])
-    expected_epochs = list(range(1, len(records) + 1))
-    if [record.get("epoch") for record in records] != expected_epochs:
-        raise ValueError("streaming checkpoint history is not a completed epoch prefix")
+    records, best_metric, best_epoch, stale = _validated_history_state(state)
     partial = state["partial_totals"]
     if not isinstance(partial, Mapping) or set(partial) != set(_METRIC_NAMES):
+        raise ValueError("streaming checkpoint partial totals are invalid")
+    if any(
+        isinstance(partial[name], bool)
+        or not isinstance(partial[name], (int, float))
+        for name in _METRIC_NAMES
+    ):
         raise ValueError("streaming checkpoint partial totals are invalid")
     totals = {name: float(partial[name]) for name in _METRIC_NAMES}
     if any(not math.isfinite(value) for value in totals.values()):
@@ -380,26 +501,46 @@ def _load_streaming_checkpoint(
         raise ValueError("streaming checkpoint epoch-boundary cursor is inconsistent")
     if cursor.epoch < 1 or cursor.epoch > target_epochs + 1:
         raise ValueError("streaming checkpoint cursor epoch is out of range")
+    _validate_dataset_checkpoint_state(
+        dataset, cursor, str(phase), seen, len(records)
+    )
+    if phase == "validation" and seen != dataset.row_count:
+        raise RuntimeError("streaming train epoch row coverage is incomplete")
+    expected_scheduler_epoch = cursor.epoch if phase == "validation" else cursor.epoch - 1
+    scheduler_state = state["scheduler_state_dict"]
+    if not isinstance(scheduler_state, dict):
+        raise ValueError("streaming checkpoint scheduler state is invalid")
+    scheduler_epoch = scheduler_state.get("last_epoch")
+    if (
+        isinstance(scheduler_epoch, bool)
+        or not isinstance(scheduler_epoch, int)
+        or scheduler_epoch != expected_scheduler_epoch
+    ):
+        raise ValueError("streaming checkpoint scheduler phase is inconsistent")
+    if not isinstance(state["optimizer_state_dict"], dict):
+        raise ValueError("streaming checkpoint optimizer state is invalid")
+    if not isinstance(state["scaler_state_dict"], dict):
+        raise ValueError("streaming checkpoint scaler state is invalid")
+    _validate_training_rng(torch, state, device.type)
+    reference = model.state_dict()
+    _validated_model_state(
+        torch, state["model_state_dict"], reference, "streaming model state"
+    )
     best_raw = state["best_state_dict"]
     if best_raw is None:
         if records:
             raise ValueError("completed history requires a best model state")
         best_state = None
-    elif isinstance(best_raw, Mapping):
-        best_state = {
-            key: value.detach().cpu().clone() for key, value in best_raw.items()
-        }
     else:
-        raise ValueError("streaming checkpoint best model state is invalid")
+        best_state = _validated_model_state(
+            torch, best_raw, reference, "streaming best model state"
+        )
     try:
         model.load_state_dict(state["model_state_dict"])
     except RuntimeError as error:
         raise ValueError("streaming checkpoint does not match the model") from error
     optimizer.load_state_dict(state["optimizer_state_dict"])
     scheduler.load_state_dict(state["scheduler_state_dict"])
-    expected_scheduler_epoch = cursor.epoch if phase == "validation" else cursor.epoch - 1
-    if int(scheduler.last_epoch) != expected_scheduler_epoch:
-        raise ValueError("streaming checkpoint scheduler phase is inconsistent")
     scaler.load_state_dict(state["scaler_state_dict"])
     _restore_training_rng(torch, state)
     return (
@@ -409,10 +550,42 @@ def _load_streaming_checkpoint(
         seen,
         records,
         best_state,
-        float(state["best_metric"]),
-        int(state["best_epoch"]),
-        int(state["stale_epochs"]),
+        best_metric,
+        best_epoch,
+        stale,
     )
+
+
+def _validate_dataset_checkpoint_state(
+    dataset: ParquetTrainingDataset,
+    cursor: DataCursor,
+    epoch_phase: str,
+    partial_seen_rows: int,
+    completed_epochs: int,
+) -> None:
+    previous_epoch = dataset.epoch
+    previous_cursor = dataset.cursor
+    try:
+        dataset.set_epoch(cursor.epoch, cursor)
+        resume = _resume_layout(dataset)
+    finally:
+        dataset.set_epoch(previous_epoch, previous_cursor)
+    batch_count = resume.layout.batch_count
+    completed_steps = completed_epochs * batch_count
+    if epoch_phase == "epoch_boundary":
+        if resume.start_index != 0 or cursor.optimizer_step != completed_steps:
+            raise ValueError("streaming checkpoint boundary step is inconsistent")
+        return
+    expected_seen = resume.layout.start_at(resume.start_index)
+    expected_step = completed_steps + resume.start_index
+    if partial_seen_rows != expected_seen or cursor.optimizer_step != expected_step:
+        raise ValueError("streaming checkpoint cursor, rows, and step are inconsistent")
+    if epoch_phase == "validation":
+        if resume.start_index != batch_count:
+            raise ValueError("streaming checkpoint validation cursor is inconsistent")
+        return
+    if resume.start_index <= 0 or resume.start_index > batch_count:
+        raise ValueError("streaming checkpoint training cursor is inconsistent")
 
 
 def fit_neural_streaming(
@@ -422,6 +595,7 @@ def fit_neural_streaming(
     active_labels: Sequence[str],
     config: dict[str, Any],
     validation_callback: ValidationCallback,
+    validation_contract: Mapping[str, Any],
     teacher_model: Any | None = None,
     *,
     checkpoint_path: Path | None = None,
@@ -438,7 +612,7 @@ def fit_neural_streaming(
 
     from bitguard_bnn.losses import BitGuardObjective
 
-    labels, indices, weights = _validate_inputs(
+    labels, indices, weights, normalized_counts = _validate_inputs(
         dataset,
         config,
         class_counts,
@@ -447,7 +621,11 @@ def fit_neural_streaming(
         feature_indices=feature_indices,
         binary_attack_target=binary_attack_target,
     )
-    del labels
+    if not isinstance(validation_contract, Mapping) or not validation_contract:
+        raise ValueError("validation_contract must be a non-empty mapping")
+    canonical_validation_contract = _canonical(dict(validation_contract))
+    if not isinstance(canonical_validation_contract, dict) or not canonical_validation_contract:
+        raise ValueError("validation_contract must encode a non-empty object")
     training = config["training"]
     epochs = int(training["epochs"])
     device = _select_device(str(training.get("device", "auto")))
@@ -474,12 +652,13 @@ def fit_neural_streaming(
     signature = _streaming_signature(
         dataset,
         config,
-        class_counts,
-        active_labels,
+        normalized_counts,
+        labels,
         training_role=training_role,
         feature_indices=indices,
         binary_attack_target=binary_attack_target,
-        teacher_fingerprint=_model_fingerprint(teacher_model),
+        teacher_fingerprint=_model_state_fingerprint(teacher_model),
+        validation_contract=canonical_validation_contract,
     )
     cursor = DataCursor(epoch=1, shard_position=0, batch_position=0, optimizer_step=0)
     epoch_phase = "training"
@@ -490,6 +669,7 @@ def fit_neural_streaming(
     best_metric = -math.inf
     best_epoch = -1
     stale = 0
+    terminal_training_resume = False
     if resume_from is not None:
         (
             cursor,
@@ -503,6 +683,7 @@ def fit_neural_streaming(
             stale,
         ) = _load_streaming_checkpoint(
             resume_from,
+            dataset=dataset,
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -511,12 +692,19 @@ def fit_neural_streaming(
             device=device,
             scientific_signature=signature,
         )
+        terminal_training_resume = (
+            epoch_phase == "training"
+            and cursor.shard_position == len(dataset.entries)
+            and cursor.batch_position == 0
+        )
     if stop_after_optimizer_step is not None and (
         isinstance(stop_after_optimizer_step, bool)
         or not isinstance(stop_after_optimizer_step, int)
         or stop_after_optimizer_step <= cursor.optimizer_step
     ):
         raise ValueError("stop_after_optimizer_step must exceed the current optimizer step")
+    if stop_after_optimizer_step is not None and checkpoint_path is None:
+        raise ValueError("stop_after_optimizer_step requires checkpoint_path")
     checkpoint_interval = int(training["checkpoint_every_steps"])
     patience = int(training["patience"])
     num_workers = int(training.get("num_workers", 0))
@@ -537,7 +725,9 @@ def fit_neural_streaming(
         try:
             for batch in iterator:
                 if batch.get("cursor") != cursor:
-                    raise RuntimeError("stream batch cursor does not match the next unapplied batch")
+                    raise RuntimeError(
+                        "stream batch cursor does not match the next unapplied batch"
+                    )
                 features = np.asarray(batch["features"], dtype=np.float32)
                 if indices is not None:
                     if indices and max(indices) >= features.shape[1]:
@@ -628,7 +818,21 @@ def fit_neural_streaming(
         if seen != dataset.row_count:
             raise RuntimeError("streaming partial row coverage does not match the train split")
         if epoch_phase == "training":
-            scheduler.step()
+            if terminal_training_resume:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=(
+                            r"Detected call of `lr_scheduler\.step\(\)` before "
+                            r"`optimizer\.step\(\)`\."
+                        ),
+                        category=UserWarning,
+                        module=r"torch\.optim\.lr_scheduler",
+                    )
+                    scheduler.step()
+                terminal_training_resume = False
+            else:
+                scheduler.step()
             epoch_phase = "validation"
             if checkpoint_path is not None:
                 _save_streaming_checkpoint(

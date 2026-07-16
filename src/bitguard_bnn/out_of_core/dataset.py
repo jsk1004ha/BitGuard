@@ -30,7 +30,7 @@ from bitguard_bnn.out_of_core.shard import SHARD_MANIFEST_SCHEMA
 from bitguard_bnn.preprocess import FeaturePreprocessor
 
 
-DATASET_ALGORITHM = "bitguard.deterministic-parquet-dataset.v1"
+DATASET_ALGORITHM = "bitguard.deterministic-parquet-dataset.v2"
 _PARTITIONS = frozenset({"train", "validation", "test"})
 _MANIFEST_SEMANTIC_FIELDS = (
     "schema_version",
@@ -671,11 +671,22 @@ def _ordered_chunks(
     if start_position == len(dataset.entries):
         return
     prefetch_factor = 2
+    loader_seed = int.from_bytes(
+        hashlib.sha256(
+            (
+                f"{DATASET_ALGORITHM}\0loader\0{dataset.seed}\0{dataset.epoch}"
+                f"\0{dataset.manifest_fingerprint}"
+            ).encode("utf-8")
+        ).digest()[:8],
+        "little",
+    )
+    loader_generator = torch.Generator().manual_seed(loader_seed)
     loader_options: dict[str, Any] = {
         "batch_size": None,
         "num_workers": num_workers,
         "collate_fn": _identity,
         "persistent_workers": False,
+        "generator": loader_generator,
     }
     if num_workers > 0:
         loader_options["prefetch_factor"] = prefetch_factor

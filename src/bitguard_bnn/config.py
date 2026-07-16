@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import random
 import subprocess
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +30,7 @@ DEFAULTS: dict[str, Any] = {
         "quantile_sketch_capacity": 200_000,
         "max_rows_per_file": None,
         "max_rows_per_class": None,
+        "max_loaded_rows": None,
         "drop_columns": [],
     },
     "split": {
@@ -80,6 +85,10 @@ DEFAULTS: dict[str, Any] = {
         "device": "auto",
         "amp": False,
         "gradient_clip": 5.0,
+        "checkpoint_every_epochs": 1,
+        "checkpoint_every_steps": 1000,
+        "shuffle_buffer_rows": 262144,
+        "resume_from": None,
         "selection_weights": {"macro_f1": 0.5, "macro_auprc": 0.3, "attack_recall": 0.2},
     },
     "cascade": {
@@ -124,6 +133,7 @@ DEFAULTS: dict[str, Any] = {
         "make_plots": True,
         "benchmark_warmup": 20,
         "benchmark_repeats": 100,
+        "fixed_fpr_targets": [1e-2, 1e-3],
     },
 }
 
@@ -152,6 +162,31 @@ def load_config(path: str | Path) -> dict[str, Any]:
     config["_project_root"] = str(project_root.resolve())
     validate_config(config)
     return config
+
+
+def _validated_selection_weights(value: Any) -> dict[str, float]:
+    expected = {"macro_f1", "macro_auprc", "attack_recall"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError(
+            "training.selection_weights must contain exactly macro_f1, "
+            "macro_auprc, and attack_recall"
+        )
+    normalized: dict[str, float] = {}
+    for name in expected:
+        weight = value[name]
+        if (
+            isinstance(weight, bool)
+            or not isinstance(weight, Real)
+            or not math.isfinite(float(weight))
+            or not 0.0 <= float(weight) <= 1.0
+        ):
+            raise ValueError("training.selection_weights values must be finite in [0, 1]")
+        normalized[name] = float(weight)
+    if not math.isclose(
+        sum(normalized.values()), 1.0, rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise ValueError("training.selection_weights must sum to 1.0")
+    return normalized
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -191,7 +226,8 @@ def validate_config(config: dict[str, Any]) -> None:
     ]
     if any(value <= 0 for value in fractions) or not np.isclose(sum(fractions), 1.0):
         raise ValueError("split fractions must be positive and sum to 1.0")
-    if config["split"]["strategy"] not in {
+    split_strategy = str(config["split"]["strategy"])
+    if split_strategy not in {
         "random",
         "device",
         "attack",
@@ -201,6 +237,10 @@ def validate_config(config: dict[str, Any]) -> None:
         "cross",
     }:
         raise ValueError("unsupported split.strategy")
+    if config["split"].get("held_out_attacks") and split_strategy != "attack":
+        raise ValueError("split.held_out_attacks requires split.strategy=attack")
+    if config["split"].get("held_out_devices") and split_strategy != "device":
+        raise ValueError("split.held_out_devices requires split.strategy=device")
     if config["preprocess"]["encoder"] not in {"none", "sign", "thermometer", "hybrid"}:
         raise ValueError("preprocess.encoder must be none/sign/thermometer/hybrid")
     bits = int(config["preprocess"]["thermometer_bits"])
@@ -216,17 +256,33 @@ def validate_config(config: dict[str, Any]) -> None:
         "xgboost",
     }:
         raise ValueError("unsupported model.type")
+    if config["model"]["type"] in {"fp32_mlp", "vanilla_bnn", "cost_aware_bnn"}:
+        hidden_dims = list(config["model"].get("hidden_dims", []))
+        if not hidden_dims or any(int(dimension) <= 0 for dimension in hidden_dims):
+            raise ValueError("model.hidden_dims must contain at least one positive dimension")
     thresholds = config["temporal"]["action_thresholds"]
     if len(thresholds) != 5 or list(thresholds) != sorted(thresholds):
         raise ValueError("temporal.action_thresholds must contain five increasing values")
-    selection_weights = config["training"].get("selection_weights", {})
-    if not np.isclose(sum(float(value) for value in selection_weights.values()), 1.0):
-        raise ValueError("training.selection_weights must sum to 1.0")
+    _validated_selection_weights(
+        config["training"].get("selection_weights", {})
+    )
     for device, risk in config["cascade"].get("device_criticality", {}).items():
         if not 0.0 <= float(risk) <= 1.0:
             raise ValueError(f"device criticality for {device!r} must be in [0, 1]")
     if int(config["temporal"].get("max_devices", 4096)) <= 0:
         raise ValueError("temporal.max_devices must be positive")
+    if int(config["training"].get("checkpoint_every_epochs", 1)) <= 0:
+        raise ValueError("training.checkpoint_every_epochs must be positive")
+    for name, default in (
+        ("checkpoint_every_steps", 1000),
+        ("shuffle_buffer_rows", 262144),
+    ):
+        value = config["training"].get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"training.{name} must be a positive integer")
+    for target in config["evaluation"].get("fixed_fpr_targets", []):
+        if not 0.0 < float(target) < 1.0:
+            raise ValueError("evaluation.fixed_fpr_targets must be between 0 and 1")
 
 
 def resolve_path(config: dict[str, Any], value: str | Path | None) -> Path | None:
@@ -240,6 +296,8 @@ def resolve_path(config: dict[str, Any], value: str | Path | None) -> Path | Non
 
 def seed_everything(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
+    if os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in {":4096:8", ":16:8"}:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     random.seed(seed)
     np.random.seed(seed)
     try:
@@ -248,7 +306,10 @@ def seed_everything(seed: int) -> None:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.use_deterministic_algorithms(True)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
     except ImportError:
         pass
 
@@ -299,7 +360,25 @@ def environment_manifest() -> dict[str, Any]:
         "platform": platform.platform(),
         "processor": platform.processor(),
         "git_commit": commit,
+        "packages": {},
+        "determinism": {
+            "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        },
     }
+    distributions = {
+        "numpy": "numpy",
+        "pandas": "pandas",
+        "scikit-learn": "scikit-learn",
+        "joblib": "joblib",
+        "PyYAML": "PyYAML",
+        "torch": "torch",
+    }
+    for key, distribution in distributions.items():
+        try:
+            manifest["packages"][key] = version(distribution)
+        except PackageNotFoundError:
+            manifest["packages"][key] = None
     try:
         import torch
 
@@ -310,6 +389,15 @@ def environment_manifest() -> dict[str, Any]:
                 "cuda_version": torch.version.cuda,
                 "cuda_device": (
                     torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+                ),
+                "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+                "cudnn_benchmark": (
+                    torch.backends.cudnn.benchmark if hasattr(torch.backends, "cudnn") else None
+                ),
+                "cudnn_deterministic": (
+                    torch.backends.cudnn.deterministic
+                    if hasattr(torch.backends, "cudnn")
+                    else None
                 ),
             }
         )
