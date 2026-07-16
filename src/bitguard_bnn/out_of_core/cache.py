@@ -110,6 +110,14 @@ class CacheLayout:
     def fingerprint(self) -> str:
         return _fingerprint(self.semantic_dict())
 
+    @property
+    def inference_base_fingerprint(self) -> str:
+        """Stable layout identity available before the inference contract exists."""
+
+        payload = self.semantic_dict()
+        payload.pop("inference_contract_fingerprint")
+        return _fingerprint(payload)
+
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "schema_version": _LAYOUT_SCHEMA,
@@ -749,10 +757,11 @@ def _prepare_inference_batch(
         "known_probabilities",
         "selected_values",
         "tiny_benign_probability",
-        "timestamp",
     ):
         if not np.all(np.isfinite(prepared[name])):
             raise ValueError(f"{name} must contain only finite values")
+    if np.any(np.isinf(prepared["timestamp"])):
+        raise ValueError("timestamp must not contain infinite values")
     for name in (
         "known_probabilities",
         "tiny_benign_probability",

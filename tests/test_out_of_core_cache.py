@@ -384,6 +384,11 @@ class CalibrationCacheTests(unittest.TestCase):
                 [[0.0, np.nan], [1.0, 2.0]], dtype=np.float32
             )
             invalid.append(nonfinite)
+            infinite_timestamp = self._inference_batch(0, 2)
+            infinite_timestamp["timestamp"] = np.asarray(
+                [0.0, np.inf], dtype=np.float64
+            )
+            invalid.append(infinite_timestamp)
             overflow = self._inference_batch(0, 2)
             overflow["device_id"] = ["x" * 13, "ok"]
             invalid.append(overflow)
@@ -396,6 +401,11 @@ class CalibrationCacheTests(unittest.TestCase):
                 self.assertEqual(cache.committed_rows, 0)
             with self.assertRaises(ValueError):
                 cache.commit_inference_range(0.0, self._inference_batch(0, 1))  # type: ignore[arg-type]
+            missing_timestamp = self._inference_batch(0, 2)
+            missing_timestamp["timestamp"] = np.full(2, np.nan, dtype=np.float64)
+            cache.commit_inference_range(0, missing_timestamp)
+            self.assertEqual(cache.committed_rows, 2)
+            self.assertTrue(np.isnan(cache.arrays["timestamp"][:2]).all())
             cache.close()
 
     def test_close_releases_windows_file_handles_for_recursive_delete(self) -> None:

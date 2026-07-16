@@ -68,7 +68,7 @@ def tune_boolean_fast_path(
 def apply_boolean_fast_path(frame: pd.DataFrame, thresholds: dict[str, float]) -> np.ndarray:
     if not thresholds:
         return np.zeros(len(frame), dtype=bool)
-    mask = np.ones(len(frame), dtype=bool)
+    mask: np.ndarray[Any, Any] = np.ones(len(frame), dtype=bool)
     for feature, threshold in thresholds.items():
         values = pd.to_numeric(frame[feature], errors="coerce").to_numpy()
         mask &= np.isfinite(values) & (values <= threshold)
@@ -147,6 +147,161 @@ def tune_exit_threshold(
     )
 
 
+class CascadeStreamRouter:
+    """Route already-ordered bounded batches while retaining temporal state."""
+
+    def __init__(
+        self,
+        probability_labels: list[str],
+        calibration: CascadeCalibration,
+        config: dict[str, Any],
+        attack_prior: np.ndarray | None = None,
+    ) -> None:
+        self.probability_labels = list(probability_labels)
+        self.calibration = calibration
+        self.config = config
+        self.machine = TemporalSecurityStateMachine(config)
+        cfg = config["cascade"]
+        self.use_temporal = bool(config["temporal"].get("enabled", False)) and bool(
+            cfg.get("use_temporal_state", True)
+        )
+        self.benign_index = self.probability_labels.index("benign")
+        self.unknown_index = self.probability_labels.index("unknown_like")
+        if attack_prior is None:
+            prior: np.ndarray[Any, Any] = np.ones(
+                len(self.probability_labels), dtype=np.float64
+            )
+        else:
+            prior = np.array(attack_prior, dtype=np.float64, copy=True)
+        if prior.shape != (len(self.probability_labels),):
+            raise ValueError("cascade attack prior must match probability_labels")
+        prior[[self.benign_index, self.unknown_index]] = 0.0
+        if not np.all(np.isfinite(prior)) or np.any(prior < 0.0) or prior.sum() <= 0:
+            raise ValueError("cascade attack prior needs at least one known attack class")
+        self.attack_prior = prior / prior.sum()
+        self.temporal_coefficient = float(cfg.get("temporal_penalty", 0.30))
+        self.device_default = float(cfg.get("device_criticality_default", 0.0))
+        self.criticality = {
+            str(key): float(value) for key, value in cfg.get("device_criticality", {}).items()
+        }
+        self.rows = 0
+        self.boolean_rows = 0
+        self.tiny_rows = 0
+        self.main_rows = 0
+        self.score_sum = 0.0
+
+    @staticmethod
+    def _timestamp(row: pd.Series) -> float | None:
+        timestamp = row.get("timestamp")
+        return float(timestamp) if timestamp is not None and pd.notna(timestamp) else None
+
+    @staticmethod
+    def _state_key(row: pd.Series) -> str:
+        return f"{row.get('source_file', 'default_episode')}::{row['device_id']}"
+
+    def replay_batch(
+        self, metadata: pd.DataFrame, routed_probabilities: np.ndarray
+    ) -> None:
+        """Rebuild temporal state from a durable routed prefix."""
+
+        probabilities = np.asarray(routed_probabilities, dtype=np.float32)
+        if len(metadata) != len(probabilities):
+            raise ValueError("cascade replay arrays have inconsistent lengths")
+        if probabilities.shape != (len(metadata), len(self.probability_labels)):
+            raise ValueError("cascade replay probabilities have an invalid shape")
+        if not self.use_temporal:
+            return
+        for index in range(len(metadata)):
+            row = metadata.iloc[index]
+            values = {
+                label: float(probabilities[index, position])
+                for position, label in enumerate(self.probability_labels)
+            }
+            self.machine.update(self._state_key(row), values, self._timestamp(row))
+
+    def route_batch(
+        self,
+        metadata: pd.DataFrame,
+        tiny_benign_probability: np.ndarray,
+        main_probabilities: np.ndarray,
+        boolean_fast_path: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Route a batch in its supplied order and retain state for the next batch."""
+
+        tiny = np.asarray(tiny_benign_probability)
+        main = np.asarray(main_probabilities)
+        if len(metadata) != len(tiny) or len(metadata) != len(main):
+            raise ValueError("cascade arrays have inconsistent lengths")
+        if main.shape != (len(metadata), len(self.probability_labels)):
+            raise ValueError("main_probabilities must match probability_labels")
+        boolean = (
+            np.zeros(len(metadata), dtype=bool)
+            if boolean_fast_path is None
+            else np.asarray(boolean_fast_path, dtype=bool)
+        )
+        if boolean.shape != (len(metadata),):
+            raise ValueError("boolean_fast_path must align with metadata")
+        output = np.zeros_like(main, dtype=np.float32)
+        stages: np.ndarray[Any, Any] = np.full(len(metadata), 2, dtype=np.int8)
+        scores: np.ndarray[Any, Any] = np.empty(len(metadata), dtype=np.float32)
+        for position in range(len(metadata)):
+            row = metadata.iloc[position]
+            state_key = self._state_key(row)
+            suspicion = self.machine.temporal_suspicion(state_key) if self.use_temporal else 0.0
+            timestamp = self._timestamp(row)
+            if boolean[position] and suspicion <= 0.0:
+                stages[position] = 0
+                output[position, self.benign_index] = 1.0
+                scores[position] = 1.0
+                if self.use_temporal:
+                    self.machine.update(state_key, {"benign": 1.0}, timestamp)
+                continue
+            score = exit_scores(
+                np.asarray([tiny[position]]),
+                temporal_risk=self.temporal_coefficient * suspicion,
+                device_risk=self.criticality.get(str(row["device_id"]), self.device_default),
+                false_negative_cost=self.calibration.false_negative_cost,
+            )[0]
+            scores[position] = score
+            if score >= self.calibration.exit_threshold:
+                stages[position] = 1
+                output[position, self.benign_index] = float(tiny[position])
+                output[position] += float(1.0 - tiny[position]) * self.attack_prior
+            else:
+                output[position] = main[position]
+            values = {
+                label: float(output[position, index])
+                for index, label in enumerate(self.probability_labels)
+            }
+            if self.use_temporal:
+                self.machine.update(state_key, values, timestamp)
+        self.rows += len(metadata)
+        self.boolean_rows += int(np.count_nonzero(stages == 0))
+        self.tiny_rows += int(np.count_nonzero(stages == 1))
+        self.main_rows += int(np.count_nonzero(stages == 2))
+        self.score_sum += float(scores.sum(dtype=np.float64))
+        return output, stages, scores
+
+    def summary(self) -> dict[str, Any]:
+        rows = max(self.rows, 1)
+        return {
+            "early_exit_ratio": float(self.tiny_rows / rows),
+            "boolean_fast_path_ratio": float(self.boolean_rows / rows),
+            "total_early_exit_ratio": float((self.boolean_rows + self.tiny_rows) / rows),
+            "main_model_ratio": float(self.main_rows / rows),
+            "mean_exit_score": float(self.score_sum / rows),
+            "temporal_state_read_before_route": True,
+            "temporal_state_enabled": self.use_temporal,
+            "early_exit_attack_residual": (
+                "distributed over known attack classes using train-only priors"
+            ),
+            "false_negative_cost_note": (
+                "Threshold is calibrated on the base score; runtime FN cost is applied afterward, "
+                "so it conservatively increases escalation."
+            ),
+        }
+
+
 def route_with_temporal_state(
     metadata: pd.DataFrame,
     tiny_benign_probability: np.ndarray,
@@ -161,89 +316,42 @@ def route_with_temporal_state(
 
     if len(metadata) != len(tiny_benign_probability) or len(metadata) != len(main_probabilities):
         raise ValueError("cascade arrays have inconsistent lengths")
-    machine = TemporalSecurityStateMachine(config)
-    cfg = config["cascade"]
-    use_temporal = bool(config["temporal"].get("enabled", False)) and bool(
-        cfg.get("use_temporal_state", True)
-    )
     order_frame = metadata.copy()
     order_frame["__position"] = np.arange(len(order_frame))
     if "timestamp" in order_frame and order_frame["timestamp"].notna().all():
-        order = order_frame.sort_values(["timestamp", "device_id", "__position"], kind="stable")[
-            "__position"
-        ].to_numpy()
+        order_columns = ["timestamp", "device_id"]
+        if "row_uid" in order_frame:
+            order_columns.append("row_uid")
+        order_columns.append("__position")
+        order = order_frame.sort_values(order_columns, kind="stable")["__position"].to_numpy()
     elif "sequence_index" in order_frame:
-        order = order_frame.sort_values(["device_id", "sequence_index", "__position"], kind="stable")[
-            "__position"
-        ].to_numpy()
+        order_columns = ["device_id", "sequence_index"]
+        if "row_uid" in order_frame:
+            order_columns.append("row_uid")
+        order_columns.append("__position")
+        order = order_frame.sort_values(order_columns, kind="stable")["__position"].to_numpy()
     else:
         order = np.arange(len(order_frame))
-    output = np.zeros_like(main_probabilities, dtype=np.float32)
-    exit_stage = np.full(len(metadata), 2, dtype=np.int8)
-    scores = np.empty(len(metadata), dtype=np.float32)
     boolean_fast_path = (
         np.zeros(len(metadata), dtype=bool)
         if boolean_fast_path is None
         else np.asarray(boolean_fast_path, dtype=bool)
     )
-    benign_index = probability_labels.index("benign")
-    unknown_index = probability_labels.index("unknown_like")
-    if attack_prior is None:
-        attack_prior = np.ones(len(probability_labels), dtype=np.float64)
-        attack_prior[[benign_index, unknown_index]] = 0.0
-    attack_prior = np.asarray(attack_prior, dtype=np.float64)
-    attack_prior[[benign_index, unknown_index]] = 0.0
-    if attack_prior.sum() <= 0:
-        raise ValueError("cascade attack prior needs at least one known attack class")
-    attack_prior /= attack_prior.sum()
-    temporal_coefficient = float(cfg.get("temporal_penalty", 0.30))
-    device_default = float(cfg.get("device_criticality_default", 0.0))
-    criticality = {str(key): float(value) for key, value in cfg.get("device_criticality", {}).items()}
-    for position in order:
-        row = order_frame.iloc[int(position)]
-        state_key = f"{row.get('source_file', 'default_episode')}::{row['device_id']}"
-        suspicion = machine.temporal_suspicion(state_key) if use_temporal else 0.0
-        timestamp = row.get("timestamp")
-        timestamp_value = float(timestamp) if timestamp is not None and pd.notna(timestamp) else None
-        if boolean_fast_path[position] and suspicion <= 0.0:
-            exit_stage[position] = 0
-            output[position, benign_index] = 1.0
-            scores[position] = 1.0
-            if use_temporal:
-                machine.update(state_key, {"benign": 1.0}, timestamp_value)
-            continue
-        score = exit_scores(
-            np.asarray([tiny_benign_probability[position]]),
-            temporal_risk=temporal_coefficient * suspicion,
-            device_risk=criticality.get(str(row["device_id"]), device_default),
-            false_negative_cost=calibration.false_negative_cost,
-        )[0]
-        scores[position] = score
-        if score >= calibration.exit_threshold:
-            exit_stage[position] = 1
-            output[position, benign_index] = float(tiny_benign_probability[position])
-            output[position] += float(1.0 - tiny_benign_probability[position]) * attack_prior
-        else:
-            output[position] = main_probabilities[position]
-        probabilities = {
-            label: float(output[position, index]) for index, label in enumerate(probability_labels)
-        }
-        if use_temporal:
-            machine.update(state_key, probabilities, timestamp_value)
-    summary = {
-        "early_exit_ratio": float(np.mean(exit_stage == 1)),
-        "boolean_fast_path_ratio": float(np.mean(exit_stage == 0)),
-        "total_early_exit_ratio": float(np.mean(exit_stage < 2)),
-        "main_model_ratio": float(np.mean(exit_stage == 2)),
-        "mean_exit_score": float(scores.mean()),
-        "temporal_state_read_before_route": True,
-        "temporal_state_enabled": use_temporal,
-        "early_exit_attack_residual": "distributed over known attack classes using train-only priors",
-        "false_negative_cost_note": (
-            "Threshold is calibrated on the base score; runtime FN cost is applied afterward, "
-            "so it conservatively increases escalation."
-        ),
-    }
+    router = CascadeStreamRouter(
+        probability_labels, calibration, config, attack_prior
+    )
+    ordered = np.asarray(order, dtype=np.int64)
+    ordered_output, ordered_stage, _ = router.route_batch(
+        order_frame.iloc[ordered].reset_index(drop=True),
+        np.asarray(tiny_benign_probability)[ordered],
+        np.asarray(main_probabilities)[ordered],
+        boolean_fast_path[ordered],
+    )
+    output = np.zeros_like(main_probabilities, dtype=np.float32)
+    exit_stage: np.ndarray[Any, Any] = np.full(len(metadata), 2, dtype=np.int8)
+    output[ordered] = ordered_output
+    exit_stage[ordered] = ordered_stage
+    summary = router.summary()
     return output, exit_stage, summary
 
 

@@ -296,7 +296,15 @@ class FeaturePreprocessor:
         )
         distance_ratio = distance / self.open_distance_threshold
         anomaly_strength = 1.0 / (1.0 + np.exp(-4.0 * (distance_ratio - 1.0)))
-        uncertainty = np.clip((confidence_threshold - max_probability) / confidence_threshold, 0.0, 1.0)
+        uncertainty = (
+            np.zeros_like(max_probability)
+            if confidence_threshold <= 0.0
+            else np.clip(
+                (confidence_threshold - max_probability) / confidence_threshold,
+                0.0,
+                1.0,
+            )
+        )
         unknown_score = np.clip(anomaly_strength * uncertainty, 0.0, 0.999)
         enabled = bool(self.config["preprocess"]["open_set"].get("enabled", True))
         is_unknown = enabled & (max_probability < confidence_threshold) & (distance >= self.open_distance_threshold)
