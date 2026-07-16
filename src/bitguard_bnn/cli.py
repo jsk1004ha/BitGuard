@@ -60,7 +60,7 @@ def main(
 
         frame = generate_demo(args.output.resolve(), args.rows, args.seed)
         print(json.dumps({"path": str(args.output.resolve()), "rows": len(frame)}, ensure_ascii=False))
-        return
+        return None
     if args.command == "stream-features":
         from .streaming import process_metadata_csv
 
@@ -73,31 +73,50 @@ def main(
             chunk_size=args.chunk_size,
         )
         print(json.dumps(result, ensure_ascii=False))
-        return
+        return None
     if args.command == "train":
         from .trainer import run_training
 
         run_dir = run_training(args.config)
         print(str(run_dir.resolve()))
-        return
+        return None
     if args.command == "export":
         from .export import export_run
 
         result = export_run(args.run.resolve(), args.output.resolve())
         print(json.dumps(result, ensure_ascii=False))
-        return
+        return None
     if args.command == "replay":
-        import pandas as pd
-
         from .config import load_config, save_json
-        from .state import replay_predictions
 
         config = load_config(args.run / "resolved_config.yaml")
-        predictions = pd.read_csv(args.run / "predictions.csv")
-        temporal, metrics = replay_predictions(predictions, config)
-        temporal.to_csv(args.run / "temporal_predictions.csv", index=False)
+        parquet_path = args.run / "predictions.parquet"
+        csv_path = args.run / "predictions.csv"
+        if parquet_path.exists():
+            from .out_of_core.replay import replay_parquet_predictions
+
+            metrics = replay_parquet_predictions(
+                parquet_path,
+                args.run / "temporal_predictions.parquet",
+                config,
+                temporary_directory=args.run / ".replay-temporary",
+            )
+        elif csv_path.exists():
+            import pandas as pd
+
+            from .state import replay_predictions
+
+            predictions = pd.read_csv(csv_path)
+            temporal, metrics = replay_predictions(predictions, config)
+            temporal.to_csv(args.run / "temporal_predictions.csv", index=False)
+        else:
+            parser.error(
+                f"run has neither predictions.parquet nor predictions.csv: {args.run}"
+            )
         save_json(metrics, args.run / "operational_metrics.json")
         print(json.dumps(metrics, ensure_ascii=False))
+        return 0
+    return None
 
 
 if __name__ == "__main__":

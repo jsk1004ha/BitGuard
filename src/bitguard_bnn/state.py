@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -109,6 +111,16 @@ class TemporalSecurityStateMachine:
         return float(np.clip(risk, 0.0, 1.0))
 
 
+def temporal_state_key(source_file: object, device_id: object) -> str:
+    """Encode an episode/device tuple without delimiter ambiguity."""
+
+    return json.dumps(
+        [str(source_file), str(device_id)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def replay_predictions(predictions: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
     required = {"device_id", "true_label", "predicted_label"}
     missing = required - set(predictions.columns)
@@ -131,35 +143,57 @@ def replay_predictions(predictions: pd.DataFrame, config: dict[str, Any]) -> tup
     machine = TemporalSecurityStateMachine(config)
     output_rows: list[dict[str, Any]] = []
     for row in replay.to_dict(orient="records"):
-        probabilities = {
-            column.removeprefix("prob_"): float(row[column]) for column in probability_columns
-        }
-        timestamp = row.get("timestamp")
-        timestamp_value = float(timestamp) if timestamp is not None and pd.notna(timestamp) else None
-        episode = str(row.get("source_file", "default_episode"))
-        state_key = f"{episode}::{row['device_id']}"
-        state, risk, action = machine.update(state_key, probabilities, timestamp_value)
-        result = dict(row)
-        result.update({f"state_{key}": value for key, value in asdict(state).items() if key != "last_timestamp"})
-        result["risk_score"] = risk
-        result["action_level"] = action
-        result["action"] = ACTION_NAMES[action]
-        if action < 2:
-            result["stateful_predicted_label"] = "benign"
-        elif row["predicted_label"] != "benign":
-            result["stateful_predicted_label"] = row["predicted_label"]
-        else:
-            dominant = max(
-                ("scan", "flood", "beacon", "unknown"), key=lambda name: getattr(state, name)
-            )
-            result["stateful_predicted_label"] = f"{dominant}_like"
-        output_rows.append(result)
+        output_rows.append(
+            replay_prediction_row(row, machine, probability_columns)
+        )
     result_frame = pd.DataFrame(output_rows).drop(columns=["__original_order"], errors="ignore")
     continuous = bool(result_frame.get("temporal_continuity", pd.Series(False)).all())
     metrics = operational_metrics(result_frame, has_real_time and continuous, continuous)
     metrics["temporal_state_device_evictions"] = machine.evictions
     metrics["temporal_state_peak_device_capacity"] = machine.max_devices
     return result_frame, metrics
+
+
+def replay_prediction_row(
+    row: dict[str, Any],
+    machine: TemporalSecurityStateMachine,
+    probability_columns: Sequence[str],
+) -> dict[str, Any]:
+    """Apply one ordered prediction while preserving temporal machine state."""
+
+    probabilities = {
+        column.removeprefix("prob_"): float(row[column])
+        for column in probability_columns
+    }
+    timestamp = row.get("timestamp")
+    timestamp_value = (
+        float(timestamp) if timestamp is not None and pd.notna(timestamp) else None
+    )
+    episode = str(row.get("source_file", "default_episode"))
+    state_key = temporal_state_key(episode, row["device_id"])
+    state, risk, action = machine.update(state_key, probabilities, timestamp_value)
+    result = dict(row)
+    result.update(
+        {
+            f"state_{key}": value
+            for key, value in asdict(state).items()
+            if key != "last_timestamp"
+        }
+    )
+    result["risk_score"] = risk
+    result["action_level"] = action
+    result["action"] = ACTION_NAMES[action]
+    if action < 2:
+        result["stateful_predicted_label"] = "benign"
+    elif row["predicted_label"] != "benign":
+        result["stateful_predicted_label"] = row["predicted_label"]
+    else:
+        dominant = max(
+            ("scan", "flood", "beacon", "unknown"),
+            key=lambda name: getattr(state, name),
+        )
+        result["stateful_predicted_label"] = f"{dominant}_like"
+    return result
 
 
 def operational_metrics(
