@@ -13,7 +13,9 @@ class SignSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, values: Tensor) -> Tensor:
         ctx.save_for_backward(values)
-        return torch.where(values >= 0, torch.ones_like(values), -torch.ones_like(values))
+        return torch.where(
+            values >= 0, torch.ones_like(values), -torch.ones_like(values)
+        )
 
     @staticmethod
     def backward(ctx: Any, gradient: Tensor) -> tuple[Tensor]:
@@ -51,7 +53,9 @@ class FeatureGate(nn.Module):
         if groups.min(initial=0) < 0 or groups.max(initial=-1) >= len(costs):
             raise ValueError("input group index is outside group_costs")
         self.register_buffer("input_groups", torch.from_numpy(groups))
-        self.register_buffer("group_costs", torch.from_numpy(costs / max(float(costs.sum()), 1e-12)))
+        self.register_buffer(
+            "group_costs", torch.from_numpy(costs / max(float(costs.sum()), 1e-12))
+        )
         self.logits = nn.Parameter(torch.full((len(costs),), 2.0))
         self.temperature = float(temperature)
 
@@ -72,7 +76,13 @@ class FeatureGate(nn.Module):
 
 
 class FP32MLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: list[int], output_dim: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list[int],
+        output_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         layers: list[nn.Module] = []
         previous = input_dim
@@ -108,7 +118,9 @@ class BNNClassifier(nn.Module):
         self.blocks = nn.ModuleList()
         previous = input_dim
         for index, width in enumerate(hidden_dims):
-            linear_type: type[nn.Linear] = BinaryLinear if (index > 0 or binary_first_layer) else nn.Linear
+            linear_type: type[nn.Linear] = (
+                BinaryLinear if (index > 0 or binary_first_layer) else nn.Linear
+            )
             self.blocks.append(
                 nn.Sequential(
                     linear_type(previous, width, bias=False),
@@ -184,13 +196,61 @@ def clamp_binary_master_weights(model: nn.Module) -> None:
                 module.weight.clamp_(-1.0, 1.0)
 
 
+def classifier_active_inputs(model: nn.Module) -> tuple[np.ndarray, np.ndarray]:
+    """Return hard-selected feature groups and their encoded classifier columns."""
+
+    gate = getattr(model, "feature_gate", None)
+    if gate is None:
+        if hasattr(model, "blocks") and len(model.blocks):
+            input_dim = int(model.blocks[0][0].in_features)
+        elif hasattr(model, "network") and len(model.network):
+            input_dim = int(model.network[0].in_features)
+        else:
+            raise ValueError("cannot determine model input dimension")
+        indices: np.ndarray = np.arange(input_dim, dtype=np.int64)
+        return indices.copy(), indices
+    probabilities = gate.probabilities().detach().cpu().numpy()
+    groups = gate.input_groups.detach().cpu().numpy().astype(np.int64, copy=False)
+    active_groups: np.ndarray = np.flatnonzero(probabilities >= 0.5).astype(np.int64)
+    active_inputs: np.ndarray = np.flatnonzero(np.isin(groups, active_groups)).astype(
+        np.int64
+    )
+    return active_groups, active_inputs
+
+
+def feature_gate_summary(model: nn.Module) -> dict[str, Any]:
+    gate = getattr(model, "feature_gate", None)
+    if gate is None:
+        return {"feature_gate_enabled": False}
+    active_groups, active_inputs = classifier_active_inputs(model)
+    probabilities = gate.probabilities().detach().cpu().numpy()
+    return {
+        "feature_gate_enabled": True,
+        "feature_groups": int(len(probabilities)),
+        "active_groups": int(len(active_groups)),
+        "active_encoded_inputs": int(len(active_inputs)),
+        "active_group_indices": active_groups.tolist(),
+        "gate_probabilities": probabilities.astype(float).tolist(),
+    }
+
+
 def parameter_summary(model: nn.Module) -> dict[str, int]:
     parameters = sum(parameter.numel() for parameter in model.parameters())
-    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    parameter_bytes = sum(parameter.numel() * parameter.element_size() for parameter in model.parameters())
-    buffer_bytes = sum(buffer.numel() * buffer.element_size() for buffer in model.buffers())
+    trainable = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    parameter_bytes = sum(
+        parameter.numel() * parameter.element_size() for parameter in model.parameters()
+    )
+    buffer_bytes = sum(
+        buffer.numel() * buffer.element_size() for buffer in model.buffers()
+    )
     fp32_bytes = parameter_bytes + buffer_bytes
-    binary_weights = sum(module.weight.numel() for module in model.modules() if isinstance(module, BinaryLinear))
+    binary_weights = sum(
+        module.weight.numel()
+        for module in model.modules()
+        if isinstance(module, BinaryLinear)
+    )
     packed_binary_bytes = (binary_weights + 7) // 8
     nonbinary_bytes = fp32_bytes - binary_weights * 4
     return {
@@ -199,5 +259,7 @@ def parameter_summary(model: nn.Module) -> dict[str, int]:
         "pytorch_tensor_bytes_parameters_and_buffers": int(fp32_bytes),
         "buffer_bytes_included": int(buffer_bytes),
         "binary_weight_count": int(binary_weights),
-        "estimated_packed_inference_bytes": int(packed_binary_bytes + max(nonbinary_bytes, 0)),
+        "estimated_packed_inference_bytes": int(
+            packed_binary_bytes + max(nonbinary_bytes, 0)
+        ),
     }
