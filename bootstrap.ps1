@@ -3,7 +3,7 @@ $pythonCommand = $null
 $pythonArguments = @()
 
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    foreach ($version in @("-3.12", "-3.11")) {
+    foreach ($version in @("-3.12", "-3.11", "-3.10")) {
         & py $version -c "import sys" *> $null
         if ($LASTEXITCODE -eq 0) {
             $pythonCommand = "py"

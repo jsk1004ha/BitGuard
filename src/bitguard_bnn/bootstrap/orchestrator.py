@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TypedDict, cast
+from typing import Any, TypedDict, cast
 
 from .cleanup import inspection_command, scan_cleanup_debt
 from .download import DownloadResult, download_file
@@ -152,6 +152,8 @@ class BootstrapDependencies:
     nbaiot_download_size: int | None = None
     available_bytes: int | None = None
     preparation_available_bytes: int | None = None
+    training_available_bytes: int | None = None
+    training_available_ram_bytes: int | None = None
     downloader: Callable[..., DownloadResult] = download_file
     zip_extractor: Callable[..., ExtractionResult] = extract_zip
     rar_extractor: Callable[..., ExtractionResult] = extract_rar
@@ -589,6 +591,267 @@ def _verified_completed_training_status(
         return expected
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class _TrainingResume:
+    path: Path
+    locator: dict[str, object]
+    device_type: str
+
+
+def _run_directory_identity(path: Path) -> dict[str, int]:
+    observed = path.lstat()
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or _is_reparse_point(observed)
+        or not stat.S_ISDIR(observed.st_mode)
+    ):
+        raise RuntimeError(f"training run must be a non-link directory: {path}")
+    return {
+        "device": int(observed.st_dev),
+        "inode": int(observed.st_ino),
+        "file_type": int(stat.S_IFMT(observed.st_mode)),
+        "file_attributes": int(getattr(observed, "st_file_attributes", 0)),
+    }
+
+
+def _checkpoint_locator(run_dir: Path, checkpoint: Path) -> dict[str, object]:
+    return {
+        "path": str(checkpoint),
+        "run": str(run_dir),
+        "run_identity": _run_directory_identity(run_dir),
+    }
+
+
+def _validate_checkpoint_locator(
+    value: object,
+    *,
+    runs_root: Path,
+    expected_descriptor_fingerprint: str,
+) -> _TrainingResume:
+    base_fields = {"path", "run", "run_identity"}
+    integrity_fields = {"sha256", "bytes"}
+    if not isinstance(value, Mapping):
+        raise RuntimeError("training resume checkpoint locator is invalid")
+    fields = frozenset(value)
+    if fields not in {
+        frozenset(base_fields),
+        frozenset(base_fields | integrity_fields),
+    }:
+        raise RuntimeError("training resume checkpoint locator is invalid")
+    path_value = value.get("path")
+    run_value = value.get("run")
+    identity_value = value.get("run_identity")
+    if not isinstance(path_value, str) or not isinstance(run_value, str):
+        raise RuntimeError("training resume checkpoint locator is invalid")
+    run_dir = Path(run_value)
+    checkpoint = Path(path_value)
+    root = runs_root.resolve(strict=True)
+    resolved_run = run_dir.resolve(strict=True)
+    try:
+        resolved_run.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError("training resume run escapes runs_root") from error
+    if resolved_run != Path(os.path.abspath(run_dir)):
+        raise RuntimeError("training resume run locator is not canonical")
+    actual_identity = _run_directory_identity(run_dir)
+    if (
+        not isinstance(identity_value, Mapping)
+        or dict(identity_value) != actual_identity
+    ):
+        raise RuntimeError("training resume run identity changed")
+    expected_checkpoint = run_dir / "last_training_state.pt"
+    if Path(os.path.abspath(checkpoint)) != Path(os.path.abspath(expected_checkpoint)):
+        raise RuntimeError("training resume checkpoint has an unexpected locator")
+
+    before = _artifact_path_snapshot(run_dir, checkpoint)
+    checkpoint_sha256, checkpoint_bytes = _artifact_digest(run_dir, checkpoint)
+    if integrity_fields.issubset(value) and (
+        value.get("sha256") != checkpoint_sha256
+        or value.get("bytes") != checkpoint_bytes
+    ):
+        raise RuntimeError("training resume checkpoint integrity changed")
+    from bitguard_bnn.trainer import _safe_torch_load
+
+    import torch
+
+    state = _safe_torch_load(
+        checkpoint,
+        torch.device("cpu"),
+        expected_sha256=checkpoint_sha256,
+        expected_bytes=checkpoint_bytes,
+    )
+    after = _artifact_path_snapshot(run_dir, checkpoint)
+    if before != after:
+        raise RuntimeError("training resume checkpoint changed while it was verified")
+    signature = state.get("scientific_signature")
+    transform = (
+        signature.get("training_transform") if isinstance(signature, Mapping) else None
+    )
+    device_type = state.get("device_type")
+    if (
+        state.get("format_version") != 4
+        or not isinstance(signature, Mapping)
+        or signature.get("prepared_descriptor_fingerprint")
+        != expected_descriptor_fingerprint
+        or not isinstance(transform, Mapping)
+        or transform.get("role") != "main"
+        or device_type not in {"cpu", "cuda", "mps"}
+    ):
+        raise RuntimeError(
+            "training resume checkpoint is incompatible with the prepared dataset"
+        )
+    return _TrainingResume(
+        path=checkpoint,
+        locator={
+            **_checkpoint_locator(run_dir, checkpoint),
+            "sha256": checkpoint_sha256,
+            "bytes": checkpoint_bytes,
+        },
+        device_type=cast(str, device_type),
+    )
+
+
+def _resume_checkpoint_from_status(
+    value: object,
+    *,
+    runs_root: Path,
+    expected_descriptor_fingerprint: str,
+) -> _TrainingResume | None:
+    if not isinstance(value, Mapping) or value.get("status") not in {
+        "running",
+        "failed",
+    }:
+        return None
+    active = value.get("active_checkpoint")
+    if active is not None:
+        if not isinstance(active, Mapping):
+            raise RuntimeError("training active checkpoint locator is invalid")
+        active_path = active.get("path")
+        if not isinstance(active_path, str):
+            raise RuntimeError("training active checkpoint locator is invalid")
+        if os.path.lexists(active_path):
+            return _validate_checkpoint_locator(
+                active,
+                runs_root=runs_root,
+                expected_descriptor_fingerprint=expected_descriptor_fingerprint,
+            )
+
+    resume = value.get("resume_checkpoint")
+    if resume is None:
+        return None
+    return _validate_checkpoint_locator(
+        resume,
+        runs_root=runs_root,
+        expected_descriptor_fingerprint=expected_descriptor_fingerprint,
+    )
+
+
+def _persisted_training_resume(
+    value: object,
+    *,
+    runs_root: Path,
+) -> _TrainingResume | None:
+    if not isinstance(value, Mapping):
+        return None
+    fingerprint = value.get("prepared_descriptor_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return None
+    return _resume_checkpoint_from_status(
+        value,
+        runs_root=runs_root,
+        expected_descriptor_fingerprint=fingerprint,
+    )
+
+
+def _verified_training_resume(
+    dataset: str,
+    descriptor: Path,
+    prepared_descriptor_fingerprint: str,
+    value: object,
+    *,
+    runs_root: Path,
+) -> _TrainingResume | None:
+    if not isinstance(value, Mapping) or value.get("status") not in {
+        "running",
+        "failed",
+    }:
+        return None
+    # Failures before the run-created callback have no resumable locator.
+    if "active_checkpoint" not in value:
+        return None
+    descriptor_digest = _regular_digest(descriptor)
+    if (
+        value.get("dataset") != dataset
+        or value.get("descriptor") != str(descriptor)
+        or value.get("descriptor_sha256") != descriptor_digest[0]
+        or value.get("descriptor_bytes") != descriptor_digest[1]
+        or value.get("prepared_descriptor_fingerprint")
+        != prepared_descriptor_fingerprint
+    ):
+        return None
+
+    return _resume_checkpoint_from_status(
+        value,
+        runs_root=runs_root,
+        expected_descriptor_fingerprint=prepared_descriptor_fingerprint,
+    )
+
+
+def _running_training_status(
+    dataset: str,
+    descriptor: Path,
+    prepared_descriptor_fingerprint: str,
+    event: Mapping[str, object],
+    *,
+    runs_root: Path,
+    resume: _TrainingResume | None,
+) -> dict[str, object]:
+    if (
+        event.get("status") != "run_created"
+        or event.get("dataset") != dataset
+        or event.get("prepared_descriptor") != str(descriptor)
+        or event.get("prepared_descriptor_fingerprint")
+        != prepared_descriptor_fingerprint
+    ):
+        raise RuntimeError("training run-created progress contract is invalid")
+    run_value = event.get("run_dir")
+    active_value = event.get("active_checkpoint")
+    if not isinstance(run_value, str) or not isinstance(active_value, str):
+        raise RuntimeError("training run-created progress locators are invalid")
+    run_dir = Path(run_value)
+    active_checkpoint = Path(active_value)
+    root = runs_root.resolve(strict=True)
+    resolved_run = run_dir.resolve(strict=True)
+    try:
+        resolved_run.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError("training active run escapes runs_root") from error
+    if resolved_run != Path(os.path.abspath(run_dir)):
+        raise RuntimeError("training active run locator is not canonical")
+    _artifact_path_snapshot(root, run_dir, final_directory=True)
+    expected_active = run_dir / "last_training_state.pt"
+    if Path(os.path.abspath(active_checkpoint)) != Path(
+        os.path.abspath(expected_active)
+    ):
+        raise RuntimeError("training active checkpoint locator is invalid")
+    expected_resume = None if resume is None else str(resume.path.resolve(strict=True))
+    event_resume = event.get("resume_checkpoint")
+    if event_resume != expected_resume:
+        raise RuntimeError("training run-created resume locator changed unexpectedly")
+    descriptor_sha256, descriptor_bytes = _regular_digest(descriptor)
+    return {
+        "status": "running",
+        "dataset": dataset,
+        "descriptor": str(descriptor),
+        "descriptor_sha256": descriptor_sha256,
+        "descriptor_bytes": descriptor_bytes,
+        "prepared_descriptor_fingerprint": prepared_descriptor_fingerprint,
+        "run": str(run_dir),
+        "resume_checkpoint": None if resume is None else dict(resume.locator),
+        "active_checkpoint": _checkpoint_locator(run_dir, active_checkpoint),
+    }
 
 
 def _tree_digest(path: Path) -> tuple[str, int, tuple[Path, ...]]:
@@ -1399,11 +1662,183 @@ def _nested_rars(root: Path) -> tuple[Path, ...]:
     )
 
 
-def _recovery(stage: str | None) -> str:
+def _error_messages(error: BaseException | None) -> tuple[str, ...]:
+    messages: list[str] = []
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(str(current).casefold())
+        current = current.__cause__ or current.__context__
+    return tuple(messages)
+
+
+def _cuda_environment_validation_failure(error: BaseException | None) -> bool:
+    if error is None:
+        return False
+    message = "\n".join(_error_messages(error))
+    return any(
+        marker in message
+        for marker in (
+            "cuda profile verification failed",
+            "torch cuda is unavailable",
+            "nvidia driver/gpu is required for requested compute profile",
+            "no compatible cuda profile",
+            "torch cuda build version verification failed",
+            "torch tensor allocation verification failed on cuda:",
+            "torch tensor operation verification failed on cuda:",
+            "cuda device-name verification failed",
+            "cuda synchronization verification failed",
+        )
+    )
+
+
+def _compute_uses_cuda(compute: Mapping[str, object] | None) -> bool:
+    if not isinstance(compute, Mapping):
+        return False
+    nested = compute.get("compute")
+    facts = nested if isinstance(nested, Mapping) else compute
+    profile = facts.get("selected_profile")
+    device = facts.get("device")
+    return (
+        isinstance(profile, str) and profile.casefold() in {"cu118", "cu124", "cuda"}
+    ) or (isinstance(device, str) and device.casefold().startswith("cuda:"))
+
+
+def _compute_uses_cpu(compute: Mapping[str, object] | None) -> bool:
+    if not isinstance(compute, Mapping):
+        return False
+    nested = compute.get("compute")
+    facts = nested if isinstance(nested, Mapping) else compute
+    profile = facts.get("selected_profile")
+    device = facts.get("device")
+    return (isinstance(profile, str) and profile.casefold() == "cpu") or (
+        isinstance(device, str) and device.casefold() == "cpu"
+    )
+
+
+def _cuda_runtime_failure(error: BaseException | None) -> bool:
+    if error is None:
+        return False
+    error_type = type(error)
+    qualified_type = f"{error_type.__module__}.{error_type.__name__}".casefold()
+    if "cuda" in qualified_type and "outofmemory" in qualified_type:
+        return True
+    message = "\n".join(_error_messages(error))
+    return any(
+        marker in message
+        for marker in (
+            "cuda out of memory",
+            "cuda error:",
+            "cuda synchronization",
+            "cuda device-name",
+            "torch cuda build version",
+            "torch tensor allocation verification failed on cuda:",
+            "torch tensor operation verification failed on cuda:",
+            "cudnn",
+            "cublas",
+            "cusolver",
+            "nvrtc",
+            "gpu allocation",
+            "device-side assert",
+            "invalid device ordinal",
+            "no kernel image",
+        )
+    )
+
+
+def _training_resume_reset_required(error: BaseException | None) -> bool:
+    semantic_markers = (
+        "corrupt",
+        "incompatible",
+        "integrity",
+        "invalid",
+        "changed",
+        "unsafe",
+        "not a safe tensor payload",
+        "unexpected locator",
+        "escapes runs_root",
+        "unbound",
+        "unsupported",
+        "mismatch",
+        "inconsistent",
+        "out of range",
+        "non-finite",
+        "does not match",
+        "must match",
+        "must be a mapping",
+        "must be a regular file",
+        "must be a single-link",
+        "must not be a link",
+        "not canonical",
+        "recursive",
+        "is not a completed epoch prefix",
+        "requires independently verified teacher identity",
+        "precedes the resume checkpoint",
+    )
+    for message in _error_messages(error):
+        if any(
+            scope in message
+            for scope in (
+                "streaming checkpoint",
+                "training checkpoint",
+                "resume checkpoint",
+            )
+        ) and any(marker in message for marker in semantic_markers):
+            return True
+        if message in (
+            "completed history requires a best model state",
+            "streaming train epoch row coverage is incomplete",
+            "training.epochs must match the checkpoint target; resume an interrupted "
+            "run with its original total epoch count",
+        ):
+            return True
+    return False
+
+
+def _recovery(
+    stage: str | None,
+    error: BaseException | None = None,
+    compute: Mapping[str, object] | None = None,
+) -> str:
     if stage is None or stage not in STAGE_ORDER:
         return (
             "Inspect the bootstrap report, correct the input or resource error, and "
             "rerun the original command."
+        )
+    if stage == "environment" and _cuda_environment_validation_failure(error):
+        return (
+            "Inspect the failed CUDA/runtime profile, then explicitly retry on CPU "
+            "with the original command plus --compute cpu --restart-stage environment."
+        )
+    if stage == "environment":
+        return (
+            "Inspect the environment-stage error, correct it, then rerun the original "
+            "command with --restart-stage environment."
+        )
+    if (
+        stage == "train"
+        and _compute_uses_cuda(compute)
+        and _cuda_runtime_failure(error)
+    ):
+        return (
+            "CUDA training failed after a CUDA runtime was selected. To avoid loading "
+            "an incompatible CUDA optimizer checkpoint on CPU, rerun the original "
+            "command with --compute cpu --restart-stage train. This deliberately "
+            "starts fresh training and gives up automatic optimizer/cache resume for "
+            "the failed training stage."
+        )
+    if stage == "train" and _training_resume_reset_required(error):
+        return (
+            "The retained training resume checkpoint is corrupt or incompatible. "
+            "After inspecting the report, rerun the original command with "
+            "--restart-stage train; this deliberately starts training from scratch."
+        )
+    if stage == "train":
+        return (
+            "Inspect retained artifacts and correct the reported cause, then rerun "
+            "the original command unchanged so automatic optimizer/cache resume is "
+            "preserved."
         )
     return (
         "Inspect retained artifacts and correct the reported cause, then rerun the "
@@ -1531,7 +1966,9 @@ def run_bootstrap(
             "lock_release_error": (
                 None if lock_release_error is None else _safe_error(lock_release_error)
             ),
-            "recovery_command": _recovery(failed_stage) if error is not None else None,
+            "recovery_command": (
+                _recovery(failed_stage, error, compute) if error is not None else None
+            ),
             "inputs": {"original": original, "resolved": options.to_dict()},
             "compute": compute,
             "state": str(state_path),
@@ -1676,7 +2113,10 @@ def run_bootstrap(
     final_status = "failed"
     lock: BootstrapWriterLock | None = None
     try:
-        lock = BootstrapWriterLock(lock_path)
+        # A hard process exit cannot release the cooperative lock. Recovery is
+        # still fail-closed for active or foreign-host owners; the lock class only
+        # reclaims an exact, well-formed same-host record whose PID is absent.
+        lock = BootstrapWriterLock(lock_path, recover_stale=True)
         lock.acquire()
         try:
             lock_entered = True
@@ -2660,6 +3100,23 @@ def run_bootstrap(
                         descriptor = prepared_descriptor_path(dataset)
                         prepared = verifier(descriptor)
                         try:
+                            if options.restart_stage != "train" and _compute_uses_cpu(
+                                compute
+                            ):
+                                prior_resume = _persisted_training_resume(
+                                    persisted_statuses.get(dataset),
+                                    runs_root=options.runs_root,
+                                )
+                                if (
+                                    prior_resume is not None
+                                    and prior_resume.device_type == "cuda"
+                                ):
+                                    raise RuntimeError(
+                                        "streaming checkpoint device type mismatch: "
+                                        "the persisted optimizer checkpoint was created "
+                                        "on CUDA; explicitly restart fresh training with "
+                                        "--compute cpu --restart-stage train"
+                                    )
                             completed = _verified_completed_training_status(
                                 dataset, descriptor, persisted_statuses.get(dataset)
                             )
@@ -2670,6 +3127,30 @@ def run_bootstrap(
                                 write_training_report("running")
                                 continue
                             if deps.trainer is None:
+                                prepared_payload = (
+                                    prepared.to_dict()
+                                    if hasattr(prepared, "to_dict")
+                                    else None
+                                )
+                                prepared_fingerprint = (
+                                    prepared_payload.get("fingerprint")
+                                    if isinstance(prepared_payload, Mapping)
+                                    else None
+                                )
+                                if (
+                                    not isinstance(prepared_fingerprint, str)
+                                    or not prepared_fingerprint
+                                ):
+                                    raise RuntimeError(
+                                        "verified prepared descriptor has no fingerprint"
+                                    )
+                                resume = _verified_training_resume(
+                                    dataset,
+                                    descriptor,
+                                    prepared_fingerprint,
+                                    persisted_statuses.get(dataset),
+                                    runs_root=options.runs_root,
+                                )
                                 resolved_value = getattr(
                                     prepared, "resolved_config_path", None
                                 )
@@ -2682,10 +3163,48 @@ def run_bootstrap(
                                 training_config["experiment"]["output_dir"] = str(
                                     options.runs_root
                                 )
+                                if resume is not None:
+                                    training_config["training"]["resume_from"] = str(
+                                        resume.path
+                                    )
+
+                                def record_progress(
+                                    event: dict[str, object],
+                                ) -> None:
+                                    dataset_statuses[dataset] = (
+                                        _running_training_status(
+                                            dataset,
+                                            descriptor,
+                                            prepared_fingerprint,
+                                            event,
+                                            runs_root=options.runs_root,
+                                            resume=resume,
+                                        )
+                                    )
+                                    write_training_report("running")
+
+                                training_runtime_options: dict[str, Any] = {}
+                                if resume is not None:
+                                    training_runtime_options[
+                                        "resume_checkpoint_integrity"
+                                    ] = {
+                                        "sha256": resume.locator["sha256"],
+                                        "bytes": resume.locator["bytes"],
+                                    }
+                                if deps.training_available_bytes is not None:
+                                    training_runtime_options["available_disk_bytes"] = (
+                                        deps.training_available_bytes
+                                    )
+                                if deps.training_available_ram_bytes is not None:
+                                    training_runtime_options["available_ram_bytes"] = (
+                                        deps.training_available_ram_bytes
+                                    )
                                 run_value: object = run_out_of_core_training(
                                     resolved_path,
                                     config=training_config,
                                     prepared_descriptor_path=descriptor,
+                                    progress_callback=record_progress,
+                                    **training_runtime_options,
                                 )
                             else:
                                 run_value = deps.trainer(
@@ -2716,11 +3235,22 @@ def run_bootstrap(
                             )
                             write_training_report("running")
                         except BaseException as error:
-                            dataset_statuses[dataset] = {
-                                "status": "failed",
-                                "descriptor": str(descriptor),
-                                "error": _safe_error(error),
-                            }
+                            current = dataset_statuses.get(dataset)
+                            if (
+                                isinstance(current, Mapping)
+                                and current.get("status") == "running"
+                            ):
+                                dataset_statuses[dataset] = {
+                                    **dict(current),
+                                    "status": "failed",
+                                    "error": _safe_error(error),
+                                }
+                            else:
+                                dataset_statuses[dataset] = {
+                                    "status": "failed",
+                                    "descriptor": str(descriptor),
+                                    "error": _safe_error(error),
+                                }
                             write_training_report("failed")
                             raise
                     write_training_report("completed")

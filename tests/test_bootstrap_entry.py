@@ -1,4 +1,7 @@
+import os
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,7 +13,12 @@ class BootstrapEntryTest(unittest.TestCase):
     def test_build_command_forwards_full_source_and_license(self):
         command = bootstrap.build_package_command(
             Path(".venv"),
-            ["--full", "--botiot-source", "input.zip", "--accept-botiot-academic-license"],
+            [
+                "--full",
+                "--botiot-source",
+                "input.zip",
+                "--accept-botiot-academic-license",
+            ],
         )
         self.assertEqual(
             command[-5:],
@@ -68,18 +76,24 @@ class BootstrapEntryTest(unittest.TestCase):
             self.assertEqual(bootstrap._detect_torch_profile(), "cpu")
 
     def test_auto_compute_rejects_broken_nvidia_smi_executable(self):
-        with patch("scripts.bootstrap.subprocess.run", side_effect=OSError("probe failure")):
+        with patch(
+            "scripts.bootstrap.subprocess.run", side_effect=OSError("probe failure")
+        ):
             with self.assertRaisesRegex(RuntimeError, "CUDA detection failed"):
                 bootstrap._detect_torch_profile()
 
     def test_auto_compute_rejects_failed_nvidia_smi_probe(self):
-        result = subprocess.CompletedProcess([], 9, stdout="", stderr="driver unavailable")
+        result = subprocess.CompletedProcess(
+            [], 9, stdout="", stderr="driver unavailable"
+        )
         with patch("scripts.bootstrap.subprocess.run", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "refusing to downgrade to CPU"):
                 bootstrap._detect_torch_profile()
 
     def test_auto_compute_rejects_malformed_nvidia_smi_output(self):
-        result = subprocess.CompletedProcess([], 0, stdout="NVIDIA-SMI without CUDA", stderr="")
+        result = subprocess.CompletedProcess(
+            [], 0, stdout="NVIDIA-SMI without CUDA", stderr=""
+        )
         with patch("scripts.bootstrap.subprocess.run", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "did not report a CUDA version"):
                 bootstrap._detect_torch_profile()
@@ -100,7 +114,9 @@ class BootstrapEntryTest(unittest.TestCase):
                     stderr="",
                 )
                 with patch("scripts.bootstrap.subprocess.run", return_value=result):
-                    self.assertEqual(bootstrap._detect_torch_profile(), expected_profile)
+                    self.assertEqual(
+                        bootstrap._detect_torch_profile(), expected_profile
+                    )
 
     def test_auto_compute_rejects_cuda_below_cu118_threshold(self):
         result = subprocess.CompletedProcess(
@@ -110,7 +126,9 @@ class BootstrapEntryTest(unittest.TestCase):
             stderr="",
         )
         with patch("scripts.bootstrap.subprocess.run", return_value=result):
-            with self.assertRaisesRegex(RuntimeError, "below the supported cu118 profile"):
+            with self.assertRaisesRegex(
+                RuntimeError, "below the supported cu118 profile"
+            ):
                 bootstrap._detect_torch_profile()
 
     def test_cuda_verification_runs_allocation_kernel_and_synchronization(self):
@@ -125,13 +143,20 @@ class BootstrapEntryTest(unittest.TestCase):
         self.assertIn("torch.cuda.synchronize()", verification)
 
     def test_cuda_verification_propagates_probe_failure(self):
-        result = subprocess.CompletedProcess([], 1, stdout="", stderr="kernel launch failed")
+        result = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="kernel launch failed"
+        )
         with patch("scripts.bootstrap.subprocess.run", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "kernel launch failed"):
                 bootstrap._verify_torch_profile(Path(".venv"), "cu118")
 
     def _exercise_main(
-        self, *, environment_exists: bool = True, package_exit_status: int = 0
+        self,
+        *,
+        environment_exists: bool = True,
+        package_exit_status: int = 0,
+        arguments: list[str] | None = None,
+        detected_profile: str = "cu124",
     ) -> tuple[int, list[tuple[str, object]]]:
         events: list[tuple[str, object]] = []
 
@@ -151,13 +176,22 @@ class BootstrapEntryTest(unittest.TestCase):
 
         with (
             patch("scripts.bootstrap.validate_python_version"),
+            patch(
+                "scripts.bootstrap._detect_torch_profile",
+                return_value=detected_profile,
+            ),
             patch.object(Path, "exists", return_value=environment_exists),
-            patch("scripts.bootstrap.validate_virtual_environment", side_effect=record_validate),
+            patch(
+                "scripts.bootstrap.validate_virtual_environment",
+                side_effect=record_validate,
+            ),
             patch("scripts.bootstrap._verify_torch_profile", side_effect=record_verify),
             patch("scripts.bootstrap.subprocess.run", side_effect=record_run),
             patch("scripts.bootstrap.subprocess.call", side_effect=record_handoff),
         ):
-            status = bootstrap.main(["--compute", "cpu", "--full"])
+            status = bootstrap.main(
+                ["--compute", "cpu", "--full"] if arguments is None else arguments
+            )
         return status, events
 
     def test_main_validates_reused_environment_and_installs_in_contract_order(self):
@@ -172,7 +206,73 @@ class BootstrapEntryTest(unittest.TestCase):
         self.assertEqual(install_commands[1][-1], "--no-deps")
         self.assertEqual(install_commands[1][-3], "--editable")
         self.assertTrue(str(install_commands[2][-1]).endswith("full-base.txt"))
-        self.assertEqual(events[-1][1][-2:], ["bootstrap", "--full"])
+        self.assertEqual(
+            events[-1][1][-4:], ["bootstrap", "--compute", "cpu", "--full"]
+        )
+        self.assertEqual(events[-1][1].count("--compute"), 1)
+
+    def test_auto_compute_handoff_uses_the_resolved_installed_profile_once(self):
+        _status, events = self._exercise_main(
+            arguments=["--full"], detected_profile="cu124"
+        )
+        handoff = events[-1][1]
+        self.assertEqual(handoff[-4:], ["bootstrap", "--compute", "cu124", "--full"])
+        self.assertEqual(handoff.count("--compute"), 1)
+
+    def test_platform_wrappers_preserve_cli_arguments_for_python_handoff(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        powershell = (repository / "bootstrap.ps1").read_text(encoding="utf-8")
+        shell = (repository / "bootstrap.sh").read_text(encoding="utf-8")
+        self.assertIn("$scriptPath @args", powershell)
+        self.assertIn('"$SCRIPT_DIR/scripts/bootstrap.py" "$@"', shell)
+
+    def test_powershell_wrapper_uses_py_launcher_when_only_python_310_is_registered(
+        self,
+    ):
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("PowerShell is required to exercise bootstrap.ps1")
+
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        wrapper = repository / "bootstrap.ps1"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "python-arguments.txt"
+            script = f"""
+function py {{
+    if ($args.Count -ge 2 -and $args[1] -eq '-c') {{
+        if ($args[0] -eq '-3.10') {{
+            $global:LASTEXITCODE = 0
+        }} else {{
+            $global:LASTEXITCODE = 1
+        }}
+        return
+    }}
+    [System.IO.File]::WriteAllLines($env:BITGUARD_CAPTURE, [string[]]$args)
+    $global:LASTEXITCODE = 0
+}}
+$env:Path = ''
+& '{wrapper}' --compute cpu --full
+"""
+            result = subprocess.run(
+                [powershell, "-NoProfile", "-Command", script],
+                capture_output=True,
+                check=False,
+                encoding="utf-8",
+                env={**os.environ, "BITGUARD_CAPTURE": str(capture)},
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                capture.read_text(encoding="utf-8").splitlines(),
+                [
+                    "-3.10",
+                    str(repository / "scripts" / "bootstrap.py"),
+                    "--compute",
+                    "cpu",
+                    "--full",
+                ],
+            )
 
     def test_main_validates_new_environment_before_installing(self):
         _status, events = self._exercise_main(environment_exists=False)

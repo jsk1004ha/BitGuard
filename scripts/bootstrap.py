@@ -24,7 +24,13 @@ def venv_python(root: Path) -> Path:
 
 
 def build_package_command(environment: Path, forwarded: list[str]) -> list[str]:
-    return [str(venv_python(environment)), "-m", "bitguard_bnn", "bootstrap", *forwarded]
+    return [
+        str(venv_python(environment)),
+        "-m",
+        "bitguard_bnn",
+        "bootstrap",
+        *forwarded,
+    ]
 
 
 def validate_virtual_environment(environment: Path) -> None:
@@ -49,7 +55,9 @@ def validate_virtual_environment(environment: Path) -> None:
         ) from exc
 
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "interpreter probe failed"
+        detail = (
+            result.stderr.strip() or result.stdout.strip() or "interpreter probe failed"
+        )
         raise RuntimeError(
             f"virtual environment Python at {environment_python} is unusable: {detail}"
         )
@@ -96,11 +104,15 @@ def _detect_torch_profile() -> str:
     except FileNotFoundError:
         return "cpu"
     except OSError as exc:
-        raise RuntimeError(f"CUDA detection failed while running nvidia-smi: {exc}") from exc
+        raise RuntimeError(
+            f"CUDA detection failed while running nvidia-smi: {exc}"
+        ) from exc
 
     if result.returncode != 0:
         detail = result.stderr.strip() or "nvidia-smi returned a non-zero exit code"
-        raise RuntimeError(f"CUDA detection failed; refusing to downgrade to CPU: {detail}")
+        raise RuntimeError(
+            f"CUDA detection failed; refusing to downgrade to CPU: {detail}"
+        )
 
     match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", result.stdout)
     if match is None:
@@ -142,7 +154,11 @@ def _verify_torch_profile(environment: Path, profile: str) -> None:
         text=True,
     )
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "Torch verification failed"
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or "Torch verification failed"
+        )
         raise RuntimeError(
             f"Torch profile {profile} is unusable; refusing to downgrade to CPU: {detail}"
         )
@@ -157,8 +173,12 @@ def _parse_arguments(argv: list[str]) -> tuple[str, list[str]]:
 
 def main(argv: list[str] | None = None) -> int:
     validate_python_version(sys.version_info[:3])
-    requested_profile, forwarded = _parse_arguments(list(sys.argv[1:] if argv is None else argv))
-    profile = _detect_torch_profile() if requested_profile == "auto" else requested_profile
+    requested_profile, forwarded = _parse_arguments(
+        list(sys.argv[1:] if argv is None else argv)
+    )
+    profile = (
+        _detect_torch_profile() if requested_profile == "auto" else requested_profile
+    )
 
     repository = Path(__file__).resolve().parents[1]
     environment = repository / ".venv"
@@ -186,7 +206,13 @@ def main(argv: list[str] | None = None) -> int:
         cwd=repository,
     )
 
-    return subprocess.call(build_package_command(environment, forwarded), cwd=repository)
+    # argparse consumes the installer-level flag. Hand the resolved profile to
+    # the package bootstrap exactly once so installation and runtime recovery
+    # cannot disagree (including when the user selected ``auto``).
+    package_arguments = ["--compute", profile, *forwarded]
+    return subprocess.call(
+        build_package_command(environment, package_arguments), cwd=repository
+    )
 
 
 if __name__ == "__main__":

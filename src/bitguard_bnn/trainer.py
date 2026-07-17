@@ -144,7 +144,13 @@ def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
             temporary.unlink()
 
 
-def _safe_torch_load(path: Path, device: Any) -> dict[str, Any]:
+def _safe_torch_load(
+    path: Path,
+    device: Any,
+    *,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
+) -> dict[str, Any]:
     """Load tensor/primitives-only checkpoints from one pinned regular file."""
 
     import torch
@@ -164,13 +170,56 @@ def _safe_torch_load(path: Path, device: Any) -> dict[str, Any]:
         raise ValueError("training checkpoint must not be a link")
     if not path.is_file():
         raise FileNotFoundError(f"training checkpoint not found: {path}")
+    if (expected_sha256 is None) != (expected_bytes is None):
+        raise ValueError("checkpoint integrity requires both SHA-256 and byte size")
+    if expected_sha256 is not None and (
+        re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes < 0
+    ):
+        raise ValueError("checkpoint integrity metadata is invalid")
     try:
         with path.open("rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            opened_before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened_before.st_mode):
                 raise ValueError("training checkpoint must be a regular file")
-            value = torch.load(handle, map_location=device, weights_only=True)
-    except (pickle.UnpicklingError, RuntimeError, EOFError, ValueError) as error:
-        raise ValueError("training checkpoint is not a safe tensor payload") from error
+            if expected_sha256 is not None:
+                digest = hashlib.sha256()
+                observed_bytes = 0
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+                    observed_bytes += len(block)
+                opened_after_hash = os.fstat(handle.fileno())
+                file_identity_key = lambda item: (
+                    int(item.st_dev),
+                    int(item.st_ino),
+                    int(item.st_size),
+                    int(item.st_mtime_ns),
+                )
+                if (
+                    file_identity_key(opened_before)
+                    != file_identity_key(opened_after_hash)
+                    or digest.hexdigest() != expected_sha256
+                    or observed_bytes != expected_bytes
+                ):
+                    raise RuntimeError(
+                        "training checkpoint changed before its verified load"
+                    )
+                handle.seek(0)
+            try:
+                value = torch.load(handle, map_location=device, weights_only=True)
+            except (
+                pickle.UnpicklingError,
+                RuntimeError,
+                EOFError,
+                ValueError,
+            ) as error:
+                raise ValueError(
+                    "training checkpoint is not a safe tensor payload"
+                ) from error
+    except OSError as error:
+        raise ValueError("training checkpoint could not be opened safely") from error
     if not isinstance(value, dict):
         raise ValueError("training checkpoint payload must be a mapping")
     stack = [value]
@@ -182,20 +231,20 @@ def _safe_torch_load(path: Path, device: Any) -> dict[str, Any]:
         if isinstance(current, torch.Tensor):
             continue
         if isinstance(current, dict):
-            identity = id(current)
-            if identity in seen_containers:
+            container_identity = id(current)
+            if container_identity in seen_containers:
                 raise ValueError("training checkpoint contains a recursive mapping")
-            seen_containers.add(identity)
+            seen_containers.add(container_identity)
             for key, item in current.items():
                 if not isinstance(key, (str, int)) or isinstance(key, bool):
                     raise ValueError("training checkpoint mapping keys are invalid")
                 stack.append(item)
             continue
         if isinstance(current, (list, tuple)):
-            identity = id(current)
-            if identity in seen_containers:
+            container_identity = id(current)
+            if container_identity in seen_containers:
                 raise ValueError("training checkpoint contains a recursive sequence")
-            seen_containers.add(identity)
+            seen_containers.add(container_identity)
             stack.extend(current)
             continue
         raise ValueError(

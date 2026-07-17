@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping, cast
+from typing import Any, Callable, Iterator, Mapping, cast
 
 import numpy as np
 import pandas as pd
@@ -66,6 +66,8 @@ _TEST_PREDICTION_ORDER_ALGORITHM = {
 # recursive work-tree scan dozens of times per second.
 _PHASE_SAMPLE_INTERVAL_SECONDS = 1.0
 
+_TRAINING_RESOURCE_RESERVE_BYTES = 64 * 1024**2
+
 
 def _add_exception_note(error: BaseException, note: str) -> None:
     """Attach secondary failure detail without requiring Python 3.11."""
@@ -84,6 +86,244 @@ def _reject_unsupported_model(config: Mapping[str, Any]) -> None:
         )
 
 
+def _existing_parent(path: Path) -> Path:
+    candidate = path.expanduser()
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            raise RuntimeError(f"cannot locate an existing parent for {path}")
+        candidate = parent
+    return candidate
+
+
+def _training_resource_requirements(
+    prepared: PreparedDataset, config: Mapping[str, Any]
+) -> dict[str, int]:
+    """Conservatively size post-prepare training artifacts before a run exists."""
+
+    preprocess = config["preprocess"]
+    model = config["model"]
+    training = config["training"]
+    cascade = config["cascade"]
+    feature_budget = max(1, int(preprocess["feature_budget"]))
+    encoded_width = feature_budget * max(1, int(preprocess["thermometer_bits"]))
+    labels = max(2, len(CANONICAL_LABELS))
+    hidden = [int(value) for value in model["hidden_dims"]]
+
+    def parameter_count(widths: list[int]) -> int:
+        return sum((left + 1) * right for left, right in zip(widths, widths[1:]))
+
+    parameters = parameter_count([encoded_width, *hidden, labels])
+    if bool(cascade.get("enabled", False)):
+        tiny_width = min(feature_budget, int(cascade["tiny_feature_budget"]))
+        tiny_hidden = [int(value) for value in cascade["hidden_dims"]]
+        parameters += parameter_count([tiny_width, *tiny_hidden, 2])
+    checkpoint_bytes = max(8 * 1024**2, parameters * 48)
+    validation_row_bytes = 512 + feature_budget * 4 + labels * 8
+    evaluation_row_bytes = 512 + labels * 8
+    evaluation_bytes = (
+        prepared.validation_count * validation_row_bytes
+        + prepared.test_count * evaluation_row_bytes
+    )
+    temporary_bytes = max(
+        16 * 1024**2,
+        (prepared.validation_count + prepared.test_count) * 96,
+    )
+    disk_required = (
+        checkpoint_bytes
+        + evaluation_bytes
+        + temporary_bytes
+        + _TRAINING_RESOURCE_RESERVE_BYTES
+    )
+    batch_size = max(1, int(training["batch_size"]))
+    batch_workspace = batch_size * encoded_width * 4 * 8
+    model_workspace = max(8 * 1024**2, parameters * 64)
+    ram_required = 32 * 1024**2 + batch_workspace + model_workspace
+    return {
+        "checkpoint_bytes": checkpoint_bytes,
+        "evaluation_bytes": evaluation_bytes,
+        "temporary_bytes": temporary_bytes,
+        "reserve_bytes": _TRAINING_RESOURCE_RESERVE_BYTES,
+        "disk_required_bytes": disk_required,
+        "ram_required_bytes": ram_required,
+        "encoded_width": encoded_width,
+        "batch_size": batch_size,
+    }
+
+
+def _require_training_resources(
+    prepared: PreparedDataset,
+    config: Mapping[str, Any],
+    *,
+    available_disk_bytes: int | None,
+    available_ram_bytes: int | None,
+) -> dict[str, int]:
+    requirements = _training_resource_requirements(prepared, config)
+    output_root = Path(str(config["experiment"]["output_dir"]))
+    disk_available = (
+        shutil.disk_usage(_existing_parent(output_root)).free
+        if available_disk_bytes is None
+        else available_disk_bytes
+    )
+    if isinstance(disk_available, bool) or not isinstance(disk_available, int):
+        raise ValueError("training available disk bytes must be an integer")
+    disk_required = requirements["disk_required_bytes"]
+    if disk_available < disk_required:
+        raise RuntimeError(
+            "Insufficient disk for post-prepare training before run creation: "
+            f"required={disk_required} bytes, available={disk_available} bytes, "
+            f"checkpoint={requirements['checkpoint_bytes']} bytes, "
+            f"evaluation={requirements['evaluation_bytes']} bytes, "
+            f"temporary={requirements['temporary_bytes']} bytes."
+        )
+    if available_ram_bytes is None:
+        from bitguard_bnn.bootstrap.preflight import discover_ram
+
+        ram_available = discover_ram().available_bytes
+    else:
+        ram_available = available_ram_bytes
+    if isinstance(ram_available, bool) or not isinstance(ram_available, int):
+        raise ValueError("training available RAM bytes must be an integer")
+    ram_required = requirements["ram_required_bytes"]
+    if ram_available < ram_required:
+        raise RuntimeError(
+            "Insufficient RAM for post-prepare training before run creation: "
+            f"required={ram_required} bytes, available={ram_available} bytes, "
+            f"encoded_width={requirements['encoded_width']}, "
+            f"batch_size={requirements['batch_size']}."
+        )
+    return {
+        **requirements,
+        "disk_available_bytes": disk_available,
+        "ram_available_bytes": ram_available,
+    }
+
+
+def _checkpoint_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(stat.S_IFMT(value.st_mode)),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_nlink),
+        int(getattr(value, "st_file_attributes", 0)),
+    )
+
+
+def _pin_verified_resume_checkpoint(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str,
+    expected_bytes: int,
+) -> Path:
+    """Copy verified bytes once into a no-clobber checkpoint owned by the new run."""
+
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+        or isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes < 0
+    ):
+        raise ValueError("verified checkpoint integrity metadata is invalid")
+    supplied = source.lstat()
+    if (
+        stat.S_ISLNK(supplied.st_mode)
+        or not stat.S_ISREG(supplied.st_mode)
+        or int(supplied.st_nlink) != 1
+    ):
+        raise RuntimeError("verified resume checkpoint must be a single-link file")
+    if destination.parent.resolve(strict=True) != destination.parent:
+        raise RuntimeError("resume checkpoint staging directory is not canonical")
+    created = False
+    try:
+        with source.open("rb") as reader:
+            opened_before = os.fstat(reader.fileno())
+            if _checkpoint_identity(opened_before) != _checkpoint_identity(supplied):
+                raise RuntimeError("verified resume checkpoint changed while opened")
+            with destination.open("xb") as writer:
+                created = True
+                digest = hashlib.sha256()
+                observed_bytes = 0
+                for block in iter(lambda: reader.read(1024 * 1024), b""):
+                    digest.update(block)
+                    observed_bytes += len(block)
+                    writer.write(block)
+                writer.flush()
+                os.fsync(writer.fileno())
+            opened_after = os.fstat(reader.fileno())
+        final = source.lstat()
+        if (
+            _checkpoint_identity(opened_before) != _checkpoint_identity(opened_after)
+            or _checkpoint_identity(opened_after) != _checkpoint_identity(final)
+            or digest.hexdigest() != expected_sha256
+            or observed_bytes != expected_bytes
+        ):
+            raise RuntimeError(
+                "verified resume checkpoint changed before it was pinned"
+            )
+        os.chmod(destination, stat.S_IREAD)
+        return destination.resolve(strict=True)
+    except BaseException:
+        if created and os.path.lexists(destination):
+            try:
+                os.chmod(destination, stat.S_IWRITE | stat.S_IREAD)
+                destination.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _verified_checkpoint_integrity(path: Path) -> dict[str, object]:
+    supplied = path.lstat()
+    if (
+        stat.S_ISLNK(supplied.st_mode)
+        or not stat.S_ISREG(supplied.st_mode)
+        or int(supplied.st_nlink) != 1
+    ):
+        raise RuntimeError("resume checkpoint must be a single-link regular file")
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        opened_before = os.fstat(stream.fileno())
+        if _checkpoint_identity(opened_before) != _checkpoint_identity(supplied):
+            raise RuntimeError("resume checkpoint changed while opened")
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+        opened_after = os.fstat(stream.fileno())
+    final = path.lstat()
+    if _checkpoint_identity(opened_before) != _checkpoint_identity(
+        opened_after
+    ) or _checkpoint_identity(opened_after) != _checkpoint_identity(final):
+        raise RuntimeError("resume checkpoint changed while hashed")
+    return {"sha256": digest.hexdigest(), "bytes": size}
+
+
+def _validated_resume_integrity(
+    path: Path, value: Mapping[str, object] | None
+) -> dict[str, object]:
+    if value is None:
+        return _verified_checkpoint_integrity(path)
+    if set(value) != {"sha256", "bytes"}:
+        raise ValueError("resume checkpoint integrity fields are invalid")
+    sha256 = value.get("sha256")
+    size = value.get("bytes")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 0
+    ):
+        raise ValueError("resume checkpoint integrity metadata is invalid")
+    return {"sha256": sha256, "bytes": size}
+
+
 def _scientific_training_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     """Select caller-visible settings that the prepared config must pin exactly."""
 
@@ -96,13 +336,17 @@ def _scientific_training_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         "schema_report",
     ):
         dataset.pop(locator, None)
+    training = copy.deepcopy(config["training"])
+    # The locator selects an already-bound checkpoint; its payload is validated
+    # against the complete streaming scientific signature at load time.
+    training.pop("resume_from", None)
     return {
         "experiment_seed": config["experiment"]["seed"],
         "dataset": dataset,
         "preprocess": copy.deepcopy(config["preprocess"]),
         "model": copy.deepcopy(config["model"]),
         "loss": copy.deepcopy(config["loss"]),
-        "training": copy.deepcopy(config["training"]),
+        "training": training,
         "cascade": copy.deepcopy(config["cascade"]),
         "temporal": copy.deepcopy(config["temporal"]),
         "evaluation": copy.deepcopy(config["evaluation"]),
@@ -117,7 +361,8 @@ def _require_matching_scientific_contract(
     if stable_fingerprint(caller_contract) != stable_fingerprint(verified_contract):
         raise ValueError(
             "caller config scientific training contract does not match the verified "
-            "prepared config; only experiment.output_dir may be overridden"
+            "prepared config; only experiment.output_dir and training.resume_from may "
+            "be overridden"
         )
 
 
@@ -393,6 +638,56 @@ def _temporary_calibration_cache(root: Path, layout: Any) -> Iterator[Any]:
             raise cleanup_error
 
 
+@contextmanager
+def _validation_calibration_cache(
+    root: Path,
+    layout: Any,
+    *,
+    resume_from: Path | None,
+) -> Iterator[Any]:
+    """Reopen a verified prior cache when bootstrap resumes its checkpoint run."""
+
+    from bitguard_bnn.out_of_core.cache import CalibrationCache
+
+    resume_root = None
+    if resume_from is not None and resume_from.name == "last_training_state.pt":
+        candidate = resume_from.parent / "temporary" / "validation-cache"
+        if os.path.lexists(candidate):
+            resume_root = candidate
+    if resume_root is None:
+        with _temporary_calibration_cache(root, layout) as temporary_cache:
+            yield temporary_cache
+        return
+
+    cache: Any | None = None
+    primary_error: BaseException | None = None
+    try:
+        cache = CalibrationCache.open_resume(resume_root, layout)
+        yield cache
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        try:
+            if cache is not None:
+                cache.close()
+        except BaseException as error:
+            cleanup_error = error
+        if primary_error is None and cleanup_error is None:
+            try:
+                shutil.rmtree(resume_root, ignore_errors=False)
+            except BaseException as error:
+                cleanup_error = error
+        if primary_error is not None and cleanup_error is not None:
+            _add_exception_note(
+                primary_error,
+                f"resumed validation cache cleanup also failed: {cleanup_error}",
+            )
+        elif cleanup_error is not None:
+            raise cleanup_error
+
+
 def _class_counts(prepared: PreparedDataset, labels: list[str]) -> dict[str, int]:
     manifest = json.loads(
         Path(prepared.shard_manifest_path).read_text(encoding="utf-8")
@@ -419,6 +714,80 @@ def _dataset(
         batch_size=int(training["batch_size"]),
         seed=int(config["experiment"]["seed"]),
         shuffle_buffer_rows=int(training["shuffle_buffer_rows"]),
+    )
+
+
+def _preflight_streaming_resume_checkpoint(
+    path: Path,
+    prepared: PreparedDataset,
+    config: dict[str, Any],
+    integrity: Mapping[str, object],
+) -> None:
+    """Reject incompatible resume state before allocating a new run."""
+
+    if float(config["loss"].get("distillation_alpha", 0.0)) > 0.0:
+        raise ValueError(
+            "streaming checkpoint distillation resume requires independently "
+            "verified teacher identity"
+        )
+
+    from bitguard_bnn.out_of_core.trainer import (
+        _load_streaming_checkpoint,
+        _make_streaming_training_components,
+        _streaming_signature,
+        _validate_inputs,
+    )
+    from bitguard_bnn.trainer import _build_neural, _select_device
+
+    preprocessor = FeaturePreprocessor.load(Path(prepared.preprocessor_path))
+    labels = list(preprocessor.active_labels)
+    counts = _class_counts(prepared, labels)
+    train_dataset = _dataset(prepared, config, "train")
+    validated_labels, feature_indices, _, normalized_counts = _validate_inputs(
+        train_dataset,
+        config,
+        counts,
+        labels,
+        training_role="main",
+        feature_indices=None,
+        binary_attack_target=False,
+    )
+    training_contract = {
+        "algorithm": "bitguard.full-validation-selection.v1",
+        "prepared_descriptor_fingerprint": prepared.to_dict()["fingerprint"],
+        "split_fingerprint": prepared.split_fingerprint,
+        "validation_rows": prepared.validation_count,
+        "role": "main",
+    }
+    expected_signature = _streaming_signature(
+        train_dataset,
+        config,
+        normalized_counts,
+        validated_labels,
+        training_role="main",
+        feature_indices=feature_indices,
+        binary_attack_target=False,
+        teacher_fingerprint=None,
+        validation_contract=training_contract,
+    )
+    device = _select_device(str(config["training"].get("device", "auto")))
+    model = _build_neural(config, preprocessor, len(labels))
+    model, optimizer, scheduler, scaler = _make_streaming_training_components(
+        model, config, device
+    )
+    _load_streaming_checkpoint(
+        path,
+        dataset=train_dataset,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        target_epochs=int(config["training"]["epochs"]),
+        device=device,
+        scientific_signature=expected_signature,
+        expected_sha256=cast(str, integrity["sha256"]),
+        expected_bytes=cast(int, integrity["bytes"]),
+        restore_rng=False,
     )
 
 
@@ -1038,6 +1407,10 @@ def run_out_of_core_training(
     *,
     config: dict[str, Any] | None = None,
     prepared_descriptor_path: str | Path | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+    resume_checkpoint_integrity: Mapping[str, object] | None = None,
+    available_disk_bytes: int | None = None,
+    available_ram_bytes: int | None = None,
 ) -> Path:
     """Run exact neural training over immutable Parquet shards.
 
@@ -1058,11 +1431,24 @@ def run_out_of_core_training(
     )
 
     # Imported lazily to keep the storage dispatch boundary acyclic.
-    return _run_verified_neural_training(loaded, prepared)
+    return _run_verified_neural_training(
+        loaded,
+        prepared,
+        progress_callback=progress_callback,
+        resume_checkpoint_integrity=resume_checkpoint_integrity,
+        available_disk_bytes=available_disk_bytes,
+        available_ram_bytes=available_ram_bytes,
+    )
 
 
 def _run_verified_neural_training(
-    config: dict[str, Any], prepared: PreparedDataset
+    config: dict[str, Any],
+    prepared: PreparedDataset,
+    *,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+    resume_checkpoint_integrity: Mapping[str, object] | None = None,
+    available_disk_bytes: int | None = None,
+    available_ram_bytes: int | None = None,
 ) -> Path:
     """Execute bounded train, calibration, evaluation, and export phases."""
 
@@ -1094,12 +1480,65 @@ def _run_verified_neural_training(
     _require_matching_scientific_contract(config, verified_config)
     runtime_config = copy.deepcopy(verified_config)
     runtime_config["experiment"]["output_dir"] = config["experiment"]["output_dir"]
+    if config["training"].get("resume_from") is not None:
+        runtime_config["training"]["resume_from"] = config["training"]["resume_from"]
+    _require_training_resources(
+        prepared,
+        runtime_config,
+        available_disk_bytes=available_disk_bytes,
+        available_ram_bytes=available_ram_bytes,
+    )
+    resume_value = runtime_config["training"].get("resume_from")
+    resume_source_path = (
+        resolve_path(runtime_config, resume_value) if resume_value else None
+    )
+    resume_integrity: dict[str, object] | None = None
+    if resume_source_path is not None:
+        resume_integrity = _validated_resume_integrity(
+            resume_source_path, resume_checkpoint_integrity
+        )
+        _preflight_streaming_resume_checkpoint(
+            resume_source_path,
+            prepared,
+            runtime_config,
+            resume_integrity,
+        )
+    elif resume_checkpoint_integrity is not None:
+        raise ValueError("resume checkpoint integrity requires training.resume_from")
     seed = int(runtime_config["experiment"]["seed"])
     seed_everything(seed)
 
     # The caller verifies the complete prepared descriptor before reaching this
     # first allocation. Never move create_run_dir above that boundary.
     run_dir = create_run_dir(runtime_config)
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "status": "run_created",
+                "dataset": prepared.dataset,
+                "prepared_descriptor": prepared.descriptor_path,
+                "prepared_descriptor_fingerprint": prepared.to_dict()["fingerprint"],
+                "run_dir": str(run_dir.resolve(strict=True)),
+                "active_checkpoint": str(
+                    (run_dir / "last_training_state.pt").resolve(strict=False)
+                ),
+                "resume_checkpoint": (
+                    None
+                    if resume_source_path is None
+                    else str(resume_source_path.resolve(strict=False))
+                ),
+            }
+        )
+    resume_path: Path | None = None
+    if resume_source_path is not None:
+        assert resume_integrity is not None
+        resume_path = _pin_verified_resume_checkpoint(
+            resume_source_path,
+            run_dir / "resume_training_state.pt",
+            expected_sha256=cast(str, resume_integrity["sha256"]),
+            expected_bytes=cast(int, resume_integrity["bytes"]),
+        )
+        runtime_config["training"]["resume_from"] = str(resume_path)
     temporary = run_dir / "temporary"
     temporary.mkdir(parents=True, exist_ok=False)
     phases: list[dict[str, Any]] = []
@@ -1160,10 +1599,6 @@ def _run_verified_neural_training(
 
     with _phase(phases, "main_training", temporary):
         main_model = _build_neural(runtime_config, preprocessor, len(labels))
-        resume_value = runtime_config["training"].get("resume_from")
-        resume_path = (
-            resolve_path(runtime_config, resume_value) if resume_value else None
-        )
         main_fit = fit_neural_streaming(
             main_model,
             _dataset(prepared, runtime_config, "train"),
@@ -1176,6 +1611,16 @@ def _run_verified_neural_training(
             checkpoint_path=run_dir / "last_training_state.pt",
             progress_path=run_dir / "training_history.partial.csv",
             resume_from=resume_path,
+            resume_sha256=(
+                None
+                if resume_integrity is None
+                else cast(str, resume_integrity["sha256"])
+            ),
+            resume_bytes=(
+                None
+                if resume_integrity is None
+                else cast(int, resume_integrity["bytes"])
+            ),
             training_role="main",
         )
         main_model = main_fit.model
@@ -1332,7 +1777,11 @@ def _run_verified_neural_training(
             inference_contract_fingerprint=validation_inference_contract,
         )
         cache_root = temporary / "validation-cache"
-        with _temporary_calibration_cache(cache_root, layout) as cache:
+        with _validation_calibration_cache(
+            cache_root,
+            layout,
+            resume_from=resume_source_path,
+        ) as cache:
             boolean_calibration = populate_validation_cache(
                 cache,
                 lambda: _iter_evaluation_batches(validation_dataset),
