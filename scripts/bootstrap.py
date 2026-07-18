@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 SUPPORTED_PYTHON = ((3, 10), (3, 11), (3, 12))
-TORCH_PROFILES = ("cpu", "cu118", "cu124")
+TORCH_PROFILES = ("cpu", "cu118", "cu124", "cu128")
 
 
 def validate_python_version(version: tuple[int, int, int]) -> None:
@@ -121,6 +121,8 @@ def _detect_torch_profile() -> str:
         )
 
     cuda_version = (int(match.group(1)), int(match.group(2)))
+    if cuda_version >= (12, 8):
+        return "cu128"
     if cuda_version >= (12, 4):
         return "cu124"
     if cuda_version >= (11, 8):
@@ -131,7 +133,12 @@ def _detect_torch_profile() -> str:
 
 
 def _verify_torch_profile(environment: Path, profile: str) -> None:
-    expected_cuda = {"cpu": None, "cu118": "11.8", "cu124": "12.4"}[profile]
+    expected_cuda = {
+        "cpu": None,
+        "cu118": "11.8",
+        "cu124": "12.4",
+        "cu128": "12.8",
+    }[profile]
     verification = (
         "import torch\n"
         f"expected = {expected_cuda!r}\n"

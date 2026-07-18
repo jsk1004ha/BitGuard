@@ -9,7 +9,7 @@ from .state import STAGE_ORDER
 from .types import BootstrapOptions
 
 DATASETS = ("nbaiot", "botiot")
-COMPUTE_PROFILES = ("auto", "cpu", "cu118", "cu124")
+COMPUTE_PROFILES = ("auto", "cpu", "cu118", "cu124", "cu128")
 _URLISH_PATH = re.compile(r"https?:[\\/]+", re.IGNORECASE)
 
 

@@ -645,8 +645,8 @@ class DriverInfo:
             memory = _nonnegative_bytes(self.memory_bytes, "memory_bytes")
             if memory == 0:
                 raise ValueError("memory_bytes must be positive when provided.")
-        if self.cuda_profile not in {None, "cu118", "cu124"}:
-            raise ValueError("cuda_profile must be cu118, cu124, or None.")
+        if self.cuda_profile not in {None, "cu118", "cu124", "cu128"}:
+            raise ValueError("cuda_profile must be cu118, cu124, cu128, or None.")
         _device_index(self.device_index)
 
     def as_dict(self) -> dict[str, object]:
@@ -768,6 +768,7 @@ def probe_nvidia_driver(
 _CUDA_BUILD_PROFILES = {
     (11, 8): "cu118",
     (12, 4): "cu124",
+    (12, 8): "cu128",
 }
 
 
@@ -793,7 +794,7 @@ def _profile_for_torch_cuda_build(torch_cuda_version: object) -> str:
         normalized = f"{build[0]}.{build[1]}"
         raise RuntimeError(
             "CUDA profile verification failed: unsupported Torch CUDA build "
-            f"{normalized}; expected 11.8 or 12.4 and no CPU fallback was applied."
+            f"{normalized}; expected 11.8, 12.4, or 12.8 and no CPU fallback was applied."
         ) from error
 
 
@@ -806,13 +807,14 @@ def choose_compute(
 ) -> str:
     """Select compute without downgrading a detected CUDA failure.
 
-    CUDA selections resolve only to the pinned ``cu118`` or ``cu124`` profile
-    matching the installed Torch CUDA build.
+    CUDA selections resolve only to the pinned ``cu118``, ``cu124``, or
+    ``cu128`` profile matching the installed Torch CUDA build.
     """
 
-    if requested not in {"auto", "cpu", "cu118", "cu124"}:
+    if requested not in {"auto", "cpu", "cu118", "cu124", "cu128"}:
         raise ValueError(
-            f"Unsupported requested compute profile {requested!r}; use auto, cpu, cu118, or cu124."
+            f"Unsupported requested compute profile {requested!r}; "
+            "use auto, cpu, cu118, cu124, or cu128."
         )
     if not isinstance(driver, DriverInfo):
         raise TypeError("driver must be DriverInfo.")
@@ -854,7 +856,7 @@ class TorchVerification:
     device_index: int | None = None
 
     def __post_init__(self) -> None:
-        if self.selected_profile not in {"cpu", "cu118", "cu124"}:
+        if self.selected_profile not in {"cpu", "cu118", "cu124", "cu128"}:
             raise ValueError(f"Unknown selected_profile {self.selected_profile!r}.")
         for value, name in (
             (self.device, "device"),
@@ -894,7 +896,7 @@ def verify_torch_compute(
     the installed Torch wheel includes CUDA; only CPU tensor work is performed.
     """
 
-    if selected_profile not in {"cpu", "cu118", "cu124"}:
+    if selected_profile not in {"cpu", "cu118", "cu124", "cu128"}:
         raise ValueError(f"Unknown selected compute profile {selected_profile!r}.")
     requested_index = _device_index(device_index)
     if driver is not None and not isinstance(driver, DriverInfo):

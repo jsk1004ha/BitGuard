@@ -103,7 +103,9 @@ class BootstrapEntryTest(unittest.TestCase):
             ("11.8", "cu118"),
             ("12.3", "cu118"),
             ("12.4", "cu124"),
-            ("12.9", "cu124"),
+            ("12.7", "cu124"),
+            ("12.8", "cu128"),
+            ("12.9", "cu128"),
         )
         for cuda_version, expected_profile in cases:
             with self.subTest(cuda_version=cuda_version):
@@ -141,6 +143,14 @@ class BootstrapEntryTest(unittest.TestCase):
         self.assertIn("device='cuda'", verification)
         self.assertIn("probe + 1", verification)
         self.assertIn("torch.cuda.synchronize()", verification)
+
+    def test_cu128_verification_requires_cuda_12_8(self):
+        result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with patch("scripts.bootstrap.subprocess.run", return_value=result) as run:
+            bootstrap._verify_torch_profile(Path(".venv"), "cu128")
+
+        verification = run.call_args.args[0][2]
+        self.assertIn("expected = '12.8'", verification)
 
     def test_cuda_verification_propagates_probe_failure(self):
         result = subprocess.CompletedProcess(
@@ -218,6 +228,26 @@ class BootstrapEntryTest(unittest.TestCase):
         handoff = events[-1][1]
         self.assertEqual(handoff[-4:], ["bootstrap", "--compute", "cu124", "--full"])
         self.assertEqual(handoff.count("--compute"), 1)
+
+    def test_explicit_cu128_uses_matching_lock_and_handoff(self):
+        _status, events = self._exercise_main(
+            arguments=["--compute", "cu128", "--full"]
+        )
+
+        install_commands = [value for kind, value in events if kind == "run"]
+        self.assertTrue(str(install_commands[0][-1]).endswith("torch-cu128.txt"))
+        self.assertEqual(
+            events[-1][1][-4:], ["bootstrap", "--compute", "cu128", "--full"]
+        )
+
+    def test_cu128_lock_pins_the_official_torch_wheel(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        lock = repository / "requirements" / "locks" / "torch-cu128.txt"
+
+        self.assertEqual(
+            lock.read_text(encoding="utf-8"),
+            "--index-url https://download.pytorch.org/whl/cu128\n" "torch==2.11.0\n",
+        )
 
     def test_platform_wrappers_preserve_cli_arguments_for_python_handoff(self):
         repository = Path(bootstrap.__file__).resolve().parents[1]
