@@ -1816,7 +1816,7 @@ class FullBootstrapRecoveryTests(unittest.TestCase):
             self.assertEqual(environment_report["compute"]["device"], "cuda:0")
             self.assertIn(
                 environment_report["compute"]["selected_profile"],
-                {"cu118", "cu124"},
+                {"cu118", "cu124", "cu128"},
             )
             completed_training = json.loads(
                 (root / "data" / ".bitguard" / "training.json").read_text(
@@ -2001,6 +2001,13 @@ class FullBootstrapRecoveryTests(unittest.TestCase):
         )
         self.assertNotIn("--compute cpu", unrelated_cuda_path)
         self.assertNotIn("--restart-stage", unrelated_cuda_path)
+
+        cu128_profile_only = _recovery(
+            "train",
+            RuntimeError("CUDA out of memory while allocating a tensor"),
+            {"compute": {"selected_profile": "cu128"}},
+        )
+        self.assertIn("--compute cpu --restart-stage train", cu128_profile_only)
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

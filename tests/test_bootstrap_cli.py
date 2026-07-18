@@ -173,6 +173,11 @@ class BootstrapOptionsTest(unittest.TestCase):
         self.assertIsNone(options.botiot_source)
         self.assertFalse(options.accepted_botiot_license)
 
+    def test_cu128_compute_profile_is_accepted(self):
+        options = parse_bootstrap_options(["--dataset", "nbaiot", "--compute", "cu128"])
+
+        self.assertEqual(options.compute, "cu128")
+
     def test_full_without_explicit_dataset_selects_all(self):
         options = parse_bootstrap_options(
             [

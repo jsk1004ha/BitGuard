@@ -101,11 +101,12 @@ also the target profile when CUDA is unsuitable; when reusing a failed data
 root, add the stage-specific recovery option described below.
 
 `--compute auto` selects CPU only when `nvidia-smi` is absent. A detected NVIDIA
-driver maps to `cu118` or `cu124`; a broken probe, an older CUDA capability, a
-wheel mismatch, or a failed GPU allocation stops the run instead of silently
-downgrading it. `--compute cu118` and `--compute cu124` explicitly require the
-matching locked PyTorch wheel and a working CUDA device. If CUDA validation
-fails before training starts, recover with the original command plus
+driver maps to `cu118`, `cu124`, or `cu128`; a broken probe, an older CUDA
+capability, a wheel mismatch, or a failed GPU allocation stops the run instead
+of silently downgrading it. Explicit CUDA selections require the matching
+locked PyTorch wheel and a working CUDA device. The `cu128` profile pins
+`torch==2.11.0` for RTX 50-series support. If CUDA validation fails before
+training starts, recover with the original command plus
 `--compute cpu --restart-stage environment`. If CUDA training has already
 created a checkpoint, use `--compute cpu --restart-stage train`: CUDA optimizer
 state is not retried on CPU, so this deliberately starts fresh training and

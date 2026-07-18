@@ -587,28 +587,29 @@ class NvidiaProbeAndSelectionTests(unittest.TestCase):
 
     def test_successful_compute_selection_preserves_profiles(self):
         driver = DriverInfo(nvidia=True)
-        self.assertEqual(
-            choose_compute(
-                "cu118",
-                driver=driver,
-                torch_cuda=True,
-                torch_cuda_version="11.8",
-            ),
-            "cu118",
-        )
-        self.assertEqual(
-            choose_compute(
-                "cu124",
-                driver=driver,
-                torch_cuda=True,
-                torch_cuda_version="12.4",
-            ),
-            "cu124",
-        )
+        for profile, build_version in (
+            ("cu118", "11.8"),
+            ("cu124", "12.4"),
+            ("cu128", "12.8"),
+        ):
+            with self.subTest(profile=profile):
+                self.assertEqual(
+                    choose_compute(
+                        profile,
+                        driver=driver,
+                        torch_cuda=True,
+                        torch_cuda_version=build_version,
+                    ),
+                    profile,
+                )
 
     def test_auto_cuda_resolves_only_supported_pinned_profiles(self):
         driver = DriverInfo(nvidia=True)
-        for build_version, expected in (("11.8", "cu118"), ("12.4", "cu124")):
+        for build_version, expected in (
+            ("11.8", "cu118"),
+            ("12.4", "cu124"),
+            ("12.8", "cu128"),
+        ):
             with self.subTest(build_version=build_version):
                 self.assertEqual(
                     choose_compute(
@@ -734,6 +735,20 @@ class TorchVerificationTests(unittest.TestCase):
         self.assertEqual(verification.device, "cuda:0")
         self.assertEqual(verification.device_name, "Fake GPU")
         self.assertEqual(verification.device_index, 0)
+
+    def test_cu128_driver_and_torch_build_are_verified(self):
+        torch = _FakeTorch(cuda_available=True, cuda_build="12.8")
+        driver = DriverInfo(nvidia=True, cuda_profile="cu128", device_index=0)
+
+        verification = verify_torch_compute(
+            "cu128",
+            torch_module=torch,
+            driver=driver,
+        )
+
+        self.assertEqual(verification.selected_profile, "cu128")
+        self.assertEqual(verification.torch_cuda_version, "12.8")
+        self.assertEqual(verification.device, "cuda:0")
 
     def test_cuda_verification_uses_selected_device_index_consistently(self):
         torch = _FakeTorch(cuda_available=True, cuda_build="12.4")

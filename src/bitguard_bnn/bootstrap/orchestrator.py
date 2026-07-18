@@ -1701,7 +1701,8 @@ def _compute_uses_cuda(compute: Mapping[str, object] | None) -> bool:
     profile = facts.get("selected_profile")
     device = facts.get("device")
     return (
-        isinstance(profile, str) and profile.casefold() in {"cu118", "cu124", "cuda"}
+        isinstance(profile, str)
+        and profile.casefold() in {"cu118", "cu124", "cu128", "cuda"}
     ) or (isinstance(device, str) and device.casefold().startswith("cuda:"))
 
 
