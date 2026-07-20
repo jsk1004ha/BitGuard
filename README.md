@@ -69,9 +69,10 @@ BoT-IoT, evaluates the complete test partitions, and exports the edge artifacts.
 ### Prerequisites
 
 - Use Python 3.10, 3.11, or 3.12. The wrapper rejects other versions.
-- Download the model-ready BoT-IoT CSV distribution after reviewing the
-  [official UNSW project page](https://research.unsw.edu.au/projects/bot-iot-dataset).
-  Keep it as a local directory, ZIP, or RAR; URLs are rejected.
+- Review the academic-use terms on the
+  [official UNSW BoT-IoT project page](https://research.unsw.edu.au/projects/bot-iot-dataset).
+  Use `--accept-botiot-academic-license` only when those terms apply. The
+  bootstrap can then fetch the pinned full-CSV archive automatically.
 - ZIP files use Python's built-in extractor. A RAR source, including a RAR
   nested inside a ZIP, requires a `7z`, `7zz`, or `7za` executable. Without
   `--install-system-tools`, BitGuard prints the exact `winget`, `apt-get`, or
@@ -86,13 +87,22 @@ datasets. They prepare and train; they do not stop at preparation.
 Windows PowerShell:
 
 ```powershell
-.\bootstrap.ps1 --full --compute cpu --botiot-source "$HOME\Datasets\BoT-IoT" --accept-botiot-academic-license --data-root "$HOME\BitGuardData" --runs-root "$HOME\BitGuardRuns"
+.\bootstrap.ps1 --full --compute cpu --accept-botiot-academic-license --data-root "$HOME\BitGuardData" --runs-root "$HOME\BitGuardRuns"
 ```
 
 Linux shell:
 
 ```bash
-./bootstrap.sh --full --compute cpu --botiot-source "$HOME/datasets/BoT-IoT" --accept-botiot-academic-license --data-root "$HOME/bitguard-data" --runs-root "$HOME/bitguard-runs"
+./bootstrap.sh --full --compute cpu --accept-botiot-academic-license --data-root "$HOME/bitguard-data" --runs-root "$HOME/bitguard-runs"
+```
+
+For an RTX 5090, select the locked CUDA 12.8 profile:
+
+```powershell
+.\bootstrap.ps1 --full --compute cu128 `
+  --accept-botiot-academic-license `
+  --data-root "$HOME\BitGuardData" `
+  --runs-root "$HOME\BitGuardRuns"
 ```
 
 CPU training is bounded-memory but not quick: the uncapped profiles default to
@@ -119,9 +129,30 @@ required to acknowledge the loss of resumable optimizer state.
 
 N-BaIoT is downloaded automatically only from the [official UCI dataset
 record](https://archive.ics.uci.edu/dataset/442/detection+of+iot+botnet+attacks+n+baiot).
-BoT-IoT is never downloaded automatically. `--accept-botiot-academic-license`
-records that you reviewed the academic terms; it does not grant or replace a
-license, and the bootstrap never stores credentials.
+For BoT-IoT, UNSW remains the dataset and license authority. Automatic
+transport uses version 1 of the public Kaggle mirror
+[`vigneshvenkateswaran/bot-iot`](https://www.kaggle.com/datasets/vigneshvenkateswaran/bot-iot),
+not Kaggle as a license authority. The registry pins the 1,257,092,644-byte
+archive and SHA-256
+`7869754e4b6192b45d4497be94cc34d621e1db81b6f76189e72ec4077e85bd75`;
+the verified archive expands to about 15.0 GB. Download publication fails
+closed if either pin changes. The downloader needs no Kaggle SDK, Kaggle
+account, Microsoft account, or stored cookie, and it never persists the
+temporary signed storage redirect.
+
+`--accept-botiot-academic-license` records that you reviewed the UNSW
+academic-use terms; it does not grant or replace a license. If the pinned
+public mirror is unavailable, provide an already downloaded local directory,
+ZIP, or RAR. The local path takes precedence and prevents BoT-IoT network
+access:
+
+```powershell
+.\bootstrap.ps1 --full --compute cu128 `
+  --botiot-source "$HOME\Datasets\BoT-IoT" `
+  --accept-botiot-academic-license `
+  --data-root "$HOME\BitGuardData" `
+  --runs-root "$HOME\BitGuardRuns"
+```
 
 The full profiles consume complete model-ready CSV flow records. They do not
 download the 69.3 GB BoT-IoT PCAP capture and do not implement PCAP-to-flow
@@ -160,11 +191,11 @@ from the checkpoint itself.
 To acquire and prepare both datasets without training, add `--prepare-only`:
 
 ```powershell
-.\bootstrap.ps1 --full --compute cpu --prepare-only --botiot-source "$HOME\Datasets\BoT-IoT" --accept-botiot-academic-license --data-root "$HOME\BitGuardData" --runs-root "$HOME\BitGuardRuns"
+.\bootstrap.ps1 --full --compute cpu --prepare-only --accept-botiot-academic-license --data-root "$HOME\BitGuardData" --runs-root "$HOME\BitGuardRuns"
 ```
 
 ```bash
-./bootstrap.sh --full --compute cpu --prepare-only --botiot-source "$HOME/datasets/BoT-IoT" --accept-botiot-academic-license --data-root "$HOME/bitguard-data" --runs-root "$HOME/bitguard-runs"
+./bootstrap.sh --full --compute cpu --prepare-only --accept-botiot-academic-license --data-root "$HOME/bitguard-data" --runs-root "$HOME/bitguard-runs"
 ```
 
 Successful preparation reports `status: "prepared"` and `next_stage: "train"`
