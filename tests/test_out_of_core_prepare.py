@@ -84,15 +84,28 @@ def _write_botiot_with_validation_only_boolean(root: Path) -> None:
     (root / "flows.csv").write_text("".join(rows), encoding="utf-8")
 
 
-def _source_contract(dataset: str, raw_root: Path, root: Path) -> tuple[Path, Path]:
+def _source_contract(
+    dataset: str,
+    raw_root: Path,
+    root: Path,
+    *,
+    acquisition_method: str | None = None,
+    acquisition_url: str | None = None,
+) -> tuple[Path, Path]:
     spec = load_registry()[dataset]
+    method = acquisition_method or (
+        "official-download" if dataset == "nbaiot" else "manual-local-source"
+    )
+    url = (
+        spec.download_url
+        if acquisition_method is None and dataset == "nbaiot"
+        else acquisition_url
+    )
     manifest = build_source_manifest(
         raw_root,
         spec,
-        acquisition_method=(
-            "official-download" if dataset == "nbaiot" else "manual-local-source"
-        ),
-        acquisition_url=spec.download_url if dataset == "nbaiot" else None,
+        acquisition_method=method,
+        acquisition_url=url,
     )
     contract = root / "contract"
     contract.mkdir(parents=True, exist_ok=True)
@@ -236,6 +249,49 @@ class FullDatasetPreparationTests(unittest.TestCase):
                 shard.write_bytes(original[:-1] + bytes([original[-1] ^ 0xFF]))
                 with self.assertRaisesRegex(RuntimeError, "checksum"):
                     verify_prepared_dataset(first.descriptor_path)
+
+    def test_botiot_approved_mirror_provenance_survives_preparation_revalidation(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core.prepare import (
+            prepare_full_dataset,
+            verify_prepared_dataset,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw"
+            _write_botiot(raw)
+            spec = load_registry()["botiot"]
+            source_manifest, schema_report = _source_contract(
+                "botiot",
+                raw,
+                root,
+                acquisition_method="approved-public-mirror",
+                acquisition_url=spec.download_url,
+            )
+            prepared = prepare_full_dataset(
+                Path(__file__).resolve().parents[1]
+                / "configs"
+                / "full"
+                / "botiot.yaml",
+                raw_root=raw,
+                source_manifest_path=source_manifest,
+                schema_report_path=schema_report,
+                output_dir=root / "prepared",
+                descriptor_path=root / "control" / "botiot.json",
+                work_dir=root / "work",
+            )
+
+            verified = verify_prepared_dataset(prepared.descriptor_path)
+            self.assertEqual(verified, prepared)
+            manifest = json.loads(
+                Path(verified.source_manifest_path).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["acquisition_method"], "approved-public-mirror"
+            )
+            self.assertEqual(manifest["acquisition_url"], spec.download_url)
 
     def test_boolean_availability_comes_from_source_not_train_usable_features(self) -> None:
         from bitguard_bnn.out_of_core.prepare import (
