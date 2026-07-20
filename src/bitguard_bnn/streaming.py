@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections import Counter, OrderedDict, deque
@@ -37,6 +38,25 @@ class _ObservedEvent:
 class _DeviceWindow:
     events: Deque[_ObservedEvent]
     known_destinations: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    protocol_counts: Counter[str] = field(default_factory=Counter)
+    destination_counts: Counter[str] = field(default_factory=Counter)
+    port_counts: Counter[int] = field(default_factory=Counter)
+    per_second_counts: Counter[int] = field(default_factory=Counter)
+    per_second_count_frequencies: Counter[int] = field(default_factory=Counter)
+    maximum_per_second_count: int = 0
+    length_sum: float = 0.0
+    outbound_length_sum: float = 0.0
+    outbound_count: int = 0
+    new_destination_count: int = 0
+    syn_count: int = 0
+    rst_count: int = 0
+    ack_only_count: int = 0
+    short_flow_count: int = 0
+    long_flow_count: int = 0
+    small_packet_count: int = 0
+    failed_connection_count: int = 0
+    interval_sum: float = 0.0
+    interval_square_sum: float = 0.0
 
 
 class MicroSecurityFeatureProcessor:
@@ -82,7 +102,7 @@ class MicroSecurityFeatureProcessor:
             self.devices[event.device_id] = state
         cutoff = event.timestamp - self.window_seconds
         while state.events and state.events[0].event.timestamp < cutoff:
-            state.events.popleft()
+            self._remove_left(state)
         new_destination = event.destination_ip not in state.known_destinations
         if event.destination_ip in state.known_destinations:
             state.known_destinations.move_to_end(event.destination_ip)
@@ -90,66 +110,131 @@ class MicroSecurityFeatureProcessor:
             state.known_destinations[event.destination_ip] = None
             if len(state.known_destinations) > self.max_known_destinations:
                 state.known_destinations.popitem(last=False)
-        state.events.append(_ObservedEvent(event, new_destination))
-        features = self._features(state.events)
+        self._append(state, _ObservedEvent(event, new_destination))
+        features = self._features(state)
         self.update_latencies_ns.append(time.perf_counter_ns() - started)
         if len(self.update_latencies_ns) > 10_000:
             self.update_latencies_ns = self.update_latencies_ns[-10_000:]
         return features
 
-    def _features(self, observed: Deque[_ObservedEvent]) -> dict[str, float]:
-        rows = list(observed)
-        events = [item.event for item in rows]
-        count = max(len(events), 1)
-        if len(events) >= 2:
-            timestamps = np.asarray([event.timestamp for event in events], dtype=np.float64)
-            interval = np.diff(timestamps)
-            duration = max(float(timestamps[-1] - timestamps[0]), 1e-3)
+    def _append(self, state: _DeviceWindow, observed: _ObservedEvent) -> None:
+        if len(state.events) >= self.max_events:
+            self._remove_left(state)
+        event = observed.event
+        if state.events:
+            interval = event.timestamp - state.events[-1].event.timestamp
+            state.interval_sum += interval
+            state.interval_square_sum += interval * interval
+        state.events.append(observed)
+        state.protocol_counts[event.protocol.strip().lower()] += 1
+        state.destination_counts[event.destination_ip] += 1
+        state.port_counts[int(event.destination_port)] += 1
+        second = int(event.timestamp)
+        previous_second_count = state.per_second_counts[second]
+        if previous_second_count:
+            _decrement(state.per_second_count_frequencies, previous_second_count)
+        current_second_count = previous_second_count + 1
+        state.per_second_counts[second] = current_second_count
+        state.per_second_count_frequencies[current_second_count] += 1
+        state.maximum_per_second_count = max(
+            state.maximum_per_second_count, current_second_count
+        )
+        state.length_sum += event.length_bytes
+        state.outbound_length_sum += event.length_bytes if event.outbound else 0.0
+        state.outbound_count += int(event.outbound)
+        state.new_destination_count += int(observed.new_destination)
+        state.syn_count += int(_has_tcp_flag(event.tcp_flags, "S", "SYN"))
+        state.rst_count += int(_has_tcp_flag(event.tcp_flags, "R", "RST"))
+        state.ack_only_count += int(_is_ack_only(event.tcp_flags))
+        state.short_flow_count += int(event.flow_duration_seconds < 1.0)
+        state.long_flow_count += int(event.flow_duration_seconds > 30.0)
+        state.small_packet_count += int(event.length_bytes < 128.0)
+        state.failed_connection_count += int(event.connection_failed)
+
+    def _remove_left(self, state: _DeviceWindow) -> None:
+        observed = state.events.popleft()
+        event = observed.event
+        if state.events:
+            interval = state.events[0].event.timestamp - event.timestamp
+            state.interval_sum -= interval
+            state.interval_square_sum -= interval * interval
+        _decrement(state.protocol_counts, event.protocol.strip().lower())
+        _decrement(state.destination_counts, event.destination_ip)
+        _decrement(state.port_counts, int(event.destination_port))
+        second = int(event.timestamp)
+        previous_second_count = state.per_second_counts[second]
+        _decrement(state.per_second_count_frequencies, previous_second_count)
+        _decrement(state.per_second_counts, second)
+        current_second_count = previous_second_count - 1
+        if current_second_count:
+            state.per_second_count_frequencies[current_second_count] += 1
+        if (
+            previous_second_count == state.maximum_per_second_count
+            and previous_second_count not in state.per_second_count_frequencies
+        ):
+            state.maximum_per_second_count = current_second_count
+        state.length_sum -= event.length_bytes
+        state.outbound_length_sum -= event.length_bytes if event.outbound else 0.0
+        state.outbound_count -= int(event.outbound)
+        state.new_destination_count -= int(observed.new_destination)
+        state.syn_count -= int(_has_tcp_flag(event.tcp_flags, "S", "SYN"))
+        state.rst_count -= int(_has_tcp_flag(event.tcp_flags, "R", "RST"))
+        state.ack_only_count -= int(_is_ack_only(event.tcp_flags))
+        state.short_flow_count -= int(event.flow_duration_seconds < 1.0)
+        state.long_flow_count -= int(event.flow_duration_seconds > 30.0)
+        state.small_packet_count -= int(event.length_bytes < 128.0)
+        state.failed_connection_count -= int(event.connection_failed)
+
+    def _features(self, state: _DeviceWindow) -> dict[str, float]:
+        event_count = len(state.events)
+        count = max(event_count, 1)
+        interval_count = max(event_count - 1, 0)
+        if event_count >= 2:
+            duration = max(
+                float(state.events[-1].event.timestamp - state.events[0].event.timestamp),
+                1e-3,
+            )
+            mean_interval = state.interval_sum / interval_count
+            interval_variance = max(
+                state.interval_square_sum / interval_count - mean_interval * mean_interval,
+                0.0,
+            )
+            jitter = math.sqrt(interval_variance)
+            stability = 1.0 / (1.0 + jitter / max(mean_interval, 1e-6))
         else:
-            interval = np.asarray([], dtype=np.float64)
             duration = max(self.window_seconds, 1e-3)
-        lengths = np.asarray([event.length_bytes for event in events], dtype=np.float64)
-        protocols = [event.protocol.strip().lower() for event in events]
-        flags = [event.tcp_flags.upper() for event in events]
-        destinations = [event.destination_ip for event in events]
-        ports = [int(event.destination_port) for event in events]
-        destination_counts = Counter(destinations)
-        port_counts = Counter(ports)
-        outbound_mask = np.asarray([event.outbound for event in events], dtype=bool)
-        flow_duration = np.asarray([event.flow_duration_seconds for event in events], dtype=np.float64)
-        per_second = Counter(int(event.timestamp) for event in events)
-        average_bin = count / max(len(per_second), 1)
-        maximum_bin = max(per_second.values(), default=0)
-        mean_interval = float(interval.mean()) if len(interval) else 0.0
-        jitter = float(interval.std()) if len(interval) else 0.0
-        stability = 1.0 / (1.0 + jitter / max(mean_interval, 1e-6)) if len(interval) else 0.0
+            mean_interval = 0.0
+            jitter = 0.0
+            stability = 0.0
+        average_bin = count / max(len(state.per_second_counts), 1)
+        maximum_bin = state.maximum_per_second_count
         feature_values = {
             "packet_rate": count / duration,
-            "byte_rate": float(lengths.sum()) / duration,
+            "byte_rate": state.length_sum / duration,
             "burst_score": maximum_bin / max(average_bin, 1e-6),
-            "tcp_ratio": protocols.count("tcp") / count,
-            "udp_ratio": protocols.count("udp") / count,
-            "icmp_ratio": protocols.count("icmp") / count,
-            "syn_ratio": sum(_has_tcp_flag(value, "S", "SYN") for value in flags) / count,
-            "rst_ratio": sum(_has_tcp_flag(value, "R", "RST") for value in flags) / count,
-            "ack_only_ratio": sum(_is_ack_only(value) for value in flags) / count,
-            "unique_destination_ip_ratio": len(destination_counts) / count,
-            "unique_destination_port_ratio": len(port_counts) / count,
-            "new_destination_ratio": sum(item.new_destination for item in rows) / count,
-            "repeated_destination_score": 1.0 - len(destination_counts) / count,
-            "repeated_port_score": 1.0 - len(port_counts) / count,
+            "tcp_ratio": state.protocol_counts["tcp"] / count,
+            "udp_ratio": state.protocol_counts["udp"] / count,
+            "icmp_ratio": state.protocol_counts["icmp"] / count,
+            "syn_ratio": state.syn_count / count,
+            "rst_ratio": state.rst_count / count,
+            "ack_only_ratio": state.ack_only_count / count,
+            "unique_destination_ip_ratio": len(state.destination_counts) / count,
+            "unique_destination_port_ratio": len(state.port_counts) / count,
+            "new_destination_ratio": state.new_destination_count / count,
+            "repeated_destination_score": 1.0 - len(state.destination_counts) / count,
+            "repeated_port_score": 1.0 - len(state.port_counts) / count,
             "interarrival_mean": mean_interval,
             "interarrival_jitter": jitter,
             "interarrival_stability": stability,
-            "periodicity_score": stability if len(interval) >= 3 else 0.0,
-            "outbound_packet_ratio": float(outbound_mask.mean()) if len(outbound_mask) else 0.0,
+            "periodicity_score": stability if interval_count >= 3 else 0.0,
+            "outbound_packet_ratio": state.outbound_count / count,
             "outbound_byte_ratio": (
-                float(lengths[outbound_mask].sum() / max(lengths.sum(), 1.0)) if len(lengths) else 0.0
+                state.outbound_length_sum / max(state.length_sum, 1.0) if event_count else 0.0
             ),
-            "short_flow_ratio": float(np.mean(flow_duration < 1.0)) if len(flow_duration) else 0.0,
-            "long_flow_ratio": float(np.mean(flow_duration > 30.0)) if len(flow_duration) else 0.0,
-            "small_packet_ratio": float(np.mean(lengths < 128.0)) if len(lengths) else 0.0,
-            "failed_connection_score": sum(event.connection_failed for event in events) / count,
+            "short_flow_ratio": state.short_flow_count / count,
+            "long_flow_ratio": state.long_flow_count / count,
+            "small_packet_ratio": state.small_packet_count / count,
+            "failed_connection_score": state.failed_connection_count / count,
         }
         return {name: float(feature_values[name]) for name in COMMON_STREAM_FEATURES}
 
@@ -263,6 +348,12 @@ def _as_bool(value: object, default: bool) -> bool:
 
 def _as_float(value: object, default: float = 0.0) -> float:
     return default if pd.isna(value) else float(value)
+
+
+def _decrement(counter: Counter, key: object) -> None:
+    counter[key] -= 1
+    if counter[key] <= 0:
+        del counter[key]
 
 
 def _flag_tokens(value: str) -> set[str]:

@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .state import TemporalSecurityStateMachine
+from .state import TemporalSecurityStateMachine, temporal_state_key
 
 
 @dataclass
@@ -197,7 +197,9 @@ class CascadeStreamRouter:
 
     @staticmethod
     def _state_key(row: pd.Series) -> str:
-        return f"{row.get('source_file', 'default_episode')}::{row['device_id']}"
+        return temporal_state_key(
+            row.get("source_file", "default_episode"), row["device_id"]
+        )
 
     def replay_batch(
         self, metadata: pd.DataFrame, routed_probabilities: np.ndarray

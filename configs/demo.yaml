@@ -59,7 +59,7 @@ training:
   patience: 3
   num_workers: 0
   device: auto
-  amp: false
+  amp: true
 
 cascade:
   enabled: true

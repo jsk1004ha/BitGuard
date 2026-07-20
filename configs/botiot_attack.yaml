@@ -1,57 +1,37 @@
 experiment:
-  name: common_stream_full
+  name: botiot_attack
   output_dir: runs
   seed: 2309
 
 dataset:
-  type: csv
-  path: data/common_stream_features.csv
-  label_column: behavior_label
-  raw_attack_column: raw_attack
-  device_column: device_id
-  time_column: timestamp
+  type: botiot
+  path: data/BoT-IoT/**/*.csv
   chunk_size: 200000
-  max_rows_per_file: null
-  max_rows_per_class: null
+  max_rows_per_file: 500000
+  max_rows_per_class: 500000
+  max_loaded_rows: 5000000
+  label_column: category
+  raw_attack_column: subcategory
+  device_column: saddr
+  time_column: stime
+  drop_columns: [pkSeqID, seq, saddr, daddr, sport, dport, smac, dmac]
 
 split:
-  strategy: time
+  strategy: attack
   train_fraction: 0.70
   validation_fraction: 0.15
   test_fraction: 0.15
+  held_out_devices: []
+  held_out_attacks: [keylogging, data_exfiltration]
   seed: 2309
 
 preprocess:
-  feature_budget: 24
-  selection: expert
-  expert_features:
-    - packet_rate
-    - byte_rate
-    - burst_score
-    - tcp_ratio
-    - udp_ratio
-    - icmp_ratio
-    - syn_ratio
-    - rst_ratio
-    - ack_only_ratio
-    - unique_destination_ip_ratio
-    - unique_destination_port_ratio
-    - new_destination_ratio
-    - repeated_destination_score
-    - repeated_port_score
-    - interarrival_mean
-    - interarrival_jitter
-    - interarrival_stability
-    - periodicity_score
-    - outbound_packet_ratio
-    - outbound_byte_ratio
-    - short_flow_ratio
-    - long_flow_ratio
-    - small_packet_ratio
-    - failed_connection_score
+  feature_budget: 32
+  selection: cost_aware
   scaler: robust
-  encoder: thermometer
+  encoder: hybrid
   thermometer_bits: 2
+  feature_cost_csv: null
   open_set:
     enabled: true
     confidence_threshold: 0.60
@@ -71,39 +51,32 @@ loss:
   lambda_feature: 0.01
   beta_fn: 0.25
   gamma_fp: 0.05
-  distillation_alpha: 0.0
 
 training:
-  epochs: 40
+  epochs: 30
   batch_size: 2048
   learning_rate: 0.001
   weight_decay: 0.0001
-  patience: 8
+  patience: 6
   num_workers: 4
   device: auto
   amp: true
-  selection_weights: {macro_f1: 0.5, macro_auprc: 0.3, attack_recall: 0.2}
 
 cascade:
-  enabled: true
-  boolean_fast_path_enabled: true
-  tiny_feature_budget: 8
+  enabled: false
+  tiny_feature_budget: 12
   hidden_dims: [16]
   min_attack_recall: 0.995
   threshold_grid_size: 201
   temporal_penalty: 0.30
-  use_temporal_state: true
   false_negative_cost: 0.10
   device_criticality_default: 0.0
-  device_criticality: {}
 
 temporal:
   enabled: true
   increment: 2
   decay: 1
   evidence_threshold: 0.45
-  max_devices: 4096
-  decay_interval_seconds: 60
   risk_weights: {model: 0.55, scan: 0.13, flood: 0.13, beacon: 0.10, unknown: 0.14, benign: 0.08}
   action_thresholds: [0.18, 0.30, 0.44, 0.60, 0.78]
 
@@ -113,4 +86,3 @@ evaluation:
   make_plots: true
   benchmark_warmup: 50
   benchmark_repeats: 500
-

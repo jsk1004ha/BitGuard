@@ -27,6 +27,24 @@ class DataSplit:
     manifest: dict[str, Any]
 
 
+class _RowBudget:
+    """Shared source-row budget consumed as CSV chunks are read."""
+
+    def __init__(self, limit: int | None) -> None:
+        self.limit = limit
+        self.consumed = 0
+        if limit is not None and limit <= 0:
+            raise ValueError("max_loaded_rows must be positive or null")
+
+    def consume(self, rows: int) -> None:
+        self.consumed += int(rows)
+        if self.limit is not None and self.consumed > self.limit:
+            raise MemoryError(
+                "dataset.max_loaded_rows exceeded while reading CSV chunks; increase the "
+                "explicit limit only after confirming available host memory"
+            )
+
+
 def _file_digest(path: Path, block_size: int = 1 << 20) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -40,23 +58,37 @@ def _read_csv_chunks(
     chunk_size: int,
     max_rows: int | None,
     seed: int,
+    row_budget: _RowBudget | None = None,
 ) -> pd.DataFrame:
     if max_rows is not None and max_rows <= 0:
         raise ValueError("max_rows must be positive or null")
-    kept: pd.DataFrame | None = None
+    candidates: list[pd.DataFrame] = []
+    candidate_rows = 0
     rng = np.random.default_rng(seed)
-    for chunk in pd.read_csv(path, chunksize=chunk_size, low_memory=False):
-        chunk = chunk.copy()
-        chunk["__source_row_index"] = chunk.index.to_numpy(dtype=np.int64)
-        if max_rows is None:
-            kept = chunk if kept is None else pd.concat([kept, chunk], ignore_index=True)
-            continue
-        chunk["__sample_key"] = rng.random(len(chunk))
-        kept = chunk if kept is None else pd.concat([kept, chunk], ignore_index=True)
-        if len(kept) > max_rows * 2:
-            kept = kept.nsmallest(max_rows, "__sample_key")
-    if kept is None:
+    reader = pd.read_csv(path, chunksize=chunk_size, low_memory=False)
+    try:
+        for chunk in reader:
+            if row_budget is not None:
+                row_budget.consume(len(chunk))
+            chunk = chunk.copy()
+            chunk["__source_row_index"] = chunk.index.to_numpy(dtype=np.int64)
+            if max_rows is not None:
+                chunk["__sample_key"] = rng.random(len(chunk))
+            candidates.append(chunk)
+            candidate_rows += len(chunk)
+            if max_rows is not None and candidate_rows > max_rows * 2:
+                retained = pd.concat(candidates, ignore_index=True).nsmallest(
+                    max_rows, "__sample_key"
+                )
+                candidates = [retained]
+                candidate_rows = len(retained)
+    finally:
+        close = getattr(reader, "close", None)
+        if callable(close):
+            close()
+    if not candidates:
         raise ValueError(f"empty CSV: {path}")
+    kept = pd.concat(candidates, ignore_index=True)
     if max_rows is not None and len(kept) > max_rows:
         kept = kept.nsmallest(max_rows, "__sample_key")
     return (

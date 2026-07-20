@@ -184,6 +184,42 @@ def clamp_binary_master_weights(model: nn.Module) -> None:
                 module.weight.clamp_(-1.0, 1.0)
 
 
+def classifier_active_inputs(model: nn.Module) -> tuple[np.ndarray, np.ndarray]:
+    """Return hard-selected feature groups and their encoded classifier columns."""
+
+    gate = getattr(model, "feature_gate", None)
+    if gate is None:
+        if hasattr(model, "blocks") and len(model.blocks):
+            input_dim = int(model.blocks[0][0].in_features)
+        elif hasattr(model, "network") and len(model.network):
+            input_dim = int(model.network[0].in_features)
+        else:
+            raise ValueError("cannot determine model input dimension")
+        indices = np.arange(input_dim, dtype=np.int64)
+        return indices.copy(), indices
+    probabilities = gate.probabilities().detach().cpu().numpy()
+    groups = gate.input_groups.detach().cpu().numpy().astype(np.int64, copy=False)
+    active_groups = np.flatnonzero(probabilities >= 0.5).astype(np.int64)
+    active_inputs = np.flatnonzero(np.isin(groups, active_groups)).astype(np.int64)
+    return active_groups, active_inputs
+
+
+def feature_gate_summary(model: nn.Module) -> dict[str, Any]:
+    gate = getattr(model, "feature_gate", None)
+    if gate is None:
+        return {"feature_gate_enabled": False}
+    active_groups, active_inputs = classifier_active_inputs(model)
+    probabilities = gate.probabilities().detach().cpu().numpy()
+    return {
+        "feature_gate_enabled": True,
+        "feature_groups": int(len(probabilities)),
+        "active_groups": int(len(active_groups)),
+        "active_encoded_inputs": int(len(active_inputs)),
+        "active_group_indices": active_groups.tolist(),
+        "gate_probabilities": probabilities.astype(float).tolist(),
+    }
+
+
 def parameter_summary(model: nn.Module) -> dict[str, int]:
     parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)

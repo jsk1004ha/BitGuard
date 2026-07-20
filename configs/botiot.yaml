@@ -9,6 +9,7 @@ dataset:
   chunk_size: 200000
   max_rows_per_file: 500000
   max_rows_per_class: 500000
+  max_loaded_rows: 5000000
   label_column: category
   raw_attack_column: subcategory
   device_column: saddr
@@ -21,7 +22,6 @@ split:
   validation_fraction: 0.15
   test_fraction: 0.15
   held_out_devices: []
-  held_out_attacks: [keylogging, data_exfiltration]
   seed: 2309
 
 preprocess:
@@ -59,7 +59,7 @@ training:
   patience: 6
   num_workers: 4
   device: auto
-  amp: false
+  amp: true
 
 cascade:
   enabled: false

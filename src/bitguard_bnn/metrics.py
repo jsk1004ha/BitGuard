@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -19,15 +20,65 @@ from sklearn.metrics import (
 from .constants import CANONICAL_LABELS
 
 
+def calibrate_fixed_fpr_thresholds(
+    y_true: np.ndarray,
+    probability_labels: list[str],
+    probabilities: np.ndarray,
+    target_fprs: Sequence[float] = (1e-2, 1e-3),
+) -> dict[float, float]:
+    """Calibrate attack-score thresholds from benign validation examples only."""
+    y_true = np.asarray(y_true, dtype=str)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if probabilities.ndim != 2 or probabilities.shape[0] != y_true.shape[0]:
+        raise ValueError("probabilities must be a two-dimensional array aligned with y_true")
+    if probabilities.shape[1] != len(probability_labels):
+        raise ValueError("probability_labels must match the probability columns")
+    if "benign" not in probability_labels:
+        raise ValueError("fixed-FPR calibration requires a benign probability column")
+    benign_mask = y_true == "benign"
+    if not benign_mask.any():
+        raise ValueError("fixed-FPR calibration requires benign validation examples")
+
+    benign_column = probability_labels.index("benign")
+    benign_attack_scores = 1.0 - probabilities[benign_mask, benign_column]
+    thresholds: dict[float, float] = {}
+    for value in target_fprs:
+        target_fpr = float(value)
+        if not 0.0 < target_fpr < 1.0:
+            raise ValueError("target FPR values must be between 0 and 1")
+        allowed_false_positives = int(
+            np.floor(target_fpr * len(benign_attack_scores) + 1e-12)
+        )
+        descending = np.sort(benign_attack_scores)[::-1]
+        if allowed_false_positives == 0:
+            threshold = np.nextafter(descending[0], np.inf)
+        else:
+            threshold = descending[allowed_false_positives - 1]
+            if int(np.count_nonzero(benign_attack_scores >= threshold)) > allowed_false_positives:
+                threshold = np.nextafter(threshold, np.inf)
+        thresholds[target_fpr] = float(threshold)
+    return thresholds
+
+
 def classification_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     probability_labels: list[str],
     probabilities: np.ndarray,
     high_risk_labels: list[str],
+    operating_thresholds: Mapping[float, float] | None = None,
 ) -> dict[str, Any]:
     y_true = np.asarray(y_true, dtype=str)
     y_pred = np.asarray(y_pred, dtype=str)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if probabilities.ndim != 2 or probabilities.shape[0] != y_true.shape[0]:
+        raise ValueError("probabilities must be a two-dimensional array aligned with y_true")
+    if probabilities.shape[1] != len(probability_labels):
+        raise ValueError("probability_labels must match the probability columns")
+    if y_pred.shape != y_true.shape:
+        raise ValueError("y_pred must be aligned with y_true")
+    if not set(y_true).issubset(probability_labels):
+        raise ValueError("every true label must have a probability column")
     labels = [label for label in CANONICAL_LABELS if label in set(y_true) | set(y_pred)]
     precision, recall, f1, support = precision_recall_fscore_support(
         y_true, y_pred, labels=labels, zero_division=0
@@ -90,14 +141,26 @@ def classification_metrics(
     attack_score = 1.0 - benign_probability
     benign_mask = y_true == "benign"
     attack_mask = ~benign_mask
-    fixed_fpr: dict[str, float | None] = {}
-    if benign_mask.any() and attack_mask.any():
-        for target_fpr in (1e-2, 1e-3):
-            threshold = float(np.quantile(attack_score[benign_mask], 1.0 - target_fpr))
-            fixed_fpr[f"attack_recall_at_benign_fpr_{target_fpr:g}"] = float(
-                np.mean(attack_score[attack_mask] >= threshold)
+    fixed_fpr: dict[str, Any] = {}
+    if operating_thresholds:
+        fixed_fpr["threshold_source"] = "validation"
+        for raw_target_fpr, raw_threshold in sorted(operating_thresholds.items()):
+            target_fpr = float(raw_target_fpr)
+            threshold = float(raw_threshold)
+            if not 0.0 < target_fpr < 1.0 or not np.isfinite(threshold):
+                raise ValueError("fixed-FPR operating points must contain valid targets and thresholds")
+            suffix = f"{target_fpr:g}"
+            fixed_fpr[f"attack_recall_at_benign_fpr_{suffix}"] = (
+                float(np.mean(attack_score[attack_mask] >= threshold))
+                if attack_mask.any()
+                else None
             )
-            fixed_fpr[f"threshold_at_benign_fpr_{target_fpr:g}"] = threshold
+            fixed_fpr[f"observed_benign_fpr_at_target_{suffix}"] = (
+                float(np.mean(attack_score[benign_mask] >= threshold))
+                if benign_mask.any()
+                else None
+            )
+            fixed_fpr[f"threshold_at_benign_fpr_{suffix}"] = threshold
     metrics["fixed_fpr"] = fixed_fpr
     return metrics
 
