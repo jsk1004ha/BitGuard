@@ -25,6 +25,7 @@ from bitguard_bnn.bootstrap.orchestrator import (
     _lock_path,
     run_bootstrap,
 )
+from bitguard_bnn.bootstrap.registry import load_registry
 from bitguard_bnn.bootstrap.state import BootstrapWriterLock
 from bitguard_bnn.bootstrap.types import BootstrapOptions
 
@@ -133,6 +134,118 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertEqual(report["reports"]["bootstrap"], report["report_path"])
         persisted = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
         self.assertEqual(persisted, report)
+
+    def test_automatic_botiot_uses_exact_pinned_public_mirror_contract(self) -> None:
+        botiot_archive = self.root / "botiot-public-mirror.zip"
+        with zipfile.ZipFile(botiot_archive, "w") as archive:
+            archive.writestr(
+                "data_1.csv",
+                "category,subcategory,saddr,stime,bytes,rate\n"
+                "Normal,Normal,10.0.0.1,1.5,100,2.0\n"
+                "DDoS,TCP,10.0.0.2,2.5,200,3.0\n",
+            )
+        calls: list[tuple[str, int | None, str | None]] = []
+
+        def public_mirror_download(
+            url,
+            destination,
+            *,
+            expected_bytes=None,
+            expected_sha256=None,
+            **_kwargs,
+        ):
+            destination = Path(destination)
+            payload = botiot_archive.read_bytes()
+            destination.write_bytes(payload)
+            calls.append((url, expected_bytes, expected_sha256))
+            return DownloadResult(
+                destination=str(destination),
+                byte_size=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                resumed=False,
+                restarted=False,
+                reused=False,
+                source_url=url,
+                final_response_url="https://storage.googleapis.test/temporary-object",
+            )
+
+        options = replace(
+            self.options,
+            datasets=("botiot",),
+            botiot_source=None,
+            accepted_botiot_license=True,
+        )
+        report = run_bootstrap(
+            options,
+            dependencies=BootstrapDependencies(
+                available_bytes=10**12,
+                compute_resolver=self.dependencies().compute_resolver,
+                downloader=public_mirror_download,
+            ),
+        )
+
+        spec = load_registry()["botiot"]
+        self.assertEqual(report["status"], "sources_verified", msg=report["error"])
+        self.assertEqual(
+            calls,
+            [(spec.download_url, spec.download_bytes, spec.download_sha256)],
+        )
+        preflight = json.loads(
+            Path(report["reports"]["preflight"]).read_text(encoding="utf-8")
+        )
+        breakdown = preflight["resources"]["request"]["breakdown"]
+        self.assertEqual(breakdown["final_downloads"], spec.download_bytes)
+        self.assertEqual(breakdown["partial_downloads"], spec.download_bytes)
+        self.assertEqual(
+            breakdown["extracted_data"],
+            spec.download_bytes * 12,
+        )
+        manifest = json.loads(
+            Path(report["manifests"]["botiot"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["acquisition_method"], "approved-public-mirror")
+        self.assertEqual(manifest["acquisition_url"], spec.download_url)
+        self.assertNotIn("storage.googleapis.test", json.dumps(report))
+
+    def test_manual_botiot_source_takes_precedence_without_network(self) -> None:
+        def reject_network(*_args, **_kwargs):
+            raise AssertionError("manual BoT-IoT source must prevent public download")
+
+        options = replace(self.options, datasets=("botiot",))
+        report = run_bootstrap(
+            options,
+            dependencies=replace(self.dependencies(), downloader=reject_network),
+        )
+
+        self.assertEqual(report["status"], "sources_verified", msg=report["error"])
+        manifest = json.loads(
+            Path(report["manifests"]["botiot"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["acquisition_method"], "manual-local-source")
+        self.assertIsNone(manifest["acquisition_url"])
+
+    def test_automatic_botiot_still_requires_license_acknowledgement(self) -> None:
+        def reject_network(*_args, **_kwargs):
+            raise AssertionError("license failure must happen before network access")
+
+        options = replace(
+            self.options,
+            datasets=("botiot",),
+            botiot_source=None,
+            accepted_botiot_license=False,
+        )
+        report = run_bootstrap(
+            options,
+            dependencies=BootstrapDependencies(
+                available_bytes=10**12,
+                compute_resolver=self.dependencies().compute_resolver,
+                downloader=reject_network,
+            ),
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["failed_stage"], "preflight")
+        self.assertIn("license", str(report["error"]).casefold())
 
     def test_partial_all_dataset_restart_counts_only_strictly_verified_pending_space(
         self,

@@ -100,6 +100,12 @@ def _normalize_sha256(value: object) -> str:
     return value
 
 
+def _normalize_expected_bytes(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise DownloadError("expected_bytes must be a positive integer.")
+    return value
+
+
 def _resolved_destination(destination: Path | str) -> Path:
     raw = Path(destination).expanduser()
     try:
@@ -620,6 +626,7 @@ def download_file(
     source_url: str,
     destination: Path | str,
     *,
+    expected_bytes: int | None = None,
     expected_sha256: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -627,6 +634,11 @@ def download_file(
     """Download one URL through a sole resumable ``.partial`` path."""
 
     safe_source = sanitize_url(source_url)
+    expected_bytes = (
+        None
+        if expected_bytes is None
+        else _normalize_expected_bytes(expected_bytes)
+    )
     expected_sha256 = (
         None if expected_sha256 is None else _normalize_sha256(expected_sha256)
     )
@@ -656,6 +668,11 @@ def download_file(
                 f"Existing download {target} changed identity before it could be reused."
             )
         _require_path_identity(target, hashed_identity, subject="Existing download")
+        if expected_bytes is not None and size != expected_bytes:
+            raise DownloadError(
+                f"Existing download {target} does not match expected_bytes and will "
+                "not be reused."
+            )
         if digest != expected_sha256:
             raise DownloadError(
                 f"Existing download {target} does not match the expected SHA-256 and will "
@@ -789,6 +806,11 @@ def download_file(
                 f"Complete partial size mismatch for {safe_source}: expected "
                 f"{expected_total} bytes but copied {snapshot.byte_size}; the partial was "
                 "not published."
+            )
+        if expected_bytes is not None and snapshot.byte_size != expected_bytes:
+            raise DownloadError(
+                "Downloaded content does not match expected_bytes; verified publication "
+                f"was refused and {partial} remains resumable."
             )
         if partial_stat.st_size != snapshot.byte_size:
             raise DownloadError(

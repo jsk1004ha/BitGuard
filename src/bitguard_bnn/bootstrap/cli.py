@@ -29,8 +29,15 @@ def add_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("all", *DATASETS),
         help="dataset to prepare; may be repeated",
     )
-    parser.add_argument("--botiot-source")
-    parser.add_argument("--accept-botiot-academic-license", action="store_true")
+    parser.add_argument(
+        "--botiot-source",
+        help="optional local BoT-IoT directory, ZIP, or RAR override",
+    )
+    parser.add_argument(
+        "--accept-botiot-academic-license",
+        action="store_true",
+        help="confirm review of the official UNSW academic-use terms",
+    )
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--runs-root", default="runs")
     parser.add_argument("--compute", choices=COMPUTE_PROFILES, default="auto")
@@ -51,8 +58,6 @@ def _selected_datasets(full: bool, requested: list[str] | None) -> tuple[str, ..
 
 def options_from_namespace(args: argparse.Namespace) -> BootstrapOptions:
     datasets = _selected_datasets(args.full, args.dataset)
-    if "botiot" in datasets and args.botiot_source is None:
-        raise ValueError("BoT-IoT selection requires --botiot-source from the official project")
     if "botiot" in datasets and not args.accept_botiot_academic_license:
         raise ValueError(
             "BoT-IoT selection requires --accept-botiot-academic-license after reviewing its terms"

@@ -16,6 +16,14 @@ NBAIOT_DOWNLOAD_URL = (
 )
 NBAIOT_DOI = "10.24432/C5RC8J"
 BOTIOT_PROJECT_URL = "https://research.unsw.edu.au/projects/bot-iot-dataset"
+BOTIOT_DOWNLOAD_URL = (
+    "https://www.kaggle.com/api/v1/datasets/download/"
+    "vigneshvenkateswaran/bot-iot?datasetVersionNumber=1"
+)
+BOTIOT_DOWNLOAD_BYTES = 1_257_092_644
+BOTIOT_DOWNLOAD_SHA256 = (
+    "7869754e4b6192b45d4497be94cc34d621e1db81b6f76189e72ec4077e85bd75"
+)
 
 
 def _validate_https_url(dataset: str, field: str, value: str | None) -> None:
@@ -47,8 +55,16 @@ def _validate_official_sources(registry: dict[str, DatasetSpec]) -> None:
     botiot = registry["botiot"]
     if botiot.project_url != BOTIOT_PROJECT_URL:
         raise ValueError("botiot.project_url must use the official UNSW project identity")
-    if botiot.download_url is not None:
-        raise ValueError("botiot must not define download_url; provide the source explicitly")
+    if botiot.download_url != BOTIOT_DOWNLOAD_URL:
+        raise ValueError(
+            "botiot.download_url must pin the approved Kaggle dataset version 1"
+        )
+    if botiot.download_bytes != BOTIOT_DOWNLOAD_BYTES:
+        raise ValueError(f"botiot.download_bytes must be {BOTIOT_DOWNLOAD_BYTES}")
+    if botiot.download_sha256 != BOTIOT_DOWNLOAD_SHA256:
+        raise ValueError(
+            "botiot.download_sha256 must match the accepted archive revision"
+        )
 
 
 def load_registry(path: Path | None = None) -> dict[str, DatasetSpec]:

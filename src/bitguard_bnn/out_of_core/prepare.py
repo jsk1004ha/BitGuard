@@ -718,10 +718,8 @@ def _validate_source_contract_against_disk(
     rebuilt = build_source_manifest(
         Path(prepared.raw_root),
         spec,
-        acquisition_method=(
-            "official-download" if prepared.dataset == "nbaiot" else "manual-local-source"
-        ),
-        acquisition_url=spec.download_url if prepared.dataset == "nbaiot" else None,
+        acquisition_method=manifest.acquisition_method,
+        acquisition_url=manifest.acquisition_url,
     )
     if rebuilt.to_dict() != manifest.to_dict():
         raise RuntimeError("raw source no longer matches its source manifest")

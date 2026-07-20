@@ -19,7 +19,7 @@ from .types import DatasetSpec
 
 MANIFEST_FORMAT_VERSION = 2
 ALLOWED_ACQUISITION_METHODS = frozenset(
-    {"official-download", "manual-local-source"}
+    {"approved-public-mirror", "official-download", "manual-local-source"}
 )
 _DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
 _TEMP_CREATE_ATTEMPTS = 16
@@ -223,9 +223,24 @@ def _validate_acquisition_metadata(
             f"Dataset metadata for {spec.name!r} does not match the official registry."
         )
     if spec.name == "botiot":
-        if method != "manual-local-source" or acquisition_url is not None:
+        if method == "manual-local-source":
+            if acquisition_url is not None:
+                raise SourceManifestError(
+                    "A manual BoT-IoT source must never record an acquisition URL."
+                )
+            return
+        if method != "approved-public-mirror":
             raise SourceManifestError(
-                "BoT-IoT must use manual-local-source and must never record an acquisition URL."
+                "BoT-IoT must use manual-local-source or approved-public-mirror."
+            )
+        if acquisition_url is None:
+            raise SourceManifestError(
+                "The approved BoT-IoT public mirror requires its pinned URL."
+            )
+        _validate_https_without_credentials(acquisition_url, "acquisition_url")
+        if acquisition_url != spec.download_url:
+            raise SourceManifestError(
+                "BoT-IoT acquisition URL does not match the approved public mirror."
             )
         return
     if spec.name == "nbaiot":

@@ -70,6 +70,8 @@ class SourceContext(TypedDict):
     digest: str | None
     bytes: int
     source: Path | None
+    acquisition_method: str
+    acquisition_url: str | None
 
 
 def _group_preparation_disk_requirements(
@@ -2127,6 +2129,7 @@ def run_bootstrap(
                 _resolved_local_path(options.runs_root, "runs_root")
                 source_context: dict[str, SourceContext] = {}
                 if "nbaiot" in options.datasets:
+                    spec = registry["nbaiot"]
                     if deps.nbaiot_archive is None:
                         remote_bytes = (
                             deps.nbaiot_download_size or UNKNOWN_REMOTE_ARCHIVE_BYTES
@@ -2136,6 +2139,8 @@ def run_bootstrap(
                             "digest": None,
                             "bytes": remote_bytes,
                             "source": None,
+                            "acquisition_method": "official-download",
+                            "acquisition_url": spec.download_url,
                         }
                     else:
                         source = deps.nbaiot_archive.expanduser().resolve(strict=True)
@@ -2149,46 +2154,66 @@ def run_bootstrap(
                             "digest": digest,
                             "bytes": size,
                             "source": source,
+                            "acquisition_method": "official-download",
+                            "acquisition_url": spec.download_url,
                         }
                 if "botiot" in options.datasets:
-                    if (
-                        not options.accepted_botiot_license
-                        or options.botiot_source is None
-                    ):
+                    if not options.accepted_botiot_license:
                         raise RuntimeError(
-                            "BoT-IoT requires a local source and explicit "
-                            "academic-license acknowledgement"
+                            "BoT-IoT requires explicit academic-license acknowledgement"
                         )
-                    _resolved_local_path(options.botiot_source, "botiot_source")
-                    source = options.botiot_source.resolve(strict=True)
-                    try:
-                        source.relative_to(options.data_root)
-                    except ValueError:
-                        pass
+                    spec = registry["botiot"]
+                    if options.botiot_source is None:
+                        if (
+                            spec.download_url is None
+                            or spec.download_bytes is None
+                            or spec.download_sha256 is None
+                        ):
+                            raise RuntimeError(
+                                "Automatic BoT-IoT acquisition requires a pinned URL, "
+                                "byte count, and SHA-256 in the dataset registry"
+                            )
+                        source_context["botiot"] = {
+                            "kind": "zip",
+                            "digest": None,
+                            "bytes": spec.download_bytes,
+                            "source": None,
+                            "acquisition_method": "approved-public-mirror",
+                            "acquisition_url": spec.download_url,
+                        }
                     else:
-                        raise RuntimeError(
-                            "BoT-IoT source must be outside the bootstrap data root"
-                        )
-                    try:
-                        source.relative_to(options.runs_root)
-                    except ValueError:
-                        pass
-                    else:
-                        raise RuntimeError(
-                            "BoT-IoT source must be outside the bootstrap runs root"
-                        )
-                    kind = _source_kind(source)
-                    if kind == "directory":
-                        _reject_excluded_capture_files(source)
-                        digest, size, _files = _tree_digest(source)
-                    else:
-                        digest, size = _regular_digest(source)
-                    source_context["botiot"] = {
-                        "kind": kind,
-                        "digest": digest,
-                        "bytes": size,
-                        "source": source,
-                    }
+                        _resolved_local_path(options.botiot_source, "botiot_source")
+                        source = options.botiot_source.resolve(strict=True)
+                        try:
+                            source.relative_to(options.data_root)
+                        except ValueError:
+                            pass
+                        else:
+                            raise RuntimeError(
+                                "BoT-IoT source must be outside the bootstrap data root"
+                            )
+                        try:
+                            source.relative_to(options.runs_root)
+                        except ValueError:
+                            pass
+                        else:
+                            raise RuntimeError(
+                                "BoT-IoT source must be outside the bootstrap runs root"
+                            )
+                        kind = _source_kind(source)
+                        if kind == "directory":
+                            _reject_excluded_capture_files(source)
+                            digest, size, _files = _tree_digest(source)
+                        else:
+                            digest, size = _regular_digest(source)
+                        source_context["botiot"] = {
+                            "kind": kind,
+                            "digest": digest,
+                            "bytes": size,
+                            "source": source,
+                            "acquisition_method": "manual-local-source",
+                            "acquisition_url": None,
+                        }
 
                 source_fingerprints: dict[str, str] = {}
                 for dataset, context in source_context.items():
@@ -2215,9 +2240,11 @@ def run_bootstrap(
                     ArchiveInspection(()),
                     final_download_bytes=download_bytes,
                     planned_partial_bytes=(
-                        source_context["nbaiot"]["bytes"]
-                        if deps.nbaiot_archive is None and "nbaiot" in source_context
-                        else 0
+                        sum(
+                            item["bytes"]
+                            for item in source_context.values()
+                            if item["source"] is None
+                        )
                     ),
                     extracted_bytes=archive_bytes * ARCHIVE_EXPANSION_FACTOR
                     + directory_bytes,
@@ -2426,7 +2453,7 @@ def run_bootstrap(
                         candidate = destination.parent / (
                             f".bitguard-acquire-{dataset}-{uuid.uuid4().hex}"
                         )
-                        if dataset == "nbaiot" and source is None:
+                        if source is None:
                             spec = registry[dataset]
                             assert spec.download_url is not None
                             prior_hash = (
@@ -2437,9 +2464,16 @@ def run_bootstrap(
                             result = deps.downloader(
                                 spec.download_url,
                                 candidate,
-                                expected_sha256=prior_hash,
+                                expected_bytes=spec.download_bytes,
+                                expected_sha256=(
+                                    spec.download_sha256 or prior_hash
+                                ),
                             )
                             dataset_report = result.to_dict()
+                            dataset_report.pop("final_response_url", None)
+                            dataset_report["method"] = context[
+                                "acquisition_method"
+                            ]
                             dataset_report["destination"] = str(destination)
                         elif kind == "directory":
                             assert isinstance(source, Path) and isinstance(digest, str)
@@ -2754,14 +2788,12 @@ def run_bootstrap(
                         manifest = build_source_manifest(
                             raw_root,
                             spec,
-                            acquisition_method=(
-                                "official-download"
-                                if dataset == "nbaiot"
-                                else "manual-local-source"
-                            ),
-                            acquisition_url=(
-                                spec.download_url if dataset == "nbaiot" else None
-                            ),
+                            acquisition_method=source_context[dataset][
+                                "acquisition_method"
+                            ],
+                            acquisition_url=source_context[dataset][
+                                "acquisition_url"
+                            ],
                         )
                         manifest_path = manifest_root / f"{dataset}-{source_token}.json"
                         write_source_manifest(manifest_path, manifest)
