@@ -10,6 +10,18 @@ from scripts import bootstrap
 
 
 class BootstrapEntryTest(unittest.TestCase):
+    def test_build_command_forwards_automatic_full_download(self):
+        command = bootstrap.build_package_command(
+            Path(".venv"),
+            ["--full", "--accept-botiot-academic-license"],
+        )
+
+        self.assertEqual(
+            command[-3:],
+            ["bootstrap", "--full", "--accept-botiot-academic-license"],
+        )
+        self.assertNotIn("--botiot-source", command)
+
     def test_build_command_forwards_full_source_and_license(self):
         command = bootstrap.build_package_command(
             Path(".venv"),

@@ -180,15 +180,31 @@ class BootstrapOptionsTest(unittest.TestCase):
 
         self.assertIs(restart_action.choices, STAGE_ORDER)
 
-    def test_full_all_requires_botiot_source_and_license(self):
-        with self.assertRaisesRegex(ValueError, "botiot-source"):
-            parse_bootstrap_options(["--full", "--dataset", "all"])
+    def test_full_all_allows_automatic_botiot_with_license(self):
+        options = parse_bootstrap_options(
+            ["--full", "--accept-botiot-academic-license"]
+        )
 
-    def test_full_all_reports_missing_license_after_source(self):
+        self.assertEqual(options.datasets, ("nbaiot", "botiot"))
+        self.assertIsNone(options.botiot_source)
+        self.assertTrue(options.accepted_botiot_license)
+
+    def test_full_all_requires_botiot_license_before_acquisition(self):
         with self.assertRaisesRegex(ValueError, "accept-botiot-academic-license"):
-            parse_bootstrap_options(
-                ["--full", "--dataset", "all", "--botiot-source", "official.zip"]
-            )
+            parse_bootstrap_options(["--full"])
+
+    def test_manual_botiot_source_remains_an_optional_override(self):
+        options = parse_bootstrap_options(
+            [
+                "--dataset",
+                "botiot",
+                "--botiot-source",
+                "official.zip",
+                "--accept-botiot-academic-license",
+            ]
+        )
+
+        self.assertEqual(options.botiot_source, Path("official.zip").resolve())
 
     def test_nbaiot_only_does_not_require_botiot_source_or_license(self):
         options = parse_bootstrap_options(["--dataset", "nbaiot"])
