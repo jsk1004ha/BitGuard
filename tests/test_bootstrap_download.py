@@ -38,6 +38,8 @@ class _RangeServer:
         self.data = data
         self.mode = mode
         self.requests: list[dict[str, str]] = []
+        self.paths: list[str] = []
+        self.redirect_generation = 0
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -45,7 +47,20 @@ class _RangeServer:
 
             def do_GET(self) -> None:
                 fixture.requests.append({key: value for key, value in self.headers.items()})
+                fixture.paths.append(self.path)
                 requested = self.headers.get("Range")
+                if fixture.mode == "redirect-generation" and self.path.startswith(
+                    "/archive.zip"
+                ):
+                    fixture.redirect_generation += 1
+                    self.send_response(302)
+                    self.send_header(
+                        "Location",
+                        f"/redirected.zip?generation={fixture.redirect_generation}",
+                    )
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if fixture.mode in {"redirect-secret", "redirect-error"} and self.path.startswith(
                     "/archive.zip"
                 ):
@@ -98,6 +113,12 @@ class _RangeServer:
                     self.send_response(200)
 
                 declared_length = len(body)
+                if (
+                    fixture.mode == "redirect-generation"
+                    and "generation=1" in self.path
+                ):
+                    body = fixture.data[: len(fixture.data) // 2]
+                    declared_length = len(fixture.data)
                 if fixture.mode == "short-body":
                     declared_length += 19
                 self.send_header("Content-Length", str(declared_length))
@@ -105,7 +126,10 @@ class _RangeServer:
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()
-                if fixture.mode == "short-body":
+                if fixture.mode == "short-body" or (
+                    fixture.mode == "redirect-generation"
+                    and "generation=1" in self.path
+                ):
                     self.close_connection = True
 
             def log_message(self, _format: str, *args: object) -> None:
@@ -240,6 +264,46 @@ class DownloadFileTest(unittest.TestCase):
         self.assertFalse(result.restarted)
         self.assertFalse(result.reused)
         self.assertEqual(json.loads(json.dumps(result.to_dict())), result.to_dict())
+
+    def test_resume_uses_stable_source_when_redirect_generation_changes(self) -> None:
+        with _RangeServer(mode="redirect-generation") as server:
+            with self.assertRaisesRegex(DownloadError, "length|response|download"):
+                download_file(
+                    server.url,
+                    self.destination,
+                    expected_bytes=len(PAYLOAD),
+                    expected_sha256=PAYLOAD_SHA256,
+                    chunk_size=97,
+                )
+
+            partial_size = self.partial.stat().st_size
+            self.assertEqual(partial_size, len(PAYLOAD) // 2)
+            result = download_file(
+                server.url,
+                self.destination,
+                expected_bytes=len(PAYLOAD),
+                expected_sha256=PAYLOAD_SHA256,
+                chunk_size=97,
+            )
+
+        self.assertEqual(
+            server.paths,
+            [
+                "/archive.zip",
+                "/redirected.zip?generation=1",
+                "/archive.zip",
+                "/redirected.zip?generation=2",
+            ],
+        )
+        self.assertEqual(server.requests[2]["Range"], f"bytes={partial_size}-")
+        self.assertEqual(server.requests[3]["Range"], f"bytes={partial_size}-")
+        self.assertEqual(result.source_url, server.url)
+        self.assertEqual(
+            result.final_response_url,
+            server.url.replace("/archive.zip", "/redirected.zip"),
+        )
+        self.assertEqual(self.destination.read_bytes(), PAYLOAD)
+        self.assertTrue(result.resumed)
 
     def test_ignored_range_restarts_from_zero_and_truncates_partial(self) -> None:
         half = len(PAYLOAD) // 2
@@ -441,6 +505,41 @@ class DownloadFileTest(unittest.TestCase):
                         self.destination,
                         expected_sha256=expected_sha256,  # type: ignore[arg-type]
                     )
+
+    def test_expected_bytes_rejects_invalid_values_before_network_access(self) -> None:
+        for value in (True, False, 0, -1, 1.5, "10"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                DownloadError, "expected_bytes"
+            ):
+                download_file(
+                    "https://example.test/archive",
+                    self.destination,
+                    expected_bytes=value,  # type: ignore[arg-type]
+                )
+
+    def test_pinned_size_is_checked_before_publication(self) -> None:
+        with _RangeServer() as server:
+            with self.assertRaisesRegex(DownloadError, "expected_bytes|pinned size"):
+                download_file(
+                    server.url,
+                    self.destination,
+                    expected_bytes=len(PAYLOAD) + 1,
+                    expected_sha256=PAYLOAD_SHA256,
+                )
+
+        self.assertFalse(self.destination.exists())
+        self.assertTrue(self.partial.exists())
+
+    def test_existing_download_requires_both_pinned_size_and_hash(self) -> None:
+        self.destination.write_bytes(PAYLOAD)
+
+        with self.assertRaisesRegex(DownloadError, "expected_bytes|pinned size"):
+            download_file(
+                "https://example.test/archive",
+                self.destination,
+                expected_bytes=len(PAYLOAD) + 1,
+                expected_sha256=PAYLOAD_SHA256,
+            )
 
     def test_sha256_normalizer_rejects_every_non_string_type(self) -> None:
         for value in (None, True, False, 1, b"0" * 64, object()):
@@ -1150,24 +1249,39 @@ class SourceManifestTest(unittest.TestCase):
                         acquisition_url=url,
                     )
 
-    def test_botiot_is_manual_only_and_never_records_acquisition_url(self) -> None:
+    def test_botiot_allows_manual_or_exact_approved_mirror_provenance(self) -> None:
         spec = self.registry["botiot"]
-        manifest = build_source_manifest(
+        manual = build_source_manifest(
             self.root,
             spec,
             acquisition_method="manual-local-source",
         )
-        self.assertEqual(manifest.dataset_name, "botiot")
-        self.assertEqual(manifest.project_url, spec.project_url)
-        self.assertEqual(manifest.acquisition_method, "manual-local-source")
-        self.assertIsNone(manifest.acquisition_url)
+        automatic = build_source_manifest(
+            self.root,
+            spec,
+            acquisition_method="approved-public-mirror",
+            acquisition_url=spec.download_url,
+        )
+        self.assertEqual(manual.dataset_name, "botiot")
+        self.assertEqual(manual.project_url, spec.project_url)
+        self.assertEqual(manual.acquisition_method, "manual-local-source")
+        self.assertIsNone(manual.acquisition_url)
+        self.assertEqual(automatic.acquisition_method, "approved-public-mirror")
+        self.assertEqual(automatic.acquisition_url, spec.download_url)
 
         for method, url in (
             ("official-download", None),
             ("manual-local-source", "https://sharepoint.example/login"),
+            ("approved-public-mirror", "https://example.test/not-approved.zip"),
+            (
+                "approved-public-mirror",
+                f"{spec.download_url}&X-Goog-Signature=temporary-secret",
+            ),
         ):
             with self.subTest(method=method):
-                with self.assertRaisesRegex(SourceManifestError, "BoT-IoT|manual|URL"):
+                with self.assertRaisesRegex(
+                    SourceManifestError, "BoT-IoT|manual|mirror|URL"
+                ):
                     build_source_manifest(
                         self.root,
                         spec,
