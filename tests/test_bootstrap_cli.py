@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class BootstrapRegistryTest(unittest.TestCase):
     def assert_registry_rejected(
-        self, dataset: str, field: str, value: str, message: str
+        self, dataset: str, field: str, value: object, message: str
     ) -> None:
         payload = {
             name: spec.to_dict() for name, spec in load_registry().items()
@@ -42,13 +42,23 @@ class BootstrapRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, message):
                 load_registry(path)
 
-    def test_registry_contains_only_official_sources(self):
+    def test_registry_preserves_official_identity_and_pins_botiot_mirror(self):
         registry = load_registry()
 
         self.assertEqual(registry["nbaiot"].doi, "10.24432/C5RC8J")
         self.assertIn("archive.ics.uci.edu", registry["nbaiot"].download_url)
-        self.assertIsNone(registry["botiot"].download_url)
-        self.assertIn("research.unsw.edu.au", registry["botiot"].project_url)
+        botiot = registry["botiot"]
+        self.assertEqual(
+            botiot.download_url,
+            "https://www.kaggle.com/api/v1/datasets/download/"
+            "vigneshvenkateswaran/bot-iot?datasetVersionNumber=1",
+        )
+        self.assertEqual(botiot.download_bytes, 1_257_092_644)
+        self.assertEqual(
+            botiot.download_sha256,
+            "7869754e4b6192b45d4497be94cc34d621e1db81b6f76189e72ec4077e85bd75",
+        )
+        self.assertIn("research.unsw.edu.au", botiot.project_url)
 
     def test_registry_is_typed_immutable_and_json_safe(self):
         registry = load_registry()
@@ -61,11 +71,11 @@ class BootstrapRegistryTest(unittest.TestCase):
         self.assertEqual(serialized["required_columns"], [])
         self.assertEqual(json.loads(json.dumps(serialized)), serialized)
 
-    def test_registry_has_exact_supported_keys_and_no_botiot_automation_secrets(self):
+    def test_registry_has_exact_supported_keys_and_no_automation_secrets(self):
         registry = load_registry()
 
         self.assertEqual(tuple(registry), ("nbaiot", "botiot"))
-        self.assertIsNone(registry["botiot"].download_url)
+        self.assertIn("kaggle.com", registry["botiot"].download_url)
         self.assertEqual(
             registry["botiot"].required_columns,
             ("category", "subcategory", "saddr", "stime"),
@@ -75,7 +85,7 @@ class BootstrapRegistryTest(unittest.TestCase):
         ).lower()
         self.assertNotIn("password", serialized)
         self.assertNotIn("credential", serialized)
-        self.assertNotIn("sha256", serialized)
+        self.assertNotIn("storage.googleapis.com", serialized)
 
     def test_registry_rejects_non_https_and_credential_bearing_urls(self):
         cases = (
@@ -92,7 +102,7 @@ class BootstrapRegistryTest(unittest.TestCase):
             with self.subTest(field=field, value=value):
                 self.assert_registry_rejected("nbaiot", field, value, message)
 
-    def test_registry_rejects_wrong_official_identities_and_botiot_download(self):
+    def test_registry_rejects_wrong_official_and_mirror_identities(self):
         cases = (
             (
                 "nbaiot",
@@ -116,13 +126,27 @@ class BootstrapRegistryTest(unittest.TestCase):
             (
                 "botiot",
                 "download_url",
-                "https://research.unsw.edu.au/downloads/bot-iot.zip",
-                "must not define download_url",
+                "https://www.kaggle.com/api/v1/datasets/download/"
+                "someone-else/bot-iot?datasetVersionNumber=1",
+                "approved Kaggle",
             ),
+            ("botiot", "download_bytes", 1, "1257092644"),
+            ("botiot", "download_sha256", "0" * 64, "accepted archive"),
         )
         for dataset, field, value, message in cases:
             with self.subTest(dataset=dataset, field=field):
                 self.assert_registry_rejected(dataset, field, value, message)
+
+    def test_registry_rejects_invalid_archive_integrity_metadata(self):
+        cases = (
+            ("download_bytes", 0, "positive integer"),
+            ("download_bytes", True, "positive integer"),
+            ("download_sha256", "ABC", "lowercase SHA-256"),
+            ("download_sha256", "0" * 63, "lowercase SHA-256"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value):
+                self.assert_registry_rejected("botiot", field, value, message)
 
 
 class BootstrapOptionsTest(unittest.TestCase):

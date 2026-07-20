@@ -17,6 +17,27 @@ def _optional_string(value: object, field: str) -> str | None:
     return _required_string(value, field)
 
 
+def _optional_positive_integer(value: object, field: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer or null")
+    return value
+
+
+def _optional_sha256(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{field} must be a lowercase SHA-256 or null")
+    return value
+
+
 def _string_tuple(value: object, field: str, *, allow_empty: bool) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(
         isinstance(item, str) and item.strip() for item in value
@@ -34,6 +55,8 @@ class DatasetSpec:
     name: str
     project_url: str
     download_url: str | None
+    download_bytes: int | None
+    download_sha256: str | None
     doi: str | None
     license_name: str
     expected_patterns: tuple[str, ...]
@@ -45,6 +68,8 @@ class DatasetSpec:
             "name",
             "project_url",
             "download_url",
+            "download_bytes",
+            "download_sha256",
             "doi",
             "license_name",
             "expected_patterns",
@@ -56,10 +81,27 @@ class DatasetSpec:
             raise ValueError(
                 f"invalid dataset registry fields: missing={sorted(missing)}, extra={sorted(extra)}"
             )
+        download_url = _optional_string(value["download_url"], "download_url")
+        download_bytes = _optional_positive_integer(
+            value["download_bytes"], "download_bytes"
+        )
+        download_sha256 = _optional_sha256(
+            value["download_sha256"], "download_sha256"
+        )
+        if download_url is None and (
+            download_bytes is not None or download_sha256 is not None
+        ):
+            raise ValueError("download integrity metadata requires download_url")
+        if (download_bytes is None) != (download_sha256 is None):
+            raise ValueError(
+                "download_bytes and download_sha256 must be set together"
+            )
         return cls(
             name=_required_string(value["name"], "name"),
             project_url=_required_string(value["project_url"], "project_url"),
-            download_url=_optional_string(value["download_url"], "download_url"),
+            download_url=download_url,
+            download_bytes=download_bytes,
+            download_sha256=download_sha256,
             doi=_optional_string(value["doi"], "doi"),
             license_name=_required_string(value["license_name"], "license_name"),
             expected_patterns=_string_tuple(
@@ -75,6 +117,8 @@ class DatasetSpec:
             "name": self.name,
             "project_url": self.project_url,
             "download_url": self.download_url,
+            "download_bytes": self.download_bytes,
+            "download_sha256": self.download_sha256,
             "doi": self.doi,
             "license_name": self.license_name,
             "expected_patterns": list(self.expected_patterns),
