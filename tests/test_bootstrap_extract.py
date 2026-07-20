@@ -635,6 +635,10 @@ Mode = drwxr-xr-x
                     "--exact",
                     "--source",
                     "winget",
+                    "--silent",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                    "--disable-interactivity",
                 ),
             ),
         )
@@ -653,6 +657,78 @@ Mode = drwxr-xr-x
                         )
                 self.assertEqual(raised.exception.command, expected)
                 self.assertNotIn("sudo", str(raised.exception))
+
+    def test_windows_standard_install_is_found_without_a_path_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            program_files = Path(directory) / "Program Files"
+            executable = program_files / "7-Zip" / "7z.exe"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"7z")
+            environment = {
+                "ProgramFiles": str(program_files),
+                "ProgramW6432": str(program_files),
+                "ProgramFiles(x86)": str(program_files),
+            }
+
+            with patch.dict(os.environ, environment):
+                found = extract_module._find_or_install_7z(
+                    install_system_tools=False,
+                    which_fn=lambda _: None,
+                    run_fn=lambda *_args, **_kwargs: self.fail(
+                        "installation must not run"
+                    ),
+                    platform_name="Windows",
+                    package_manager=None,
+                )
+
+        self.assertEqual(found, str(executable))
+
+    def test_windows_install_rechecks_the_standard_install_location(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            program_files = Path(directory) / "Program Files"
+            executable = program_files / "7-Zip" / "7z.exe"
+            calls: list[list[str]] = []
+            environment = {
+                "ProgramFiles": str(program_files),
+                "ProgramW6432": str(program_files),
+                "ProgramFiles(x86)": str(program_files),
+            }
+
+            def which(name: str) -> str | None:
+                return "C:\\Windows\\winget.exe" if name == "winget" else None
+
+            def run(args, **kwargs):
+                calls.append(list(args))
+                executable.parent.mkdir(parents=True)
+                executable.write_bytes(b"7z")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with patch.dict(os.environ, environment):
+                found = extract_module._find_or_install_7z(
+                    install_system_tools=True,
+                    which_fn=which,
+                    run_fn=run,
+                    platform_name="Windows",
+                    package_manager=None,
+                )
+
+        self.assertEqual(found, str(executable))
+        self.assertEqual(
+            calls,
+            [[
+                "C:\\Windows\\winget.exe",
+                "install",
+                "--id",
+                "7zip.7zip",
+                "--exact",
+                "--source",
+                "winget",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+                "--disable-interactivity",
+            ]],
+        )
 
     def test_system_install_requires_consent_and_rechecks_tool(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

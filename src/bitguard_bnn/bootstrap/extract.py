@@ -737,7 +737,19 @@ def _remediation_command(
 ) -> tuple[str, ...]:
     system = platform_name.casefold()
     if system.startswith("win"):
-        return ("winget", "install", "--id", "7zip.7zip", "--exact", "--source", "winget")
+        return (
+            "winget",
+            "install",
+            "--id",
+            "7zip.7zip",
+            "--exact",
+            "--source",
+            "winget",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        )
     manager = package_manager
     if manager is None:
         manager = next((name for name in ("apt-get", "dnf") if which_fn(name)), None)
@@ -756,11 +768,7 @@ def _find_or_install_7z(
     platform_name: str,
     package_manager: str | None,
 ) -> str:
-    found = None
-    for name in ("7z", "7zz", "7za"):
-        found = which_fn(name)
-        if found:
-            break
+    found = _find_7z_executable(which_fn, platform_name)
     if found:
         return found
     command = _remediation_command(platform_name, which_fn, package_manager)
@@ -787,16 +795,33 @@ def _find_or_install_7z(
             "7-Zip installation command failed with exit code "
             f"{getattr(result, 'returncode', None)}"
         )
-    found = None
-    for name in ("7z", "7zz", "7za"):
-        found = which_fn(name)
-        if found:
-            break
+    found = _find_7z_executable(which_fn, platform_name)
     if not found:
         raise ArchiveExtractionError(
             "7-Zip installation completed but no compatible executable was found"
         )
     return found
+
+
+def _find_7z_executable(
+    which_fn: Callable[[str], str | None], platform_name: str
+) -> str | None:
+    for name in ("7z", "7zz", "7za"):
+        found = which_fn(name)
+        if found:
+            return found
+    if platform_name.casefold().startswith("win"):
+        for variable in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+            root = os.environ.get(variable)
+            if not root:
+                continue
+            candidate = Path(root) / "7-Zip" / "7z.exe"
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                continue
+    return None
 
 
 def _run_7z(

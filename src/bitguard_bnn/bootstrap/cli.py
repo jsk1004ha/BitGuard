@@ -42,7 +42,20 @@ def add_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runs-root", default="runs")
     parser.add_argument("--compute", choices=COMPUTE_PROFILES, default="auto")
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--install-system-tools", action="store_true")
+    system_tools = parser.add_mutually_exclusive_group()
+    system_tools.add_argument(
+        "--install-system-tools",
+        dest="install_system_tools",
+        action="store_true",
+        help="allow installation of required operating-system tools",
+    )
+    system_tools.add_argument(
+        "--no-install-system-tools",
+        dest="install_system_tools",
+        action="store_false",
+        help="disable the automatic system-tool installation enabled by --full",
+    )
+    parser.set_defaults(install_system_tools=None)
     parser.add_argument("--restart-stage", choices=STAGE_ORDER)
 
 
@@ -72,7 +85,9 @@ def options_from_namespace(args: argparse.Namespace) -> BootstrapOptions:
         runs_root=_resolve_local_path(args.runs_root, "--runs-root"),
         compute=args.compute,
         prepare_only=args.prepare_only,
-        install_system_tools=args.install_system_tools,
+        install_system_tools=(
+            args.full if args.install_system_tools is None else args.install_system_tools
+        ),
         accepted_botiot_license=args.accept_botiot_academic_license,
         restart_stage=args.restart_stage,
     )

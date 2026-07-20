@@ -74,9 +74,11 @@ BoT-IoT, evaluates the complete test partitions, and exports the edge artifacts.
   Use `--accept-botiot-academic-license` only when those terms apply. The
   bootstrap can then fetch the pinned full-CSV archive automatically.
 - ZIP files use Python's built-in extractor. A RAR source, including a RAR
-  nested inside a ZIP, requires a `7z`, `7zz`, or `7za` executable. Without
-  `--install-system-tools`, BitGuard prints the exact `winget`, `apt-get`, or
-  `dnf` command and makes no operating-system change.
+  nested inside a ZIP, requires a `7z`, `7zz`, or `7za` executable. A `--full`
+  bootstrap finds Windows installations outside `PATH` and installs the
+  required tool automatically when it is absent. Use
+  `--no-install-system-tools` to forbid operating-system changes; partial
+  bootstrap commands require `--install-system-tools` to opt in.
 - Put `--data-root` and `--runs-root` on filesystems with enough free space.
   The bootstrap performs a conservative per-filesystem disk preflight before
   dataset acquisition or preparation.

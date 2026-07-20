@@ -189,6 +189,24 @@ class BootstrapOptionsTest(unittest.TestCase):
         self.assertIsNone(options.botiot_source)
         self.assertTrue(options.accepted_botiot_license)
 
+    def test_full_bootstrap_installs_required_system_tools_by_default(self):
+        options = parse_bootstrap_options(
+            ["--full", "--accept-botiot-academic-license"]
+        )
+
+        self.assertTrue(options.install_system_tools)
+
+    def test_full_bootstrap_system_tool_install_can_be_disabled(self):
+        options = parse_bootstrap_options(
+            [
+                "--full",
+                "--accept-botiot-academic-license",
+                "--no-install-system-tools",
+            ]
+        )
+
+        self.assertFalse(options.install_system_tools)
+
     def test_full_all_requires_botiot_license_before_acquisition(self):
         with self.assertRaisesRegex(ValueError, "accept-botiot-academic-license"):
             parse_bootstrap_options(["--full"])
