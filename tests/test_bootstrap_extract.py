@@ -558,6 +558,17 @@ Mode = drwxr-xr-x
             ("empty", 0, True),
         ])
 
+    def test_accepts_empty_technical_metadata_values(self) -> None:
+        listing = self.LISTING.replace(
+            "Mode = -rw-r--r--",
+            "Mode = -rw-r--r--\nVolume Index =",
+            1,
+        )
+
+        entries = parse_7z_listing(listing)
+
+        self.assertEqual(entries[0].path, "nested/data.csv")
+
     def test_rejects_unsafe_duplicate_encrypted_link_and_malformed_rar_entries(self) -> None:
         cases = (
             (self.LISTING.replace("nested/data.csv", "../escape.csv"), "unsafe archive path"),

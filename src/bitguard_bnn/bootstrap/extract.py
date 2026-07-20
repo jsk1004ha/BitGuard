@@ -684,9 +684,12 @@ def parse_7z_listing(output: str) -> tuple[ArchiveEntry, ...]:
     for block in blocks:
         fields: dict[str, str] = {}
         for line in block.splitlines():
-            if " = " not in line:
+            if " = " in line:
+                key, value = line.split(" = ", 1)
+            elif line.endswith(" ="):
+                key, value = line[:-2], ""
+            else:
                 raise ArchiveExtractionError(f"ambiguous 7-Zip listing line: {line!r}")
-            key, value = line.split(" = ", 1)
             if key in fields:
                 raise ArchiveExtractionError(f"duplicate 7-Zip listing field: {key!r}")
             fields[key] = value
