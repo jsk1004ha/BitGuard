@@ -226,6 +226,7 @@ class BootstrapEntryTest(unittest.TestCase):
         install_commands = [value for kind, value in events if kind == "run"]
         self.assertTrue(str(install_commands[0][-1]).endswith("torch-cpu.txt"))
         self.assertEqual(install_commands[1][-1], "--no-deps")
+        self.assertIn("--no-build-isolation", install_commands[1])
         self.assertEqual(install_commands[1][-3], "--editable")
         self.assertTrue(str(install_commands[2][-1]).endswith("full-base.txt"))
         self.assertEqual(

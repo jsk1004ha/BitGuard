@@ -203,7 +203,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     _verify_torch_profile(environment, profile)
     subprocess.run(
-        [*pip_install, "--editable", str(repository), "--no-deps"],
+        [
+            *pip_install,
+            "--no-build-isolation",
+            "--editable",
+            str(repository),
+            "--no-deps",
+        ],
         check=True,
         cwd=repository,
     )
