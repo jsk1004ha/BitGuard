@@ -504,6 +504,10 @@ def _nbaiot_metadata(root: Path, path: Path) -> tuple[str, str]:
     return str(device), nbaiot_behavior(raw_attack)
 
 
+def _is_nbaiot_structure_sidecar(dataset: str, path: Path) -> bool:
+    return dataset == "nbaiot" and path.name.casefold() == "demonstrate_structure.csv"
+
+
 def _row_metadata(
     dataset: str,
     values: dict[str, str],
@@ -895,15 +899,23 @@ def _inspect_csv_dataset_unlocked(
             for path in paths:
                 relative = path.relative_to(root).as_posix()
                 _verify_source_directories(root, path)
-                plan = _plan_file_inspection(
-                    normalized_dataset,
-                    root,
-                    path,
-                    required,
-                    dropped,
-                    chunk_size=chunk_size,
-                    max_record_chars=max_record_chars,
-                )
+                try:
+                    plan = _plan_file_inspection(
+                        normalized_dataset,
+                        root,
+                        path,
+                        required,
+                        dropped,
+                        chunk_size=chunk_size,
+                        max_record_chars=max_record_chars,
+                    )
+                except SchemaInspectionError as error:
+                    if (
+                        _is_nbaiot_structure_sidecar(normalized_dataset, path)
+                        and str(error).startswith("no numeric feature columns found")
+                    ):
+                        continue
+                    raise
                 schema = plan.schema
                 file_features = plan.feature_columns
                 normalized_file_features = tuple(
@@ -1032,6 +1044,10 @@ def _inspect_csv_dataset_unlocked(
                 for column in schema.excluded:
                     excluded_columns.setdefault(_column_key(column), column)
 
+            if canonical_features is None:
+                raise SchemaInspectionError(
+                    f"no numeric feature columns found under {root}"
+                )
             if total_rows == 0:
                 raise SchemaInspectionError(
                     "CSV dataset contains headers but no data rows"
@@ -1045,7 +1061,6 @@ def _inspect_csv_dataset_unlocked(
                 raise SchemaInspectionError(
                     f"schema inspection found {rejected_rows} rejected rows: {reasons}"
                 )
-            assert canonical_features is not None
             return SchemaInspectionReport(
                 dataset=normalized_dataset,
                 root=str(root),

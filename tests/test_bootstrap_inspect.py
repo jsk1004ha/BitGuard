@@ -66,6 +66,30 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertEqual(report.rejected_rows, 0)
             self.assertEqual(report.as_dict()["total_rows"], 4)
 
+    def test_nbaiot_ignores_official_structure_csv_without_numeric_features(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "device" / "benign_traffic.csv"
+            data.parent.mkdir()
+            data.write_text("mean,std\n1,2\n3,4\n", encoding="utf-8")
+            (root / "demonstrate_structure.csv").write_text(
+                "field,description\n"
+                "mean,example feature column\n"
+                "std,example feature column\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset("nbaiot", root, chunk_size=1)
+
+            self.assertEqual(report.total_rows, 2)
+            self.assertEqual(report.feature_columns, ("mean", "std"))
+            self.assertEqual(
+                [item.relative_path for item in report.files],
+                ["device/benign_traffic.csv"],
+            )
+
     def test_botiot_required_metadata_labels_devices_and_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
