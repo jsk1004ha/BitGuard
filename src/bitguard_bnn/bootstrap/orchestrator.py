@@ -1854,6 +1854,7 @@ def run_bootstrap(
     *,
     raw_inputs: Mapping[str, object] | None = None,
     dependencies: BootstrapDependencies | None = None,
+    progress_callback: Callable[[Mapping[str, object]], None] | None = None,
 ) -> dict[str, object]:
     """Acquire and verify selected CSV sources, returning a durable report."""
 
@@ -3237,6 +3238,7 @@ def run_bootstrap(
                                     config=training_config,
                                     prepared_descriptor_path=descriptor,
                                     progress_callback=record_progress,
+                                    event_callback=progress_callback,
                                     **training_runtime_options,
                                 )
                             else:
@@ -3434,12 +3436,24 @@ def run_bootstrap(
                         ),
                     )
 
-                for stage in stages:
+                total_stages = len(stages)
+                for stage_index, stage in enumerate(stages):
                     current_stage = stage.name
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "scope": "bootstrap",
+                                "status": "started",
+                                "stage": stage.name,
+                                "completed": stage_index,
+                                "total": total_stages,
+                            }
+                        )
                     signature = stage.input_signature()
                     reusable = state.reusable(stage.name, signature)
                     if reusable and not stage.always_run:
                         reused.append(stage.name)
+                        progress_status = "reused"
                     else:
                         if not reusable:
                             state.invalidate_from(stage.name, STAGE_ORDER)
@@ -3454,6 +3468,7 @@ def run_bootstrap(
                                 )
                         state.complete(stage.name, completion_signature, outputs)
                         executed.append(stage.name)
+                        progress_status = "completed"
                     last_completed = stage.name
                     if stage.name == "environment" and compute is None:
                         compute = json.loads(
@@ -3492,6 +3507,16 @@ def run_bootstrap(
                             }
                         )
                         dataset_statuses.update(persisted_statuses)
+                    if progress_callback is not None:
+                        progress_callback(
+                            {
+                                "scope": "bootstrap",
+                                "status": progress_status,
+                                "stage": stage.name,
+                                "completed": stage_index + 1,
+                                "total": total_stages,
+                            }
+                        )
 
                 final_status = (
                     "completed"

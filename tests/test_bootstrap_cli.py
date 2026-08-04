@@ -27,6 +27,11 @@ from bitguard_bnn.cli import _build_parser, main
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class _TTY(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 class BootstrapRegistryTest(unittest.TestCase):
     def assert_registry_rejected(
         self, dataset: str, field: str, value: object, message: str
@@ -424,6 +429,35 @@ class BootstrapDispatchTest(unittest.TestCase):
 
         self.assertEqual(status, 1)
         self.assertEqual(json.loads(output.getvalue())["failed_stage"], "acquire")
+
+    def test_cli_progress_stays_on_terminal_stream_and_stdout_remains_json(self):
+        output = StringIO()
+        progress_output = _TTY()
+
+        def fake_runner(_options, *, raw_inputs, progress_callback):
+            del raw_inputs
+            progress_callback(
+                {
+                    "scope": "bootstrap",
+                    "status": "completed",
+                    "stage": "inspect",
+                    "completed": 1,
+                    "total": 1,
+                }
+            )
+            return {"status": "sources_verified"}
+
+        with redirect_stdout(output):
+            status = main(
+                ["bootstrap", "--dataset", "nbaiot", "--prepare-only"],
+                bootstrap_runner=fake_runner,
+                progress_stream=progress_output,
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue()), {"status": "sources_verified"})
+        self.assertIn("100%", progress_output.getvalue())
+        self.assertIn("inspect", progress_output.getvalue())
 
     def test_module_entrypoint_reports_bootstrap_semantic_error_without_traceback(self):
         environment = os.environ.copy()

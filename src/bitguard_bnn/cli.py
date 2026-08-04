@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import TextIO
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -24,6 +26,7 @@ def _build_parser() -> argparse.ArgumentParser:
     stream.add_argument("--chunk-size", type=int, default=100000)
     train = subparsers.add_parser("train", help="run preprocessing, training, and evaluation")
     train.add_argument("--config", type=Path, required=True)
+    train.add_argument("--no-progress", action="store_true")
     export = subparsers.add_parser("export", help="export a trained BNN for packed edge inference")
     export.add_argument("--run", type=Path, required=True)
     export.add_argument("--output", type=Path, required=True)
@@ -43,16 +46,26 @@ def main(
     argv: list[str] | None = None,
     *,
     bootstrap_runner: Callable[..., Mapping[str, object]] | None = None,
+    progress_stream: TextIO | None = None,
 ) -> int | None:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "bootstrap":
         from .bootstrap.cli import run_from_namespace
+        from .progress import TerminalProgress
 
+        progress = TerminalProgress(stream=progress_stream or sys.stderr)
+        callback = None if args.no_progress or not progress.enabled else progress
         try:
-            report = run_from_namespace(args, runner=bootstrap_runner)
+            report = run_from_namespace(
+                args,
+                runner=bootstrap_runner,
+                progress_callback=callback,
+            )
         except ValueError as exc:
             args._command_parser.error(str(exc))
+        finally:
+            progress.close()
         print(json.dumps(report, ensure_ascii=False))
         return 0 if report.get("status") != "failed" else 1
     if args.command == "make-demo":
@@ -75,9 +88,15 @@ def main(
         print(json.dumps(result, ensure_ascii=False))
         return None
     if args.command == "train":
+        from .progress import TerminalProgress
         from .trainer import run_training
 
-        run_dir = run_training(args.config)
+        progress = TerminalProgress(stream=progress_stream or sys.stderr)
+        callback = None if args.no_progress or not progress.enabled else progress
+        try:
+            run_dir = run_training(args.config, event_callback=callback)
+        finally:
+            progress.close()
         print(str(run_dir.resolve()))
         return None
     if args.command == "export":

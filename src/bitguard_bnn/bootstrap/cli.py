@@ -57,6 +57,11 @@ def add_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.set_defaults(install_system_tools=None)
     parser.add_argument("--restart-stage", choices=STAGE_ORDER)
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable interactive terminal progress rendering",
+    )
 
 
 def _selected_datasets(full: bool, requested: list[str] | None) -> tuple[str, ...]:
@@ -103,6 +108,7 @@ def run_from_namespace(
     args: argparse.Namespace,
     *,
     runner: Callable[..., Mapping[str, object]] | None = None,
+    progress_callback: Callable[[Mapping[str, object]], None] | None = None,
 ) -> dict[str, object]:
     """Resolve validated options while preserving original path spellings."""
 
@@ -111,12 +117,14 @@ def run_from_namespace(
         from .orchestrator import run_bootstrap
 
         runner = run_bootstrap
-    result = runner(
-        options,
-        raw_inputs={
+    keyword_arguments: dict[str, object] = {
+        "raw_inputs": {
             "botiot_source": args.botiot_source,
             "data_root": args.data_root,
             "runs_root": args.runs_root,
-        },
-    )
+        }
+    }
+    if progress_callback is not None:
+        keyword_arguments["progress_callback"] = progress_callback
+    result = runner(options, **keyword_arguments)
     return dict(result)

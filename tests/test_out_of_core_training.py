@@ -189,6 +189,38 @@ class OutOfCoreTrainingTests(unittest.TestCase):
         )
         return config
 
+    def test_streaming_training_reports_monotonic_batch_progress(self) -> None:
+        from bitguard_bnn.out_of_core.trainer import fit_neural_streaming
+
+        config = self._config(epochs=2, dropout=0.0)
+        events: list[dict[str, object]] = []
+        with patch(
+            "bitguard_bnn.out_of_core.trainer.verify_prepared_dataset",
+            return_value=_prepared(),
+        ), patch(
+            "bitguard_bnn.out_of_core.trainer.iter_ordered_batches",
+            side_effect=_ordered_fake_batches,
+        ):
+            fit_neural_streaming(
+                self._model(config),
+                self._dataset(),
+                {"benign": 3, "flood_like": 3},
+                ("benign", "flood_like"),
+                config,
+                self._validation,
+                _VALIDATION_CONTRACT,
+                event_callback=lambda event: events.append(dict(event)),
+            )
+
+        advanced = [event for event in events if event["status"] == "advanced"]
+        self.assertEqual(len(advanced), 6)
+        self.assertEqual(
+            [(event["epoch"], event["completed"]) for event in advanced],
+            [(1, 2), (1, 4), (1, 6), (2, 8), (2, 10), (2, 12)],
+        )
+        self.assertTrue(all(event["total"] == 12 for event in advanced))
+        self.assertTrue(all(event["role"] == "main" for event in advanced))
+
     @staticmethod
     def _dataset() -> _FakeDataset:
         rng = np.random.default_rng(17)
@@ -439,6 +471,7 @@ class OutOfCoreTrainingTests(unittest.TestCase):
                 )
 
         seed_everything(17)
+        array_events: list[dict[str, object]] = []
         with patch("torch.utils.data.DataLoader", FixedDataLoader):
             array_result = _fit_neural(
                 self._model(config),
@@ -448,7 +481,17 @@ class OutOfCoreTrainingTests(unittest.TestCase):
                 validation_labels,
                 np.ones(2, dtype=np.float32),
                 config,
+                event_callback=lambda event: array_events.append(dict(event)),
             )
+
+        self.assertEqual(
+            [
+                (event["completed"], event["total"])
+                for event in array_events
+                if event["status"] == "advanced"
+            ],
+            [(2, 6), (4, 6), (6, 6)],
+        )
 
         def complete_validation(model, device):
             probabilities = _predict_neural_probabilities(

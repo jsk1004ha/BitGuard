@@ -703,6 +703,7 @@ def fit_neural_streaming(
     feature_indices: Sequence[int] | None = None,
     binary_attack_target: bool = False,
     stop_after_optimizer_step: int | None = None,
+    event_callback: Callable[[Mapping[str, object]], None] | None = None,
 ) -> NeuralFitResult:
     """Train without materializing prepared rows and resume at the next unapplied batch."""
 
@@ -888,6 +889,18 @@ def fit_neural_streaming(
                         device_type=device.type,
                         scientific_signature=signature,
                     )
+                if event_callback is not None:
+                    event_callback(
+                        {
+                            "scope": "training",
+                            "status": "advanced",
+                            "role": training_role,
+                            "epoch": epoch,
+                            "epochs": epochs,
+                            "completed": (epoch - 1) * dataset.row_count + seen,
+                            "total": epochs * dataset.row_count,
+                        }
+                    )
                 if (
                     stop_after_optimizer_step is not None
                     and cursor.optimizer_step == stop_after_optimizer_step
@@ -1023,6 +1036,18 @@ def fit_neural_streaming(
             _save_training_progress(progress_path, records)
     if best_state is None:
         raise RuntimeError("streaming training did not produce a best state")
+    if event_callback is not None:
+        event_callback(
+            {
+                "scope": "training",
+                "status": "completed",
+                "role": training_role,
+                "epoch": min(cursor.epoch - 1, epochs),
+                "epochs": epochs,
+                "completed": epochs * dataset.row_count,
+                "total": epochs * dataset.row_count,
+            }
+        )
     model.load_state_dict(best_state)
     return NeuralFitResult(model, pd.DataFrame(records), best_metric, best_epoch)
 

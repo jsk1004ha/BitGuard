@@ -107,6 +107,35 @@ For an RTX 5090, select the locked CUDA 12.8 profile:
   --runs-root "$HOME\BitGuardRuns"
 ```
 
+On Windows, after reviewing the UNSW academic-use terms, `start.bat` provides
+the double-click path for the same full RTX 5090 run. It requests Administrator
+privileges, uses `%USERPROFILE%\BitGuardData` and
+`%USERPROFILE%\BitGuardRuns`, selects `cu128`, and delegates every operation to
+the normal bootstrap pipeline. It never adds `--restart-stage`: verified setup
+stages and compatible training checkpoints are reused automatically. A failed
+package bootstrap is retried with the exact same command up to three times, so
+transient download or process interruptions can continue from durable state.
+Persistent failures remain fail-closed and are recorded in
+`%USERPROFILE%\BitGuardData\.bitguard\bootstrap-report.json`; launcher logs are
+written under `%USERPROFILE%\BitGuardLogs`.
+
+```bat
+start.bat
+```
+
+Arguments supplied from Command Prompt override launcher defaults. For example,
+the following keeps the automatic elevation and resume behavior while selecting
+CPU explicitly:
+
+```bat
+start.bat --compute cpu
+```
+
+Interactive `bitguard bootstrap` and `bitguard train` commands render setup
+stage and neural batch progress bars on stderr, leaving stdout reports
+machine-readable. Use `--no-progress` when a stable non-interactive stream is
+preferred.
+
 CPU training is bounded-memory but not quick: the uncapped profiles default to
 30 epochs and can run for many hours or days. The CPU profile shown above is
 also the target profile when CUDA is unsuitable; when reusing a failed data

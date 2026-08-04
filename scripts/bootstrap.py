@@ -6,11 +6,16 @@ import os
 import re
 import subprocess
 import sys
+import time
+from collections.abc import Callable, Sequence
+from io import TextIOBase
 from pathlib import Path
 
 
 SUPPORTED_PYTHON = ((3, 10), (3, 11), (3, 12))
 TORCH_PROFILES = ("cpu", "cu118", "cu124", "cu128")
+BOOTSTRAP_ATTEMPTS = 3
+_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
 
 def validate_python_version(version: tuple[int, int, int]) -> None:
@@ -31,6 +36,38 @@ def build_package_command(environment: Path, forwarded: list[str]) -> list[str]:
         "bootstrap",
         *forwarded,
     ]
+
+
+def run_package_with_retries(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    attempts: int = BOOTSTRAP_ATTEMPTS,
+    invoke: Callable[..., int] | None = None,
+    sleeper: Callable[[float], object] | None = None,
+    stream: TextIOBase | None = None,
+) -> int:
+    """Retry resumable bootstrap failures without changing their command."""
+
+    if attempts < 1:
+        raise ValueError("bootstrap attempts must be at least one")
+    run = subprocess.call if invoke is None else invoke
+    wait = time.sleep if sleeper is None else sleeper
+    output = sys.stderr if stream is None else stream
+    frozen_command = list(command)
+    for attempt in range(1, attempts + 1):
+        status = int(run(list(frozen_command), cwd=cwd))
+        if status != 1 or attempt == attempts:
+            return status
+        delay = _RETRY_DELAYS_SECONDS[min(attempt - 1, len(_RETRY_DELAYS_SECONDS) - 1)]
+        print(
+            "Bootstrap stopped before completion; verified state will be reused "
+            f"automatically (retry {attempt + 1}/{attempts} in {delay:g}s).",
+            file=output,
+            flush=True,
+        )
+        wait(delay)
+    raise AssertionError("bootstrap retry loop did not return")
 
 
 def validate_virtual_environment(environment: Path) -> None:
@@ -223,8 +260,9 @@ def main(argv: list[str] | None = None) -> int:
     # the package bootstrap exactly once so installation and runtime recovery
     # cannot disagree (including when the user selected ``auto``).
     package_arguments = ["--compute", profile, *forwarded]
-    return subprocess.call(
-        build_package_command(environment, package_arguments), cwd=repository
+    return run_package_with_retries(
+        build_package_command(environment, package_arguments),
+        cwd=repository,
     )
 
 

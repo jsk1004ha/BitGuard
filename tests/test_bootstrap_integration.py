@@ -319,6 +319,41 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         self.assertEqual(stage.input_signature(), "signature")
         self.assertEqual(stage.run(), ())
 
+    def test_progress_events_follow_stage_order_and_mark_reuse(self) -> None:
+        first_events: list[dict[str, object]] = []
+        first = run_bootstrap(
+            self.options,
+            dependencies=self.dependencies(),
+            progress_callback=lambda event: first_events.append(dict(event)),
+        )
+        self.assertEqual(first["status"], "sources_verified")
+        self.assertEqual(
+            [
+                event["stage"]
+                for event in first_events
+                if event["status"] == "completed"
+            ],
+            ["preflight", "environment", "acquire", "extract", "inspect"],
+        )
+        self.assertEqual(first_events[-1]["completed"], 5)
+        self.assertEqual(first_events[-1]["total"], 5)
+
+        reused_events: list[dict[str, object]] = []
+        second = run_bootstrap(
+            self.options,
+            dependencies=self.dependencies(),
+            progress_callback=lambda event: reused_events.append(dict(event)),
+        )
+        self.assertEqual(second["status"], "sources_verified")
+        self.assertEqual(
+            [
+                event["stage"]
+                for event in reused_events
+                if event["status"] == "reused"
+            ],
+            ["preflight", "environment", "acquire", "extract", "inspect"],
+        )
+
     def test_prepare_only_runs_to_verified_sources_and_reuses_every_stage(self) -> None:
         first = run_bootstrap(
             self.options,

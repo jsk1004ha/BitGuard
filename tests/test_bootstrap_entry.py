@@ -1,8 +1,10 @@
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +12,68 @@ from scripts import bootstrap
 
 
 class BootstrapEntryTest(unittest.TestCase):
+    def test_failed_package_bootstrap_is_retried_with_the_exact_same_command(self):
+        command = ["python", "-m", "bitguard_bnn", "bootstrap", "--full"]
+        calls: list[tuple[list[str], Path]] = []
+
+        def invoke(candidate, *, cwd):
+            calls.append((list(candidate), cwd))
+            return 1 if len(calls) == 1 else 0
+
+        delays: list[float] = []
+        status = bootstrap.run_package_with_retries(
+            command,
+            cwd=Path("repository"),
+            attempts=3,
+            invoke=invoke,
+            sleeper=delays.append,
+            stream=StringIO(),
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            calls,
+            [(command, Path("repository")), (command, Path("repository"))],
+        )
+        self.assertEqual(delays, [2.0])
+
+    def test_usage_error_is_not_retried(self):
+        calls: list[list[str]] = []
+
+        def invoke(command, *, cwd):
+            del cwd
+            calls.append(list(command))
+            return 2
+
+        status = bootstrap.run_package_with_retries(
+            ["python", "-m", "bitguard_bnn", "bootstrap"],
+            cwd=Path("repository"),
+            attempts=3,
+            invoke=invoke,
+            sleeper=lambda _seconds: self.fail("usage errors must not sleep"),
+            stream=StringIO(),
+        )
+
+        self.assertEqual(status, 2)
+        self.assertEqual(len(calls), 1)
+
+    def test_bootstrap_retry_stops_at_the_attempt_limit(self):
+        attempts: list[int] = []
+        delays: list[float] = []
+
+        status = bootstrap.run_package_with_retries(
+            ["python", "-m", "bitguard_bnn", "bootstrap"],
+            cwd=Path("repository"),
+            attempts=3,
+            invoke=lambda _command, *, cwd: attempts.append(len(str(cwd))) or 1,
+            sleeper=delays.append,
+            stream=StringIO(),
+        )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(delays, [2.0, 5.0])
+
     def test_build_command_forwards_automatic_full_download(self):
         command = bootstrap.build_package_command(
             Path(".venv"),
@@ -268,6 +332,132 @@ class BootstrapEntryTest(unittest.TestCase):
         shell = (repository / "bootstrap.sh").read_text(encoding="utf-8")
         self.assertIn("$scriptPath @args", powershell)
         self.assertIn('"$SCRIPT_DIR/scripts/bootstrap.py" "$@"', shell)
+
+    def test_windows_start_launcher_is_elevated_resumable_and_repo_relative(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        batch = (repository / "start.bat").read_text(encoding="utf-8")
+        launcher = (repository / "scripts" / "start.ps1").read_text(encoding="utf-8")
+
+        self.assertIn(r"%~dp0scripts\start.ps1", batch)
+        self.assertIn("%*", batch)
+        self.assertIn('set "BITGUARD_EXIT_CODE=%ERRORLEVEL%"', batch)
+        self.assertIn("exit /b %BITGUARD_EXIT_CODE%", batch)
+        self.assertIn("-Verb RunAs", launcher)
+        self.assertIn("CmdletBinding(PositionalBinding = $false)", launcher)
+        self.assertIn("-EncodedCommand", launcher)
+        self.assertIn("EncodedArguments", launcher)
+        self.assertNotIn("GetTempPath", launcher)
+        self.assertNotIn("ArgumentFile", launcher)
+        self.assertIn("--full", launcher)
+        self.assertIn("--compute", launcher)
+        self.assertIn("cu128", launcher)
+        self.assertIn("--accept-botiot-academic-license", launcher)
+        self.assertIn("BitGuardData", launcher)
+        self.assertIn("BitGuardRuns", launcher)
+        self.assertIn("Get-BitGuardOptionValue", launcher)
+        self.assertIn("$displayDataRoot", launcher)
+        self.assertIn("$displayRunsRoot", launcher)
+        self.assertNotIn("--restart-stage", launcher)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "PowerShell is required")
+    def test_windows_start_launcher_preserves_dash_prefixed_user_arguments(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        launcher = repository / "scripts" / "start.ps1"
+        probe = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:BITGUARD_START_LAUNCHER, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -gt 0) { exit 91 }
+$attributes = ($ast.ParamBlock.Attributes | ForEach-Object { $_.Extent.Text }) -join "`n"
+$parameters = $ast.ParamBlock.Extent.Text
+$body = @'
+[pscustomobject]@{
+    Encoded = $EncodedArguments
+    Elevated = [bool]$Elevated
+    Remaining = @($BootstrapArguments)
+} | ConvertTo-Json -Compress
+'@
+$bindingProbe = [ScriptBlock]::Create("$attributes`n$parameters`n$body")
+& $bindingProbe --compute cpu --data-root 'C:\Users\A B\BitGuardData'
+"""
+        environment = os.environ.copy()
+        environment["BITGUARD_START_LAUNCHER"] = str(launcher)
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                probe,
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["Encoded"], "")
+        self.assertFalse(payload["Elevated"])
+        self.assertEqual(
+            payload["Remaining"],
+            ["--compute", "cpu", "--data-root", r"C:\Users\A B\BitGuardData"],
+        )
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "PowerShell is required")
+    def test_windows_start_launcher_reports_overridden_roots(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        launcher = repository / "scripts" / "start.ps1"
+        probe = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:BITGUARD_START_LAUNCHER, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -gt 0) { exit 91 }
+$wanted = @('Get-BitGuardOptionValue', 'Resolve-BitGuardDisplayPath')
+$functions = $ast.FindAll(
+    {
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $wanted -contains $node.Name
+    },
+    $true
+) | ForEach-Object { $_.Extent.Text }
+$body = @'
+$arguments = @(
+    '--data-root', 'ignored-data',
+    '--runs-root=ignored-runs',
+    '--data-root', 'C:\Users\A B\Data',
+    '--runs-root=relative-runs'
+)
+$data = Get-BitGuardOptionValue $arguments '--data-root'
+$runs = Get-BitGuardOptionValue $arguments '--runs-root'
+[pscustomobject]@{
+    Data = Resolve-BitGuardDisplayPath $data 'C:\repository'
+    Runs = Resolve-BitGuardDisplayPath $runs 'C:\repository'
+    Tilde = Resolve-BitGuardDisplayPath '~\BitGuardData' 'C:\repository'
+} | ConvertTo-Json -Compress
+'@
+$rootProbe = [ScriptBlock]::Create("$($functions -join "`n")`n$body")
+& $rootProbe
+"""
+        environment = os.environ.copy()
+        environment["BITGUARD_START_LAUNCHER"] = str(launcher)
+        result = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", probe],
+            check=True,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["Data"], r"C:\Users\A B\Data")
+        self.assertEqual(payload["Runs"], r"C:\repository\relative-runs")
+        self.assertEqual(payload["Tilde"], str(Path.home() / "BitGuardData"))
 
     def test_powershell_wrapper_uses_py_launcher_when_only_python_310_is_registered(
         self,

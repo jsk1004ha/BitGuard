@@ -1408,6 +1408,7 @@ def run_out_of_core_training(
     config: dict[str, Any] | None = None,
     prepared_descriptor_path: str | Path | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
+    event_callback: Callable[[Mapping[str, object]], None] | None = None,
     resume_checkpoint_integrity: Mapping[str, object] | None = None,
     available_disk_bytes: int | None = None,
     available_ram_bytes: int | None = None,
@@ -1435,6 +1436,7 @@ def run_out_of_core_training(
         loaded,
         prepared,
         progress_callback=progress_callback,
+        event_callback=event_callback,
         resume_checkpoint_integrity=resume_checkpoint_integrity,
         available_disk_bytes=available_disk_bytes,
         available_ram_bytes=available_ram_bytes,
@@ -1446,6 +1448,7 @@ def _run_verified_neural_training(
     prepared: PreparedDataset,
     *,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
+    event_callback: Callable[[Mapping[str, object]], None] | None = None,
     resume_checkpoint_integrity: Mapping[str, object] | None = None,
     available_disk_bytes: int | None = None,
     available_ram_bytes: int | None = None,
@@ -1558,6 +1561,12 @@ def _run_verified_neural_training(
         "split_fingerprint": prepared.split_fingerprint,
         "validation_rows": prepared.validation_count,
     }
+
+    def training_event(event: Mapping[str, object]) -> None:
+        if event_callback is not None:
+            event_callback({**dict(event), "dataset": prepared.dataset})
+
+    training_event_callback = None if event_callback is None else training_event
     batch_size = int(runtime_config["training"]["batch_size"])
     validation_dataset = _dataset(prepared, runtime_config, "validation")
     validation_callback = _validation_callback(
@@ -1583,6 +1592,7 @@ def _run_verified_neural_training(
                 checkpoint_path=run_dir / "teacher_training_state.pt",
                 progress_path=run_dir / "teacher_training_history.partial.csv",
                 training_role="teacher",
+                event_callback=training_event_callback,
             )
             teacher_model = teacher_fit.model
             teacher_fit.history.to_csv(
@@ -1622,6 +1632,7 @@ def _run_verified_neural_training(
                 else cast(int, resume_integrity["bytes"])
             ),
             training_role="main",
+            event_callback=training_event_callback,
         )
         main_model = main_fit.model
         main_fit.history.to_csv(run_dir / "training_history.csv", index=False)
@@ -1690,6 +1701,7 @@ def _run_verified_neural_training(
                 training_role="tiny",
                 feature_indices=tiny_indices.tolist(),
                 binary_attack_target=True,
+                event_callback=training_event_callback,
             )
             tiny_model = tiny_fit.model
             tiny_fit.history.to_csv(run_dir / "tiny_training_history.csv", index=False)

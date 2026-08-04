@@ -10,6 +10,7 @@ import random
 import re
 import stat
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -721,6 +722,8 @@ def _fit_neural(
     resume_from: Path | None = None,
     stop_after_epoch: int | None = None,
     resume_context: dict[str, Any] | None = None,
+    training_role: str = "main",
+    event_callback: Callable[[Mapping[str, object]], None] | None = None,
 ) -> NeuralFitResult:
     import torch
     from torch.utils.data import DataLoader, RandomSampler, TensorDataset
@@ -897,6 +900,18 @@ def _fit_neural(
                 seen += batch_rows
                 for name, value in step_metrics.items():
                     totals[name] += value * batch_rows
+                if event_callback is not None:
+                    event_callback(
+                        {
+                            "scope": "training",
+                            "status": "advanced",
+                            "role": training_role,
+                            "epoch": epoch,
+                            "epochs": epochs,
+                            "completed": (epoch - 1) * len(x_train) + seen,
+                            "total": epochs * len(x_train),
+                        }
+                    )
             scheduler.step()
             validation_probability = _predict_neural_probabilities(
                 model, x_validation, int(training_cfg["batch_size"]), device
@@ -957,6 +972,18 @@ def _fit_neural(
         _shutdown_persistent_workers(loader)
     if best_state is None:
         raise RuntimeError("training did not produce a checkpoint")
+    if event_callback is not None:
+        event_callback(
+            {
+                "scope": "training",
+                "status": "completed",
+                "role": training_role,
+                "epoch": min(len(records), epochs),
+                "epochs": epochs,
+                "completed": epochs * len(x_train),
+                "total": epochs * len(x_train),
+            }
+        )
     model.load_state_dict(best_state)
     return NeuralFitResult(model, pd.DataFrame(records), best_metric, best_epoch)
 
@@ -1269,12 +1296,31 @@ def _load_and_split(config: dict[str, Any]) -> tuple[DataSplit, list[str]]:
     return split, shared
 
 
-def run_training(config_path: str | Path) -> Path:
+def run_training(
+    config_path: str | Path,
+    *,
+    event_callback: Callable[[Mapping[str, object]], None] | None = None,
+) -> Path:
     config = load_config(config_path)
     if str(config["dataset"].get("storage", "csv")) == "parquet":
         from .out_of_core.run import run_out_of_core_training
 
-        return run_out_of_core_training(Path(config_path), config=config)
+        if event_callback is None:
+            return run_out_of_core_training(Path(config_path), config=config)
+        return run_out_of_core_training(
+            Path(config_path), config=config, event_callback=event_callback
+        )
+
+    def training_event(event: Mapping[str, object]) -> None:
+        if event_callback is not None:
+            event_callback(
+                {
+                    **dict(event),
+                    "dataset": str(config["dataset"].get("type", "training")),
+                }
+            )
+
+    training_event_callback = None if event_callback is None else training_event
     seed = int(config["experiment"]["seed"])
     seed_everything(seed)
     run_dir = create_run_dir(config)
@@ -1356,6 +1402,8 @@ def run_training(config_path: str | Path) -> Path:
                 checkpoint_path=run_dir / "teacher_training_state.pt",
                 progress_path=run_dir / "teacher_training_history.partial.csv",
                 resume_context={**resume_context, "training_role": "teacher"},
+                training_role="teacher",
+                event_callback=training_event_callback,
             )
             teacher_model = teacher_fit.model
             teacher_fit.history.to_csv(
@@ -1385,6 +1433,8 @@ def run_training(config_path: str | Path) -> Path:
             progress_path=run_dir / "training_history.partial.csv",
             resume_from=resume_path,
             resume_context={**resume_context, "training_role": "main"},
+            training_role="main",
+            event_callback=training_event_callback,
         )
         model = fit.model
         history = fit.history
@@ -1479,6 +1529,8 @@ def run_training(config_path: str | Path) -> Path:
                 "training_role": "tiny",
                 "tiny_indices": tiny_indices.tolist(),
             },
+            training_role="tiny",
+            event_callback=training_event_callback,
         )
         tiny_model = tiny_fit.model
         tiny_fit.history.to_csv(run_dir / "tiny_training_history.csv", index=False)
