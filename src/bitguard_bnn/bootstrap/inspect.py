@@ -16,7 +16,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Any, BinaryIO, TextIO
 
 from bitguard_bnn.column_names import (
     csv_column_name_key,
@@ -159,6 +159,48 @@ def _content_fingerprint(result: os.stat_result) -> tuple[int, int, int, int]:
     )
 
 
+class _HashingRawReader(io.RawIOBase):
+    """Hash bytes as the CSV decoder consumes its pinned source handle."""
+
+    def __init__(self, handle: BinaryIO) -> None:
+        super().__init__()
+        self._handle = handle
+        self._digest = hashlib.sha256()
+        self.bytes_read = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self._handle.fileno()
+
+    def readinto(self, buffer: Any) -> int:
+        block = self._handle.read(len(buffer))
+        if not block:
+            return 0
+        memoryview(buffer)[: len(block)] = block
+        self._digest.update(block)
+        self.bytes_read += len(block)
+        return len(block)
+
+    def drain(self) -> None:
+        """Hash bytes the text decoder did not request after an early failure."""
+
+        while block := self._handle.read(1 << 20):
+            self._digest.update(block)
+            self.bytes_read += len(block)
+
+    @property
+    def sha256(self) -> str:
+        return self._digest.hexdigest()
+
+    def close(self) -> None:
+        try:
+            self._handle.close()
+        finally:
+            super().close()
+
+
 def _regular_file(path: Path) -> os.stat_result:
     try:
         result = path.lstat()
@@ -227,17 +269,26 @@ def _open_pinned_text(path: Path) -> tuple[TextIO, os.stat_result, os.stat_resul
         raise SchemaInspectionError(
             f"cannot open CSV source {path}: {error}"
         ) from error
+    binary: BinaryIO | None = None
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or not _same_object(before, opened):
             raise SchemaInspectionError(f"CSV source changed during inspection: {path}")
-        return (
-            os.fdopen(descriptor, "r", encoding="utf-8-sig", newline=""),
-            opened,
-            before,
+        binary = os.fdopen(descriptor, "rb", buffering=0)
+        descriptor = -1
+        hashing_reader = _HashingRawReader(binary)
+        text = io.TextIOWrapper(
+            io.BufferedReader(hashing_reader, buffer_size=1 << 20),
+            encoding="utf-8-sig",
+            newline="",
         )
+        text._bitguard_hashing_reader = hashing_reader  # type: ignore[attr-defined]
+        return text, opened, before
     except BaseException:
-        os.close(descriptor)
+        if binary is not None:
+            binary.close()
+        elif descriptor >= 0:
+            os.close(descriptor)
         raise
 
 
@@ -262,24 +313,24 @@ def _verify_pinned_text(
         raise SchemaInspectionError(f"CSV source changed during inspection: {path}")
 
 
-def _sha256_pinned_text(path: Path, handle: TextIO) -> str:
-    """Hash the source through its already identity-pinned descriptor."""
+def _streamed_sha256(path: Path, handle: TextIO) -> str:
+    """Finish and return the SHA-256 accumulated by the parsing stream."""
 
-    descriptor = handle.fileno()
+    hashing_reader = getattr(handle, "_bitguard_hashing_reader", None)
+    if not isinstance(hashing_reader, _HashingRawReader):
+        raise SchemaInspectionError(
+            f"CSV source was not opened through the hashing reader: {path}"
+        )
     try:
-        handle.seek(0)
-        before = os.fstat(descriptor)
-        digest = hashlib.sha256()
-        while block := os.read(descriptor, 1 << 20):
-            digest.update(block)
-        after = os.fstat(descriptor)
+        hashing_reader.drain()
+        expected_bytes = os.fstat(handle.fileno()).st_size
     except OSError as error:
         raise SchemaInspectionError(
-            f"cannot hash pinned CSV source {path}: {error}"
+            f"cannot finish hashing pinned CSV source {path}: {error}"
         ) from error
-    if _content_fingerprint(before) != _content_fingerprint(after):
+    if hashing_reader.bytes_read != expected_bytes:
         raise SchemaInspectionError(f"CSV source changed during inspection: {path}")
-    return digest.hexdigest()
+    return hashing_reader.sha256
 
 
 def _discover_csvs(source: Path) -> tuple[Path, tuple[Path, ...]]:
@@ -515,6 +566,7 @@ def _row_metadata(
     path: Path,
     *,
     timestamp_valid: bool = True,
+    behavior_cache: dict[tuple[str, str], str] | None = None,
 ) -> tuple[str, str] | str:
     if dataset == "nbaiot":
         return _nbaiot_metadata(root, path)
@@ -524,7 +576,14 @@ def _row_metadata(
     raw = values[schema.raw_label].strip() if schema.raw_label else category
     if not category:
         return "invalid_label"
-    label = botiot_behavior(category, raw)
+    behavior_key = (category, raw)
+    label = None if behavior_cache is None else behavior_cache.get(behavior_key)
+    if label is None:
+        label = botiot_behavior(category, raw)
+        if behavior_cache is not None:
+            if len(behavior_cache) >= 256:
+                behavior_cache.clear()
+            behavior_cache[behavior_key] = label
     if schema.device is None:
         device = f"source_{path.stem}"
     else:
@@ -544,7 +603,7 @@ def _row_reason(
 ) -> tuple[str | None, dict[str, str] | None]:
     if len(row) != len(schema.header):
         return "column_count_mismatch", None
-    if sum(len(item) for item in row) > max_record_chars:
+    if sum(map(len, row)) > max_record_chars:
         raise SchemaInspectionError(
             f"CSV logical record exceeds max_record_chars={max_record_chars}"
         )
@@ -748,6 +807,9 @@ def _plan_file_inspection(
         reader = csv.reader(bounded_lines, strict=True)
         header = _read_header(path, bounded_lines, reader)
         schema = _schema_for(dataset, header, required, dropped, path)
+        inference_columns = list(schema.candidates)
+        if schema.timestamp is not None:
+            inference_columns.append(schema.timestamp)
         while True:
             chunk = _next_chunk(reader, bounded_lines, chunk_size)
             if not chunk:
@@ -765,7 +827,7 @@ def _plan_file_inspection(
                 if progress_callback is not None:
                     progress_callback(planned_rows)
                 continue
-            inferred_chunk = _pandas_inferred_chunk(schema.header, values_chunk)
+            inferred_chunk = _pandas_inferred_chunk(inference_columns, values_chunk)
             for candidate in schema.candidates:
                 key = _column_key(candidate)
                 if key in numeric_keys:
@@ -804,7 +866,7 @@ def _plan_file_inspection(
         raise SchemaInspectionError(f"cannot parse CSV {path}: {error}") from error
     finally:
         try:
-            source_sha256 = _sha256_pinned_text(path, handle)
+            source_sha256 = _streamed_sha256(path, handle)
             _verify_pinned_text(path, handle, opened, path_before, root)
         finally:
             handle.close()
@@ -899,6 +961,7 @@ def _inspect_csv_dataset_unlocked(
     rejection_counts: Counter[str] = Counter()
     class_counts: Counter[str] = Counter()
     samples: list[RejectedRowSample] = []
+    behavior_cache: dict[tuple[str, str], str] = {}
 
     with tempfile.TemporaryDirectory(prefix="bitguard-schema-") as temp_directory:
         devices = _DeviceStore(Path(temp_directory) / "devices.sqlite3")
@@ -955,6 +1018,11 @@ def _inspect_csv_dataset_unlocked(
                         f"expected={list(canonical_features)}, "
                         f"observed={list(normalized_file_features)}"
                     )
+                nbaiot_metadata = (
+                    _nbaiot_metadata(root, path)
+                    if normalized_dataset == "nbaiot"
+                    else None
+                )
 
                 handle, opened, path_before = _open_pinned_text(path)
                 file_rows = 0
@@ -992,7 +1060,7 @@ def _inspect_csv_dataset_unlocked(
                         ]
                         if schema.timestamp is not None and normalized_rows:
                             inferred_chunk = _pandas_inferred_chunk(
-                                schema.header, normalized_rows
+                                (schema.timestamp,), normalized_rows
                             )
                             timestamp_values = _promote_timestamp_series(
                                 inferred_chunk[schema.timestamp],
@@ -1012,13 +1080,18 @@ def _inspect_csv_dataset_unlocked(
                             total_rows += 1
                             if reason is None:
                                 assert values is not None
-                                metadata = _row_metadata(
-                                    normalized_dataset,
-                                    values,
-                                    schema,
-                                    root,
-                                    path,
-                                    timestamp_valid=bool(next(timestamp_validity)),
+                                metadata = (
+                                    nbaiot_metadata
+                                    if nbaiot_metadata is not None
+                                    else _row_metadata(
+                                        normalized_dataset,
+                                        values,
+                                        schema,
+                                        root,
+                                        path,
+                                        timestamp_valid=bool(next(timestamp_validity)),
+                                        behavior_cache=behavior_cache,
+                                    )
                                 )
                                 if isinstance(metadata, str):
                                     reason = metadata
@@ -1044,7 +1117,7 @@ def _inspect_csv_dataset_unlocked(
                     ) from error
                 finally:
                     try:
-                        pass_sha256 = _sha256_pinned_text(path, handle)
+                        pass_sha256 = _streamed_sha256(path, handle)
                         _verify_pinned_text(path, handle, opened, path_before, root)
                     finally:
                         handle.close()

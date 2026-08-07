@@ -79,6 +79,110 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertTrue(all(event["file_index"] == 1 for event in phase_events))
             self.assertTrue(all(event["file_count"] == 1 for event in phase_events))
 
+    def test_inspection_reads_each_source_only_for_two_semantic_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "rows.csv"
+            source.write_text(
+                "mean,std\n1,2\n3,4\n",
+                encoding="utf-8",
+            )
+            source_size = source.stat().st_size
+            bytes_read = 0
+            real_readinto = inspect_module._HashingRawReader.readinto
+
+            def record_read(
+                reader: inspect_module._HashingRawReader,
+                buffer: bytearray | memoryview,
+            ) -> int:
+                nonlocal bytes_read
+                count = real_readinto(reader, buffer)
+                bytes_read += count
+                return count
+
+            with patch.object(inspect_module._HashingRawReader, "readinto", record_read):
+                report = inspect_csv_dataset("nbaiot", root, chunk_size=1)
+
+        self.assertEqual(report.total_rows, 2)
+        self.assertEqual(bytes_read, source_size * 2)
+
+    def test_nbaiot_file_metadata_is_derived_once_per_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            benign = root / "device_a" / "benign_traffic.csv"
+            attack = root / "device_b" / "gafgyt_attacks" / "tcp.csv"
+            benign.parent.mkdir()
+            attack.parent.mkdir(parents=True)
+            benign.write_text("mean,std\n1,2\n3,4\n5,6\n", encoding="utf-8")
+            attack.write_text("mean,std\n7,8\n9,10\n", encoding="utf-8")
+
+            with patch.object(
+                inspect_module,
+                "_nbaiot_metadata",
+                wraps=inspect_module._nbaiot_metadata,
+            ) as derive_metadata:
+                inspect_csv_dataset("nbaiot", root, chunk_size=1)
+
+        self.assertEqual(derive_metadata.call_count, 2)
+
+    def test_botiot_behavior_is_derived_once_per_distinct_label_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            header = "category,subcategory,saddr,stime,bytes\n"
+            (root / "flows_a.csv").write_text(
+                header
+                + "Normal,Normal,device-a,1,100\n"
+                + "DDoS,TCP,device-b,2,200\n"
+                + "Normal,Normal,device-c,3,300\n",
+                encoding="utf-8",
+            )
+            (root / "flows_b.csv").write_text(
+                header
+                + "DDoS,TCP,device-d,4,400\n"
+                + "Normal,Normal,device-e,5,500\n"
+                + "DDoS,TCP,device-f,6,600\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                inspect_module,
+                "botiot_behavior",
+                wraps=inspect_module.botiot_behavior,
+            ) as derive_behavior:
+                inspect_csv_dataset("botiot", root, chunk_size=1)
+
+        self.assertEqual(derive_behavior.call_count, 2)
+
+    def test_botiot_pandas_inference_uses_only_phase_required_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory,saddr,stime,pkSeqID,seq,daddr,sport,dport,"
+                "smac,dmac,bytes,rate,proto\n"
+                "Normal,Normal,device-a,1,1,11,target-a,100,200,aa,bb,10,0.1,tcp\n"
+                "DDoS,TCP,device-b,2,2,12,target-b,101,201,cc,dd,20,0.2,udp\n"
+                "Normal,Normal,device-c,3,3,13,target-c,102,202,ee,ff,30,0.3,tcp\n"
+                "DDoS,TCP,device-d,4,4,14,target-d,103,203,gg,hh,40,0.4,udp\n"
+                "Normal,Normal,device-e,5,5,15,target-e,104,204,ii,jj,50,0.5,tcp\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                inspect_module,
+                "_pandas_inferred_chunk",
+                wraps=inspect_module._pandas_inferred_chunk,
+            ) as infer_chunk:
+                inspect_csv_dataset("botiot", root, chunk_size=2)
+
+        inferred_columns = [
+            frozenset(call.args[0]) for call in infer_chunk.call_args_list
+        ]
+        self.assertEqual(
+            inferred_columns,
+            [frozenset({"bytes", "proto", "rate", "stime"})] * 3
+            + [frozenset({"stime"})] * 3,
+        )
+
     def test_physical_line_read_is_limited_before_allocation(self) -> None:
         class RecordingText(io.StringIO):
             def __init__(self, value: str) -> None:
