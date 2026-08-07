@@ -1012,6 +1012,93 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
 
             self._assert_parity(config)
 
+    def test_botiot_reader_normalizes_spaced_header_without_metadata_feature_leakage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "botiot.csv").write_text(
+                "category,subcategory ,saddr,stime,bytes\n"
+                "Normal,Normal,device-a,1,100\n"
+                "DDoS,TCP,device-b,2,200\n",
+                encoding="utf-8",
+            )
+            config = _base_config(root, "botiot", "botiot.csv")
+
+            with open_normalized_source(config) as source:
+                frame = pd.concat(
+                    [chunk.frame for chunk in source.iter_chunks()],
+                    ignore_index=True,
+                )
+                feature_names = source.proof.feature_names
+
+            self.assertEqual(feature_names, ("bytes",))
+            self.assertNotIn("subcategory ", frame.columns)
+            self.assertEqual(frame["raw_attack"].tolist(), ["normal", "tcp"])
+            self.assertEqual(
+                frame["behavior_label"].tolist(), ["benign", "flood_like"]
+            )
+            self.assertEqual(frame["device_id"].tolist(), ["device-a", "device-b"])
+            self.assertEqual(frame["timestamp"].tolist(), [1.0, 2.0])
+
+    def test_botiot_reader_rejects_headers_colliding_after_trim_and_nfc(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "botiot.csv").write_text(
+                "category,subcategory,saddr,stime,cafe\u0301 ,caf\u00e9\n"
+                "Normal,Normal,device-a,1,10,20\n",
+                encoding="utf-8",
+            )
+            config = _base_config(root, "botiot", "botiot.csv")
+
+            with self.assertRaisesRegex(ValueError, "duplicate.*column"):
+                list(iter_normalized_chunks(config))
+
+    def test_botiot_reader_rejects_invalid_raw_headers_before_pandas_mangling(
+        self,
+    ) -> None:
+        cases = (
+            ("exact duplicate", "bytes,bytes", "100,200"),
+            ("empty", "bytes,", "100,200"),
+            ("whitespace only", "bytes,   ", "100,200"),
+            ("nul control", "bytes,bad\x00column", "100,200"),
+        )
+        for name, feature_header, feature_values in cases:
+            with (
+                self.subTest(header=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                (root / "botiot.csv").write_text(
+                    f"category,subcategory,saddr,stime,{feature_header}\n"
+                    f"Normal,Normal,device-a,1,{feature_values}\n",
+                    encoding="utf-8",
+                )
+                config = _base_config(root, "botiot", "botiot.csv")
+
+                with self.assertRaisesRegex(ValueError, "CSV header"):
+                    list(iter_normalized_chunks(config))
+
+    def test_botiot_reader_matches_casefolded_drop_columns_to_source_features(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "botiot.csv").write_text(
+                "category,subcategory,saddr,stime,Bytes,rate\n"
+                "Normal,Normal,device-a,1,100,0.5\n"
+                "DDoS,TCP,device-b,2,200,3.5\n",
+                encoding="utf-8",
+            )
+            config = _base_config(root, "botiot", "botiot.csv")
+            config["dataset"]["drop_columns"] = ["bytes"]
+
+            with open_normalized_source(config) as source:
+                list(source.iter_chunks())
+                feature_names = source.proof.feature_names
+
+            self.assertEqual(feature_names, ("rate",))
+
     def test_iterator_does_not_concat_source_chunks_and_reports_exact_offsets(
         self,
     ) -> None:

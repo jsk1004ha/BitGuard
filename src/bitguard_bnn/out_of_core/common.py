@@ -11,6 +11,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from bitguard_bnn.column_names import csv_column_name_key
 from bitguard_bnn.config import resolve_path
 from bitguard_bnn.constants import META_COLUMNS
 
@@ -135,8 +136,15 @@ def append_metadata(
 def numeric_features(
     frame: pd.DataFrame, drop_columns: Iterable[str] = ()
 ) -> list[str]:
-    excluded = META_COLUMNS | set(drop_columns)
-    candidates = [column for column in frame.columns if column not in excluded]
+    excluded = {
+        csv_column_name_key(column)
+        for column in META_COLUMNS | set(drop_columns)
+    }
+    candidates = [
+        column
+        for column in frame.columns
+        if csv_column_name_key(column) not in excluded
+    ]
     numeric: list[str] = []
     for column in candidates:
         converted = pd.to_numeric(frame[column], errors="coerce")
@@ -151,10 +159,11 @@ def numeric_features(
 def find_column(
     frame: pd.DataFrame, preferred: str | None, candidates: list[str]
 ) -> str | None:
-    lookup = {str(column).lower(): str(column) for column in frame.columns}
+    lookup = {csv_column_name_key(column): str(column) for column in frame.columns}
     for candidate in [preferred, *candidates]:
-        if candidate and candidate.lower() in lookup:
-            return lookup[candidate.lower()]
+        key = csv_column_name_key(candidate) if candidate else None
+        if key and key in lookup:
+            return lookup[key]
     return None
 
 

@@ -21,6 +21,64 @@ from bitguard_bnn.bootstrap.inspect import (
 
 
 class SchemaInspectionTest(unittest.TestCase):
+    def test_botiot_trailing_header_space_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory ,saddr,stime,bytes\n"
+                "DDoS,TCP,10.0.0.2,2.5,200\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset("botiot", root)
+
+        self.assertEqual(report.accepted_rows, 1)
+        self.assertEqual(report.class_counts, (("flood_like", 1),))
+        self.assertIn("subcategory", report.excluded_columns)
+
+    def test_headers_colliding_after_trimming_are_rejected_as_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rows.csv").write_text(
+                "bytes,bytes \n1,2\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SchemaInspectionError, "duplicate column"):
+                inspect_csv_dataset("nbaiot", root)
+
+    def test_inspection_reports_plan_and_validate_chunk_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relative_path = "device/benign_traffic.csv"
+            source = root / relative_path
+            source.parent.mkdir()
+            source.write_text("mean,std\n1,2\n3,4\n5,6\n", encoding="utf-8")
+            events: list[dict[str, object]] = []
+
+            report = inspect_csv_dataset(
+                "nbaiot",
+                root,
+                chunk_size=2,
+                progress_callback=lambda event: events.append(dict(event)),
+            )
+
+        self.assertEqual(report.total_rows, 3)
+        for phase in ("plan", "validate"):
+            phase_events = [event for event in events if event.get("phase") == phase]
+            self.assertEqual(
+                [event["rows"] for event in phase_events],
+                [2, 3],
+            )
+            self.assertTrue(
+                all(event["dataset"] == "nbaiot" for event in phase_events)
+            )
+            self.assertTrue(
+                all(event["relative_path"] == relative_path for event in phase_events)
+            )
+            self.assertTrue(all(event["file_index"] == 1 for event in phase_events))
+            self.assertTrue(all(event["file_count"] == 1 for event in phase_events))
+
     def test_physical_line_read_is_limited_before_allocation(self) -> None:
         class RecordingText(io.StringIO):
             def __init__(self, value: str) -> None:

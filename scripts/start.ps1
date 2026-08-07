@@ -112,6 +112,33 @@ function Get-BitGuardFailureSummary {
     return $lines
 }
 
+function Write-BitGuardFailureSummary {
+    param(
+        [int]$ExitCode,
+        [string]$ReportPath,
+        [string]$LogPath
+    )
+
+    $summary = @(
+        Get-BitGuardFailureSummary `
+            -ExitCode $ExitCode `
+            -ReportPath $ReportPath `
+            -LogPath $LogPath
+    )
+    try {
+        Add-Content `
+            -LiteralPath $LogPath `
+            -Encoding UTF8 `
+            -Value @("", "BitGuard failure summary", $summary)
+    }
+    catch {
+        [Console]::Error.WriteLine(
+            "BitGuard could not append its failure summary to the log: $($_.Exception.Message)"
+        )
+    }
+    return $summary
+}
+
 function Wait-BitGuardFailureWindow {
     param([switch]$Enabled)
 
@@ -277,7 +304,7 @@ Invoke-BitGuardBootstrapSession `
 if ($exitCode -ne 0) {
     $reportPath = Join-Path $displayDataRoot ".bitguard\bootstrap-report.json"
     Write-Host ""
-    Get-BitGuardFailureSummary `
+    Write-BitGuardFailureSummary `
         -ExitCode $exitCode `
         -ReportPath $reportPath `
         -LogPath $logPath |

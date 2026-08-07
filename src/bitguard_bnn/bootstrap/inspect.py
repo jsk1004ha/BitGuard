@@ -11,14 +11,18 @@ import sqlite3
 import stat
 import tempfile
 import threading
-import unicodedata
 import warnings
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
+from bitguard_bnn.column_names import (
+    csv_column_name_key,
+    normalize_csv_column_name,
+    normalize_csv_column_names,
+)
 from bitguard_bnn.constants import botiot_behavior, nbaiot_behavior, normalize_token
 
 _PANDAS_IMPORT_ERROR: Exception | None = None
@@ -388,32 +392,22 @@ class _DeviceStore:
         self.connection.close()
 
 
-def _header_mapping(header: Sequence[str], path: Path) -> dict[str, str]:
-    if not header or all(not str(item).strip() for item in header):
-        raise SchemaInspectionError(f"empty CSV header: {path}")
-    if any(not str(item).strip() for item in header):
-        raise SchemaInspectionError(f"CSV header contains an empty column: {path}")
-    mapping: dict[str, str] = {}
-    for column in header:
-        if column != column.strip() or any(ord(character) < 32 for character in column):
-            raise SchemaInspectionError(
-                f"CSV header contains whitespace or control characters in {path}: {column!r}"
-            )
-        key = unicodedata.normalize("NFC", column).casefold()
-        if key in mapping:
-            raise SchemaInspectionError(
-                f"duplicate column after case folding in {path}: {column!r}"
-            )
-        mapping[key] = column
-    return mapping
+def _header_mapping(
+    header: Sequence[str], path: Path
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    try:
+        normalized = normalize_csv_column_names(header, source=path)
+    except ValueError as error:
+        raise SchemaInspectionError(str(error)) from error
+    return ({csv_column_name_key(column): column for column in normalized}, normalized)
 
 
 def _normalized_column_name(column: str) -> str:
-    return unicodedata.normalize("NFC", column.strip())
+    return normalize_csv_column_name(column)
 
 
 def _column_key(column: str) -> str:
-    return _normalized_column_name(column).casefold()
+    return csv_column_name_key(column)
 
 
 def _find(
@@ -455,7 +449,7 @@ def _schema_for(
     drop_columns: Sequence[str],
     path: Path,
 ) -> _Schema:
-    mapping = _header_mapping(header, path)
+    mapping, normalized_header = _header_mapping(header, path)
     missing = [column for column in required if _column_key(column) not in mapping]
     if missing:
         raise SchemaInspectionError(
@@ -474,15 +468,20 @@ def _schema_for(
         item for item in (label, raw_label, device, timestamp) if item is not None
     }
     drop_keys = {_column_key(column) for column in drop_columns}
-    dropped = {column for column in header if _column_key(column) in drop_keys}
+    dropped = {
+        column for column in normalized_header if _column_key(column) in drop_keys
+    }
     excluded = metadata | dropped
     candidates = tuple(
-        sorted((column for column in header if column not in excluded), key=_column_key)
+        sorted(
+            (column for column in normalized_header if column not in excluded),
+            key=_column_key,
+        )
     )
     if not candidates:
         raise SchemaInspectionError(f"no numeric feature columns remain in {path}")
     return _Schema(
-        tuple(header),
+        normalized_header,
         candidates,
         tuple(sorted(excluded, key=str.casefold)),
         label,
@@ -732,6 +731,7 @@ def _plan_file_inspection(
     *,
     chunk_size: int,
     max_record_chars: int,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> _FileInspectionPlan:
     """Choose adapter-compatible schema and timestamp mode in bounded chunks."""
 
@@ -742,6 +742,7 @@ def _plan_file_inspection(
     timestamp_witnesses: dict[tuple[str, bool], object] = {}
     first_timestamp_value: object | None = None
     source_sha256 = ""
+    planned_rows = 0
     try:
         bounded_lines = _BoundedLines(handle, max_record_chars)
         reader = csv.reader(bounded_lines, strict=True)
@@ -759,7 +760,10 @@ def _plan_file_inspection(
                 if reason is None:
                     assert values is not None
                     values_chunk.append(values)
+            planned_rows += len(chunk)
             if not values_chunk:
+                if progress_callback is not None:
+                    progress_callback(planned_rows)
                 continue
             inferred_chunk = _pandas_inferred_chunk(schema.header, values_chunk)
             for candidate in schema.candidates:
@@ -794,6 +798,8 @@ def _plan_file_inspection(
                 converted_timestamp = _converted_numeric(timestamp_values)
                 timestamp_numeric += int(converted_timestamp.notna().sum())
                 timestamp_total += len(timestamp_values)
+            if progress_callback is not None:
+                progress_callback(planned_rows)
     except (csv.Error, UnicodeError) as error:
         raise SchemaInspectionError(f"cannot parse CSV {path}: {error}") from error
     finally:
@@ -855,6 +861,7 @@ def _inspect_csv_dataset_unlocked(
     fail_on_rejected: bool = True,
     rejected_sample_limit: int = 32,
     device_sample_limit: int = 128,
+    progress_callback: Callable[[Mapping[str, object]], None] | None = None,
 ) -> SchemaInspectionReport:
     """Inspect all CSV rows in bounded chunks without retaining a complete frame."""
 
@@ -896,8 +903,25 @@ def _inspect_csv_dataset_unlocked(
     with tempfile.TemporaryDirectory(prefix="bitguard-schema-") as temp_directory:
         devices = _DeviceStore(Path(temp_directory) / "devices.sqlite3")
         try:
-            for path in paths:
+            for file_index, path in enumerate(paths, start=1):
                 relative = path.relative_to(root).as_posix()
+
+                def report_progress(phase: str, rows: int) -> None:
+                    if progress_callback is None:
+                        return
+                    progress_callback(
+                        {
+                            "scope": "inspection",
+                            "status": "advanced",
+                            "dataset": normalized_dataset,
+                            "phase": phase,
+                            "relative_path": relative,
+                            "file_index": file_index,
+                            "file_count": len(paths),
+                            "rows": rows,
+                        }
+                    )
+
                 _verify_source_directories(root, path)
                 try:
                     plan = _plan_file_inspection(
@@ -908,6 +932,7 @@ def _inspect_csv_dataset_unlocked(
                         dropped,
                         chunk_size=chunk_size,
                         max_record_chars=max_record_chars,
+                        progress_callback=lambda rows: report_progress("plan", rows),
                     )
                 except SchemaInspectionError as error:
                     if (
@@ -1012,6 +1037,7 @@ def _inspect_csv_dataset_unlocked(
                                         RejectedRowSample(relative, logical_row, reason)
                                     )
                         devices.add(chunk_devices)
+                        report_progress("validate", file_rows)
                 except (csv.Error, UnicodeError) as error:
                     raise SchemaInspectionError(
                         f"cannot parse CSV {path}: {error}"
@@ -1096,6 +1122,7 @@ def inspect_csv_dataset(
     fail_on_rejected: bool = True,
     rejected_sample_limit: int = 32,
     device_sample_limit: int = 128,
+    progress_callback: Callable[[Mapping[str, object]], None] | None = None,
 ) -> SchemaInspectionReport:
     """Inspect all CSV rows while isolating the process-global CSV field limit."""
 
@@ -1120,6 +1147,7 @@ def inspect_csv_dataset(
                 fail_on_rejected=fail_on_rejected,
                 rejected_sample_limit=rejected_sample_limit,
                 device_sample_limit=device_sample_limit,
+                progress_callback=progress_callback,
             )
         finally:
             csv.field_size_limit(previous_limit)

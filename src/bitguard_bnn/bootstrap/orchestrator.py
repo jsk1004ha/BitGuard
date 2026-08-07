@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import inspect as python_inspect
 import json
 import os
 import platform
@@ -176,6 +177,27 @@ def _json_signature(value: object) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _accepts_keyword_argument(callback: Callable[..., object], name: str) -> bool:
+    """Return whether a dependency callback explicitly accepts a keyword."""
+
+    try:
+        parameters = python_inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is python_inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == name
+            and parameter.kind
+            in {
+                python_inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                python_inspect.Parameter.KEYWORD_ONLY,
+            }
+        )
+        for parameter in parameters
+    )
 
 
 def _regular_digest(path: Path) -> tuple[str, int]:
@@ -2778,14 +2800,75 @@ def run_bootstrap(
                     outputs.append(extraction_report_path)
                     return tuple(outputs)
 
+                inspect_source_tokens: dict[str, str] = {}
+
+                def report_inspection_progress(
+                    event: Mapping[str, object],
+                ) -> None:
+                    if progress_callback is None:
+                        return
+                    payload = dict(event)
+                    payload.update(
+                        {
+                            "scope": "bootstrap",
+                            "stage": "inspect",
+                            "completed": stage_index,
+                            "total": total_stages,
+                        }
+                    )
+                    progress_callback(payload)
+
+                def inspect_input_signature() -> str:
+                    source_tokens: dict[str, str] = {}
+                    for dataset_index, dataset in enumerate(options.datasets, start=1):
+                        raw_root = raw_roots[dataset]
+                        report_inspection_progress(
+                            {
+                                "status": "advanced",
+                                "dataset": dataset,
+                                "phase": "hash",
+                                "relative_path": str(raw_root),
+                                "dataset_index": dataset_index,
+                                "dataset_count": len(options.datasets),
+                                "rows": 0,
+                            }
+                        )
+                        source_tokens[dataset] = _tree_digest(raw_root)[0]
+                    inspect_source_tokens.clear()
+                    inspect_source_tokens.update(source_tokens)
+                    return _json_signature(
+                        {
+                            "raw": source_tokens,
+                            "registry": {
+                                name: registry[name].to_dict()
+                                for name in options.datasets
+                            },
+                        }
+                    )
+
                 def run_inspect() -> Sequence[Path]:
                     _ensure_durable_directory(manifest_root)
                     _ensure_durable_directory(schema_root)
                     outputs: list[Path] = []
-                    for dataset in options.datasets:
+                    for dataset_index, dataset in enumerate(options.datasets, start=1):
                         spec: DatasetSpec = registry[dataset]
                         raw_root = raw_roots[dataset]
-                        source_token = _tree_digest(raw_root)[0]
+                        source_token = inspect_source_tokens.get(dataset)
+                        if source_token is None:
+                            raise RuntimeError(
+                                f"inspect source digest is unavailable for {dataset}"
+                            )
+                        report_inspection_progress(
+                            {
+                                "status": "advanced",
+                                "dataset": dataset,
+                                "phase": "manifest",
+                                "relative_path": str(raw_root),
+                                "dataset_index": dataset_index,
+                                "dataset_count": len(options.datasets),
+                                "rows": 0,
+                            }
+                        )
                         manifest = build_source_manifest(
                             raw_root,
                             spec,
@@ -2798,10 +2881,20 @@ def run_bootstrap(
                         )
                         manifest_path = manifest_root / f"{dataset}-{source_token}.json"
                         write_source_manifest(manifest_path, manifest)
+                        inspector_arguments: dict[str, object] = {
+                            "required_columns": spec.required_columns,
+                        }
+                        if _accepts_keyword_argument(
+                            deps.inspector,
+                            "progress_callback",
+                        ):
+                            inspector_arguments["progress_callback"] = (
+                                report_inspection_progress
+                            )
                         schema = deps.inspector(
                             dataset,
                             raw_root,
-                            required_columns=spec.required_columns,
+                            **inspector_arguments,
                         )
                         schema_path = schema_root / f"{dataset}-{source_token}.json"
                         _write_json(schema_path, schema.as_dict())
@@ -3400,18 +3493,7 @@ def run_bootstrap(
                     ),
                     Stage(
                         "inspect",
-                        lambda: _json_signature(
-                            {
-                                "raw": {
-                                    name: _tree_digest(path)[0]
-                                    for name, path in raw_roots.items()
-                                },
-                                "registry": {
-                                    name: registry[name].to_dict()
-                                    for name in options.datasets
-                                },
-                            }
-                        ),
+                        inspect_input_signature,
                         run_inspect,
                     ),
                 )
@@ -3440,15 +3522,25 @@ def run_bootstrap(
                 for stage_index, stage in enumerate(stages):
                     current_stage = stage.name
                     if progress_callback is not None:
-                        progress_callback(
-                            {
-                                "scope": "bootstrap",
-                                "status": "started",
-                                "stage": stage.name,
-                                "completed": stage_index,
-                                "total": total_stages,
-                            }
-                        )
+                        stage_event: dict[str, object] = {
+                            "scope": "bootstrap",
+                            "status": "started",
+                            "stage": stage.name,
+                            "completed": stage_index,
+                            "total": total_stages,
+                        }
+                        if stage.name == "inspect":
+                            first_dataset = options.datasets[0]
+                            stage_event.update(
+                                {
+                                    "dataset": first_dataset,
+                                    "phase": "hash",
+                                    "relative_path": str(raw_roots[first_dataset]),
+                                    "dataset_index": 1,
+                                    "dataset_count": len(options.datasets),
+                                }
+                            )
+                        progress_callback(stage_event)
                     signature = stage.input_signature()
                     reusable = state.reusable(stage.name, signature)
                     if reusable and not stage.always_run:
@@ -3466,6 +3558,14 @@ def run_bootstrap(
                                     "full-data preparation inputs changed while the "
                                     "shard stage was running"
                                 )
+                        if (
+                            stage.name == "inspect"
+                            and completion_signature != signature
+                        ):
+                            raise RuntimeError(
+                                "full-data inspection inputs changed while the "
+                                "inspect stage was running"
+                            )
                         state.complete(stage.name, completion_signature, outputs)
                         executed.append(stage.name)
                         progress_status = "completed"
@@ -3476,7 +3576,11 @@ def run_bootstrap(
                         )
                     if stage.name == "inspect":
                         for dataset in options.datasets:
-                            source_token = _tree_digest(raw_roots[dataset])[0]
+                            source_token = inspect_source_tokens.get(dataset)
+                            if source_token is None:
+                                raise RuntimeError(
+                                    f"inspect source digest is unavailable for {dataset}"
+                                )
                             manifests[dataset] = str(
                                 manifest_root / f"{dataset}-{source_token}.json"
                             )

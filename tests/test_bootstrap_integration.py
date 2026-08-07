@@ -10,11 +10,13 @@ import subprocess
 import tempfile
 import unittest
 import zipfile
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import bitguard_bnn.bootstrap.orchestrator as orchestrator_module
 from bitguard_bnn.bootstrap.cleanup import scan_cleanup_debt
 from bitguard_bnn.bootstrap.download import DownloadResult, download_file
 from bitguard_bnn.bootstrap.extract import ExtractionResult, extract_zip
@@ -353,6 +355,183 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
             ],
             ["preflight", "environment", "acquire", "extract", "inspect"],
         )
+
+    def test_inspection_subprogress_keeps_outer_stage_counts(self) -> None:
+        events: list[dict[str, object]] = []
+
+        def inspector(
+            dataset,
+            source,
+            *,
+            required_columns,
+            progress_callback,
+        ):
+            progress_callback(
+                {
+                    "scope": "inspection",
+                    "status": "advanced",
+                    "dataset": dataset,
+                    "phase": "plan",
+                    "relative_path": "fixture.csv",
+                    "file_index": 1,
+                    "file_count": 1,
+                    "rows": 2,
+                }
+            )
+            return inspect_csv_dataset(
+                dataset,
+                source,
+                required_columns=required_columns,
+            )
+
+        report = run_bootstrap(
+            self.options,
+            dependencies=self.dependencies(inspector=inspector),
+            progress_callback=lambda event: events.append(dict(event)),
+        )
+
+        self.assertEqual(report["status"], "sources_verified", msg=report.get("error"))
+        forwarded = [event for event in events if event.get("phase") == "plan"]
+        self.assertEqual(len(forwarded), 2)
+        self.assertTrue(all(event["scope"] == "bootstrap" for event in forwarded))
+        self.assertTrue(all(event["stage"] == "inspect" for event in forwarded))
+        self.assertTrue(all(event["completed"] == 4 for event in forwarded))
+        self.assertTrue(all(event["total"] == 5 for event in forwarded))
+        self.assertEqual(
+            [event["dataset"] for event in forwarded],
+            ["nbaiot", "botiot"],
+        )
+
+    def test_legacy_inspector_signature_remains_supported_with_optional_progress(
+        self,
+    ) -> None:
+        def legacy_inspector(dataset, source, *, required_columns):
+            return inspect_csv_dataset(
+                dataset,
+                source,
+                required_columns=required_columns,
+            )
+
+        for with_progress in (False, True):
+            with self.subTest(with_progress=with_progress):
+                options = replace(
+                    self.options,
+                    data_root=(self.root / f"data-legacy-{with_progress}").resolve(),
+                    runs_root=(self.root / f"runs-legacy-{with_progress}").resolve(),
+                )
+                events: list[dict[str, object]] = []
+                report = run_bootstrap(
+                    options,
+                    dependencies=self.dependencies(inspector=legacy_inspector),
+                    progress_callback=(
+                        (lambda event: events.append(dict(event)))
+                        if with_progress
+                        else None
+                    ),
+                )
+
+                self.assertEqual(
+                    report["status"],
+                    "sources_verified",
+                    msg=report.get("error"),
+                )
+                if with_progress:
+                    self.assertTrue(events)
+
+    def test_inspect_started_event_includes_first_dataset_hash_detail(self) -> None:
+        events: list[dict[str, object]] = []
+
+        report = run_bootstrap(
+            self.options,
+            dependencies=self.dependencies(),
+            progress_callback=lambda event: events.append(dict(event)),
+        )
+
+        self.assertEqual(report["status"], "sources_verified", msg=report.get("error"))
+        first_inspect = next(
+            event
+            for event in events
+            if event.get("stage") == "inspect"
+        )
+        self.assertEqual(first_inspect["status"], "started")
+        self.assertEqual(first_inspect["dataset"], "nbaiot")
+        self.assertEqual(first_inspect["phase"], "hash")
+        self.assertEqual(first_inspect["dataset_index"], 1)
+        self.assertEqual(first_inspect["dataset_count"], 2)
+
+    def test_inspect_stage_digests_each_raw_dataset_root_exactly_twice(self) -> None:
+        active = False
+        calls: Counter[str] = Counter()
+        real_tree_digest = orchestrator_module._tree_digest
+
+        def progress(event) -> None:
+            nonlocal active
+            if event.get("stage") != "inspect":
+                return
+            if event.get("status") == "started":
+                active = True
+            elif event.get("status") in {"completed", "reused", "failed"}:
+                active = False
+
+        def counting_tree_digest(path: Path):
+            if active and path.parent == self.data_root / "raw":
+                calls[path.name.split("-", 1)[0]] += 1
+            return real_tree_digest(path)
+
+        with patch.object(
+            orchestrator_module,
+            "_tree_digest",
+            side_effect=counting_tree_digest,
+        ):
+            report = run_bootstrap(
+                self.options,
+                dependencies=self.dependencies(),
+                progress_callback=progress,
+            )
+
+        self.assertEqual(report["status"], "sources_verified", msg=report.get("error"))
+        self.assertEqual(calls, Counter({"nbaiot": 2, "botiot": 2}))
+
+    def test_source_mutation_before_second_inspect_digest_fails_stage(self) -> None:
+        active = False
+        calls: Counter[str] = Counter()
+        real_tree_digest = orchestrator_module._tree_digest
+
+        def progress(event) -> None:
+            nonlocal active
+            if event.get("stage") != "inspect":
+                return
+            if event.get("status") == "started":
+                active = True
+            elif event.get("status") in {"completed", "reused", "failed"}:
+                active = False
+
+        def mutate_before_second_digest(path: Path):
+            if active and path.parent == self.data_root / "raw":
+                dataset = path.name.split("-", 1)[0]
+                calls[dataset] += 1
+                if dataset == "nbaiot" and calls[dataset] == 2:
+                    (path / "changed-after-inspection.txt").write_text(
+                        "mutation",
+                        encoding="utf-8",
+                    )
+            return real_tree_digest(path)
+
+        with patch.object(
+            orchestrator_module,
+            "_tree_digest",
+            side_effect=mutate_before_second_digest,
+        ):
+            report = run_bootstrap(
+                self.options,
+                dependencies=self.dependencies(),
+                progress_callback=progress,
+            )
+
+        self.assertEqual(calls["nbaiot"], 2)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["failed_stage"], "inspect")
+        self.assertEqual(report["last_completed_stage"], "extract")
 
     def test_prepare_only_runs_to_verified_sources_and_reuses_every_stage(self) -> None:
         first = run_bootstrap(

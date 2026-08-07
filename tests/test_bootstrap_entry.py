@@ -439,6 +439,77 @@ $summaryProbe = [ScriptBlock]::Create("$($function.Extent.Text)`n$body")
         self.assertIn(str(log), result.stdout)
 
     @unittest.skipUnless(shutil.which("powershell.exe"), "PowerShell is required")
+    def test_windows_start_launcher_appends_failure_summary_after_child_transcript(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        launcher = repository / "scripts" / "start.ps1"
+        with tempfile.TemporaryDirectory() as temporary:
+            user_profile = Path(temporary)
+            log_root = user_profile / "BitGuardLogs"
+            log_root.mkdir()
+            log = log_root / "bootstrap-20260807-120000.log"
+            log.write_text("child transcript ended\n", encoding="utf-8")
+            report = user_profile / "bootstrap-report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "failed_stage": "inspect",
+                        "last_completed_stage": "extract",
+                        "error": "SchemaInspectionError: malformed fixture",
+                        "recovery_command": "rerun the original command",
+                        "report_path": str(report),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            probe = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:BITGUARD_START_LAUNCHER, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -gt 0) { exit 91 }
+$wanted = @('Get-BitGuardFailureSummary', 'Write-BitGuardFailureSummary')
+$functions = $ast.FindAll(
+    {
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $wanted -contains $node.Name
+    },
+    $true
+) | ForEach-Object { $_.Extent.Text }
+if ($functions.Count -ne $wanted.Count) { exit 92 }
+$body = @'
+Write-BitGuardFailureSummary `
+    -ExitCode 7 `
+    -ReportPath $env:BITGUARD_TEST_REPORT `
+    -LogPath $env:BITGUARD_TEST_LOG
+'@
+$summaryProbe = [ScriptBlock]::Create("$($functions -join "`n")`n$body")
+& $summaryProbe
+"""
+            environment = os.environ.copy()
+            environment["USERPROFILE"] = str(user_profile)
+            environment["BITGUARD_START_LAUNCHER"] = str(launcher)
+            environment["BITGUARD_TEST_REPORT"] = str(report)
+            environment["BITGUARD_TEST_LOG"] = str(log)
+            result = subprocess.run(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", probe],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            logged = log.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(logged.index("child transcript ended"), logged.index("exit code 7"))
+        self.assertIn("Failed stage: inspect", logged)
+        self.assertIn("SchemaInspectionError: malformed fixture", logged)
+        self.assertIn("Recovery: rerun the original command", logged)
+        self.assertIn(f"Report: {report}", logged)
+        self.assertIn(f"Log:    {log}", logged)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "PowerShell is required")
     def test_windows_start_launcher_captures_child_exit_and_returns_to_parent(self):
         repository = Path(bootstrap.__file__).resolve().parents[1]
         launcher = repository / "scripts" / "start.ps1"

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import csv
 import ctypes
 import functools
 import heapq
 import hashlib
+import io
 import json
 import os
 import re
@@ -25,6 +27,10 @@ import numpy as np
 import pandas as pd
 from pandas.tseries.api import guess_datetime_format
 
+from bitguard_bnn.column_names import (
+    csv_column_name_key,
+    normalize_csv_column_names,
+)
 from bitguard_bnn.config import resolve_path
 from bitguard_bnn.constants import (
     META_COLUMNS,
@@ -1115,6 +1121,20 @@ class _VerifiedCsvPass:
         )
         return os.fdopen(descriptor, "rb", buffering=0)
 
+    def _normalized_header(self, handle: BinaryIO) -> tuple[str, ...]:
+        text = io.TextIOWrapper(handle, encoding="utf-8-sig", newline="")
+        try:
+            try:
+                header = next(csv.reader(text, strict=True), ())
+            except (csv.Error, UnicodeError) as error:
+                raise ValueError(
+                    f"CSV header could not be parsed in {self.path}: {error}"
+                ) from error
+        finally:
+            text.detach()
+            handle.seek(0)
+        return normalize_csv_column_names(header, source=self.path)
+
     def __iter__(self) -> Iterator[pd.DataFrame]:
         completed = False
         self._assert_guard()
@@ -1140,8 +1160,11 @@ class _VerifiedCsvPass:
             )
             reader: Any = None
             try:
+                normalized_header = self._normalized_header(handle)
                 reader = pd.read_csv(
                     hashing_reader,
+                    header=0,
+                    names=list(normalized_header),
                     chunksize=self.chunk_size,
                     low_memory=False,
                 )
@@ -1160,6 +1183,13 @@ class _VerifiedCsvPass:
                         self._path_stat(),
                         self.phase,
                     )
+                    if (
+                        tuple(str(column) for column in chunk.columns)
+                        != normalized_header
+                    ):
+                        raise ValueError(
+                            f"CSV header changed while reading {self.path}"
+                        )
                     yield chunk
                 completed = True
             finally:
@@ -1715,8 +1745,15 @@ def _raw_feature_columns(
             )
             if column is not None
         }
-    excluded = META_COLUMNS | drop_columns | metadata_sources
-    return tuple(column for column in raw_columns if column not in excluded)
+    excluded = {
+        csv_column_name_key(column)
+        for column in META_COLUMNS | drop_columns | metadata_sources
+    }
+    return tuple(
+        column
+        for column in raw_columns
+        if csv_column_name_key(column) not in excluded
+    )
 
 
 def _timestamp_plan(
