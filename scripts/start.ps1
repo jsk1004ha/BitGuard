@@ -2,6 +2,7 @@
 param(
     [string]$EncodedArguments,
     [switch]$Elevated,
+    [switch]$PauseOnError,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$BootstrapArguments
 )
@@ -68,6 +69,110 @@ function Resolve-BitGuardDisplayPath {
     return [IO.Path]::GetFullPath((Join-Path $BasePath $Path))
 }
 
+function Get-BitGuardFailureSummary {
+    param(
+        [int]$ExitCode,
+        [string]$ReportPath,
+        [string]$LogPath
+    )
+
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add("BitGuard setup failed with exit code $ExitCode.") | Out-Null
+    $resolvedReportPath = $ReportPath
+    try {
+        if (Test-Path -LiteralPath $ReportPath -PathType Leaf) {
+            $report = Get-Content -Raw -LiteralPath $ReportPath | ConvertFrom-Json
+            if ($report.report_path) {
+                $resolvedReportPath = [string]$report.report_path
+            }
+            if ($report.failed_stage) {
+                $lines.Add("Failed stage: $($report.failed_stage)") | Out-Null
+            }
+            if ($report.last_completed_stage) {
+                $lines.Add(
+                    "Last completed stage: $($report.last_completed_stage)"
+                ) | Out-Null
+            }
+            if ($report.error) {
+                $lines.Add("Error: $($report.error)") | Out-Null
+            }
+            if ($report.recovery_command) {
+                $lines.Add("Recovery: $($report.recovery_command)") | Out-Null
+            }
+        }
+        else {
+            $lines.Add("Failure report was not found at the expected path.") | Out-Null
+        }
+    }
+    catch {
+        $lines.Add("Failure report could not be read: $($_.Exception.Message)") | Out-Null
+    }
+    $lines.Add("Report: $resolvedReportPath") | Out-Null
+    $lines.Add("Log:    $LogPath") | Out-Null
+    return $lines
+}
+
+function Wait-BitGuardFailureWindow {
+    param([switch]$Enabled)
+
+    if (-not $Enabled -or $env:BITGUARD_NO_PAUSE -eq "1") {
+        return
+    }
+    try {
+        [void](Read-Host "Press Enter after reviewing the error to close this window")
+    }
+    catch {
+        Write-Warning "Could not wait for input: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-BitGuardBootstrapSession {
+    param(
+        [string]$BootstrapScript,
+        [string[]]$EffectiveArguments,
+        [string]$LogPath,
+        [ref]$ExitCode
+    )
+
+    $ExitCode.Value = 1
+    $transcriptStarted = $false
+    try {
+        Start-Transcript -LiteralPath $LogPath -Append | Out-Null
+        $transcriptStarted = $true
+    }
+    catch {
+        [Console]::Error.WriteLine(
+            "BitGuard could not start its transcript: $($_.Exception.Message)"
+        )
+    }
+    try {
+        $powershellPath = (Get-Process -Id $PID).Path
+        & $powershellPath `
+            -NoLogo `
+            -NoProfile `
+            -ExecutionPolicy Bypass `
+            -File $BootstrapScript `
+            @EffectiveArguments
+        $ExitCode.Value = [int]$LASTEXITCODE
+    }
+    catch {
+        [Console]::Error.WriteLine("BitGuard launcher error: $($_.Exception.Message)")
+        $ExitCode.Value = 1
+    }
+    finally {
+        if ($transcriptStarted) {
+            try {
+                Stop-Transcript | Out-Null
+            }
+            catch {
+                [Console]::Error.WriteLine(
+                    "BitGuard could not stop its transcript: $($_.Exception.Message)"
+                )
+            }
+        }
+    }
+}
+
 if (-not (Test-BitGuardAdministrator)) {
     if ($Elevated) {
         throw "Administrator elevation did not take effect."
@@ -79,26 +184,35 @@ if (-not (Test-BitGuardAdministrator)) {
         )
     )
     $quotedScript = $PSCommandPath.Replace("'", "''")
+    $pauseOnErrorArgument = if ($PauseOnError) { " -PauseOnError" } else { "" }
     $elevatedCommand = (
-        "& '{0}' -Elevated -EncodedArguments '{1}'; exit `$LASTEXITCODE" -f
+        "& '{0}' -Elevated{1} -EncodedArguments '{2}'; exit `$LASTEXITCODE" -f
         $quotedScript,
+        $pauseOnErrorArgument,
         $argumentPayload
     )
     $encodedCommand = [Convert]::ToBase64String(
         [Text.Encoding]::Unicode.GetBytes($elevatedCommand)
     )
     $powershellPath = (Get-Process -Id $PID).Path
-    $process = Start-Process `
-        -FilePath $powershellPath `
-        -ArgumentList @(
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-EncodedCommand", $encodedCommand
-        ) `
-        -Verb RunAs `
-        -Wait `
-        -PassThru
+    try {
+        $process = Start-Process `
+            -FilePath $powershellPath `
+            -ArgumentList @(
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-EncodedCommand", $encodedCommand
+            ) `
+            -Verb RunAs `
+            -Wait `
+            -PassThru
+    }
+    catch {
+        Write-Host "Administrator launch failed: $($_.Exception.Message)" -ForegroundColor Red
+        Wait-BitGuardFailureWindow -Enabled:$PauseOnError
+        exit 1
+    }
     exit $process.ExitCode
 }
 
@@ -153,30 +267,23 @@ Write-Host "Runs: $displayRunsRoot"
 Write-Host "Log:  $logPath"
 Write-Host "Running with Administrator privileges. Existing verified stages and checkpoints will be reused."
 
-$transcriptStarted = $false
-try {
-    Start-Transcript -LiteralPath $logPath -Append | Out-Null
-    $transcriptStarted = $true
-    & $bootstrapScript @effectiveArguments
-    $exitCode = $LASTEXITCODE
-}
-catch {
-    Write-Error $_
-    $exitCode = 1
-}
-finally {
-    if ($transcriptStarted) {
-        Stop-Transcript | Out-Null
-    }
-}
+$exitCode = 1
+Invoke-BitGuardBootstrapSession `
+    -BootstrapScript $bootstrapScript `
+    -EffectiveArguments $effectiveArguments `
+    -LogPath $logPath `
+    -ExitCode ([ref]$exitCode)
 
 if ($exitCode -ne 0) {
     $reportPath = Join-Path $displayDataRoot ".bitguard\bootstrap-report.json"
     Write-Host ""
-    Write-Host "Automatic attempts ended with exit code $exitCode." -ForegroundColor Red
-    Write-Host "Report: $reportPath"
-    Write-Host "Log:    $logPath"
+    Get-BitGuardFailureSummary `
+        -ExitCode $exitCode `
+        -ReportPath $reportPath `
+        -LogPath $logPath |
+        ForEach-Object { Write-Host $_ -ForegroundColor Red }
     Write-Host "Run start.bat again after correcting the reported cause; completed work will be reused."
+    Wait-BitGuardFailureWindow -Enabled:$PauseOnError
 }
 else {
     Write-Host ""

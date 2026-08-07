@@ -359,6 +359,153 @@ class BootstrapEntryTest(unittest.TestCase):
         self.assertIn("$displayRunsRoot", launcher)
         self.assertNotIn("--restart-stage", launcher)
 
+    def test_windows_start_launcher_keeps_the_elevated_failure_window_open(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        batch = (repository / "start.bat").read_text(encoding="utf-8")
+        launcher = (repository / "scripts" / "start.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("-PauseOnError", batch)
+        self.assertNotIn("pause >nul", batch.casefold())
+        self.assertIn("[switch]$PauseOnError", launcher)
+        self.assertIn("-PauseOnError", launcher)
+        self.assertIn("function Wait-BitGuardFailureWindow", launcher)
+        self.assertIn("Read-Host", launcher)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "PowerShell is required")
+    def test_windows_start_launcher_summarizes_the_failure_report(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        launcher = repository / "scripts" / "start.ps1"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "bootstrap-report.json"
+            log = root / "bootstrap.log"
+            report.write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "failed_stage": "inspect",
+                        "last_completed_stage": "extract",
+                        "error": "SchemaInspectionError: malformed fixture",
+                        "recovery_command": "rerun the original command",
+                        "report_path": str(report),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            probe = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:BITGUARD_START_LAUNCHER, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -gt 0) { exit 91 }
+$function = $ast.FindAll(
+    {
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Get-BitGuardFailureSummary'
+    },
+    $true
+) | Select-Object -First 1
+if ($null -eq $function) { exit 92 }
+$body = @'
+Get-BitGuardFailureSummary `
+    -ExitCode 1 `
+    -ReportPath $env:BITGUARD_TEST_REPORT `
+    -LogPath $env:BITGUARD_TEST_LOG
+'@
+$summaryProbe = [ScriptBlock]::Create("$($function.Extent.Text)`n$body")
+& $summaryProbe
+"""
+            environment = os.environ.copy()
+            environment["BITGUARD_START_LAUNCHER"] = str(launcher)
+            environment["BITGUARD_TEST_REPORT"] = str(report)
+            environment["BITGUARD_TEST_LOG"] = str(log)
+            result = subprocess.run(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", probe],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("inspect", result.stdout)
+        self.assertIn("extract", result.stdout)
+        self.assertIn("SchemaInspectionError: malformed fixture", result.stdout)
+        self.assertIn("rerun the original command", result.stdout)
+        self.assertIn(str(report), result.stdout)
+        self.assertIn(str(log), result.stdout)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "PowerShell is required")
+    def test_windows_start_launcher_captures_child_exit_and_returns_to_parent(self):
+        repository = Path(bootstrap.__file__).resolve().parents[1]
+        launcher = repository / "scripts" / "start.ps1"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            failing_bootstrap = root / "failing-bootstrap.ps1"
+            failing_bootstrap.write_text(
+                "param([Parameter(ValueFromRemainingArguments = $true)]"
+                "[string[]]$Forwarded)\n"
+                '[Console]::Error.WriteLine("synthetic bootstrap failure")\n'
+                '[Console]::Error.WriteLine("ARGS=" + ($Forwarded -join "|"))\n'
+                "exit 7\n",
+                encoding="utf-8",
+            )
+            log = root / "bootstrap.log"
+            probe = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:BITGUARD_START_LAUNCHER, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -gt 0) { exit 91 }
+$function = $ast.FindAll(
+    {
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Invoke-BitGuardBootstrapSession'
+    },
+    $true
+) | Select-Object -First 1
+if ($null -eq $function) { exit 92 }
+$body = @'
+$exitCode = 0
+$arguments = [Collections.Generic.List[string]]::new()
+@('--compute', 'cpu', '--data-root', 'C:\A B\Data') |
+    ForEach-Object { $arguments.Add($_) } | Out-Null
+Invoke-BitGuardBootstrapSession `
+    -BootstrapScript $env:BITGUARD_TEST_BOOTSTRAP `
+    -EffectiveArguments $arguments `
+    -LogPath $env:BITGUARD_TEST_LOG `
+    -ExitCode ([ref]$exitCode)
+[pscustomobject]@{
+    ExitCode = $exitCode
+    ReachedAfterCatch = $true
+} | ConvertTo-Json -Compress
+'@
+$sessionProbe = [ScriptBlock]::Create("$($function.Extent.Text)`n$body")
+& $sessionProbe
+"""
+            environment = os.environ.copy()
+            environment["BITGUARD_START_LAUNCHER"] = str(launcher)
+            environment["BITGUARD_TEST_BOOTSTRAP"] = str(failing_bootstrap)
+            environment["BITGUARD_TEST_LOG"] = str(log)
+            result = subprocess.run(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", probe],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["ExitCode"], 7)
+        self.assertTrue(payload["ReachedAfterCatch"])
+        self.assertIn("synthetic bootstrap failure", result.stderr)
+        self.assertIn("ARGS=--compute|cpu|--data-root|C:\\A B\\Data", result.stderr)
+
     @unittest.skipUnless(shutil.which("powershell.exe"), "PowerShell is required")
     def test_windows_start_launcher_preserves_dash_prefixed_user_arguments(self):
         repository = Path(bootstrap.__file__).resolve().parents[1]

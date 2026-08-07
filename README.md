@@ -117,7 +117,9 @@ package bootstrap is retried with the exact same command up to three times, so
 transient download or process interruptions can continue from durable state.
 Persistent failures remain fail-closed and are recorded in
 `%USERPROFILE%\BitGuardData\.bitguard\bootstrap-report.json`; launcher logs are
-written under `%USERPROFILE%\BitGuardLogs`.
+written under `%USERPROFILE%\BitGuardLogs`. When setup fails, the elevated
+window prints the failed stage, error, and recovery guidance and stays open
+until Enter is pressed.
 
 ```bat
 start.bat
