@@ -24,6 +24,11 @@ META_COLUMNS: Final[set[str]] = {
     "timestamp",
 }
 
+_DATASET_CSV_SIDECARS: Final[dict[str, frozenset[str]]] = {
+    "nbaiot": frozenset({"demonstrate_structure.csv"}),
+    "botiot": frozenset({"data_names.csv"}),
+}
+
 COMMON_STREAM_FEATURES: Final[list[str]] = [
     "packet_rate",
     "byte_rate",
@@ -65,6 +70,13 @@ def normalize_token(value: object) -> str:
     token = str(value).strip().lower()
     token = re.sub(r"[^a-z0-9]+", "_", token).strip("_")
     return token or "unknown"
+
+
+def is_dataset_csv_sidecar(dataset: object, filename: object) -> bool:
+    """Return whether a CSV name is an official non-row dataset sidecar."""
+
+    sidecars = _DATASET_CSV_SIDECARS.get(str(dataset).strip().casefold(), frozenset())
+    return str(filename).casefold() in sidecars
 
 
 def nbaiot_behavior(raw_attack: object) -> str:

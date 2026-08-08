@@ -36,6 +36,7 @@ from bitguard_bnn.constants import (
     META_COLUMNS,
     botiot_behavior,
     canonicalize_behavior,
+    is_dataset_csv_sidecar,
     nbaiot_behavior,
     normalize_token,
 )
@@ -1305,13 +1306,21 @@ def _resolve_source(
         root = path_override or resolve_path(config, cfg["path"])
         assert root is not None
         anchor = Path(root)
-        files = tuple(sorted(anchor.rglob("*.csv")))
+        files = tuple(
+            path
+            for path in sorted(anchor.rglob("*.csv"))
+            if not is_dataset_csv_sidecar(kind, path.name)
+        )
         if not files:
             raise FileNotFoundError(f"no N-BaIoT CSV files under {anchor}")
         relative_paths = _logical_paths(files, anchor)
         return _SourceSpec(kind, files, relative_paths, anchor, label_overrides)
     pattern = path_override or cfg["path"]
-    files = resolve_csv_files(config, pattern)
+    files = tuple(
+        path
+        for path in resolve_csv_files(config, pattern)
+        if not is_dataset_csv_sidecar(kind, path.name)
+    )
     if not files:
         if kind == "botiot":
             raise FileNotFoundError(f"no BoT-IoT CSV files match {pattern}")

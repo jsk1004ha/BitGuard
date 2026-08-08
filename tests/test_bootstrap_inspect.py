@@ -252,6 +252,47 @@ class SchemaInspectionTest(unittest.TestCase):
                 ["device/benign_traffic.csv"],
             )
 
+    def test_botiot_ignores_official_data_names_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data_1.csv").write_text(
+                "category,subcategory,saddr,stime,bytes\n"
+                "Normal,Normal,device-a,1,100\n",
+                encoding="utf-8",
+            )
+            (root / "data_names.csv").write_text(
+                "category,subcategory ,saddr,stime,bytes\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset("botiot", root, chunk_size=1)
+
+            self.assertEqual(report.total_rows, 1)
+            self.assertEqual(report.feature_columns, ("bytes",))
+            self.assertEqual(
+                [item.relative_path for item in report.files],
+                ["data_1.csv"],
+            )
+
+    def test_botiot_does_not_ignore_lookalike_data_names_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data_1.csv").write_text(
+                "category,subcategory,saddr,stime,bytes\n"
+                "Normal,Normal,device-a,1,100\n",
+                encoding="utf-8",
+            )
+            (root / " data_names.csv").write_text(
+                "category,subcategory,saddr,stime,bytes\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                SchemaInspectionError,
+                "no numeric feature columns",
+            ):
+                inspect_csv_dataset("botiot", root, chunk_size=1)
+
     def test_botiot_required_metadata_labels_devices_and_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

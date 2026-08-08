@@ -293,6 +293,49 @@ class FullDatasetPreparationTests(unittest.TestCase):
             )
             self.assertEqual(manifest["acquisition_url"], spec.download_url)
 
+    def test_botiot_sidecar_stays_in_raw_manifest_but_not_model_input(self) -> None:
+        from bitguard_bnn.out_of_core.prepare import (
+            prepare_full_dataset,
+            verify_prepared_dataset,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "raw"
+            _write_botiot(raw)
+            (raw / "data_names.csv").write_text(
+                "category,subcategory ,saddr,stime,bytes,rate\n",
+                encoding="utf-8",
+            )
+            source_manifest, schema_report = _source_contract("botiot", raw, root)
+
+            raw_manifest = json.loads(source_manifest.read_text(encoding="utf-8"))
+            schema = json.loads(schema_report.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["relative_path"] for item in raw_manifest["files"]],
+                ["data_names.csv", "flows.csv"],
+            )
+            self.assertEqual(
+                [item["relative_path"] for item in schema["files"]],
+                ["flows.csv"],
+            )
+
+            prepared = prepare_full_dataset(
+                Path(__file__).resolve().parents[1]
+                / "configs"
+                / "full"
+                / "botiot.yaml",
+                raw_root=raw,
+                source_manifest_path=source_manifest,
+                schema_report_path=schema_report,
+                output_dir=root / "prepared",
+                descriptor_path=root / "control" / "botiot.json",
+                work_dir=root / "work",
+            )
+
+            self.assertEqual(prepared.total_count, 40)
+            self.assertEqual(prepared, verify_prepared_dataset(prepared.descriptor_path))
+
     def test_boolean_availability_comes_from_source_not_train_usable_features(self) -> None:
         from bitguard_bnn.out_of_core.prepare import (
             prepare_full_dataset,

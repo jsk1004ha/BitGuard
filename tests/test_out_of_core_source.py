@@ -996,6 +996,31 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
 
             self._assert_parity(config)
 
+    def test_nbaiot_directory_ignores_official_structure_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "device" / "benign_traffic.csv"
+            data.parent.mkdir()
+            data.write_text("mean,std\n1,2\n3,4\n", encoding="utf-8")
+            (root / "demonstrate_structure.csv").write_text(
+                "field,description\n"
+                "mean,example feature column\n"
+                "std,example feature column\n",
+                encoding="utf-8",
+            )
+            config = _base_config(root, "nbaiot", ".")
+
+            with open_normalized_source(config) as source:
+                chunks = list(source.iter_chunks())
+                proof = source.proof
+
+            frame = pd.concat([chunk.frame for chunk in chunks], ignore_index=True)
+            self.assertEqual(len(frame), 2)
+            self.assertEqual(
+                [item.relative_path for item in proof.files],
+                ["device/benign_traffic.csv"],
+            )
+
     def test_botiot_chunks_match_in_memory_loader(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1011,6 +1036,33 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
             config = _base_config(root, "botiot", "botiot.csv")
 
             self._assert_parity(config)
+
+    def test_botiot_directory_ignores_official_data_names_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data_1.csv").write_text(
+                "category,subcategory,saddr,stime,rate\n"
+                "Normal,Normal,device-a,1,0.1\n"
+                "DDoS,TCP,device-b,2,5.0\n",
+                encoding="utf-8",
+            )
+            (root / "data_names.csv").write_text(
+                "category,subcategory ,saddr,stime,rate\n",
+                encoding="utf-8",
+            )
+            config = _base_config(root, "botiot", ".")
+
+            with open_normalized_source(config) as source:
+                chunks = list(source.iter_chunks())
+                proof = source.proof
+
+            frame = pd.concat([chunk.frame for chunk in chunks], ignore_index=True)
+            self.assertEqual(len(frame), 2)
+            self.assertEqual(proof.row_count, 2)
+            self.assertEqual(
+                [item.relative_path for item in proof.files],
+                ["data_1.csv"],
+            )
 
     def test_botiot_reader_normalizes_spaced_header_without_metadata_feature_leakage(
         self,

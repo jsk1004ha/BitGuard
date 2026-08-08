@@ -23,7 +23,12 @@ from bitguard_bnn.column_names import (
     normalize_csv_column_name,
     normalize_csv_column_names,
 )
-from bitguard_bnn.constants import botiot_behavior, nbaiot_behavior, normalize_token
+from bitguard_bnn.constants import (
+    botiot_behavior,
+    is_dataset_csv_sidecar,
+    nbaiot_behavior,
+    normalize_token,
+)
 
 _PANDAS_IMPORT_ERROR: Exception | None = None
 try:
@@ -554,10 +559,6 @@ def _nbaiot_metadata(root: Path, path: Path) -> tuple[str, str]:
     return str(device), nbaiot_behavior(raw_attack)
 
 
-def _is_nbaiot_structure_sidecar(dataset: str, path: Path) -> bool:
-    return dataset == "nbaiot" and path.name.casefold() == "demonstrate_structure.csv"
-
-
 def _row_metadata(
     dataset: str,
     values: dict[str, str],
@@ -951,7 +952,12 @@ def _inspect_csv_dataset_unlocked(
         _DEFAULT_DROP_COLUMNS[normalized_dataset],
     )
     _require_pandas()
-    root, paths = _discover_csvs(Path(source))
+    root, discovered_paths = _discover_csvs(Path(source))
+    paths = tuple(
+        path
+        for path in discovered_paths
+        if not is_dataset_csv_sidecar(normalized_dataset, path.name)
+    )
     canonical_features: tuple[str, ...] | None = None
     unusable_columns: dict[str, str] = {}
     excluded_columns: dict[str, str] = {}
@@ -986,24 +992,16 @@ def _inspect_csv_dataset_unlocked(
                     )
 
                 _verify_source_directories(root, path)
-                try:
-                    plan = _plan_file_inspection(
-                        normalized_dataset,
-                        root,
-                        path,
-                        required,
-                        dropped,
-                        chunk_size=chunk_size,
-                        max_record_chars=max_record_chars,
-                        progress_callback=lambda rows: report_progress("plan", rows),
-                    )
-                except SchemaInspectionError as error:
-                    if (
-                        _is_nbaiot_structure_sidecar(normalized_dataset, path)
-                        and str(error).startswith("no numeric feature columns found")
-                    ):
-                        continue
-                    raise
+                plan = _plan_file_inspection(
+                    normalized_dataset,
+                    root,
+                    path,
+                    required,
+                    dropped,
+                    chunk_size=chunk_size,
+                    max_record_chars=max_record_chars,
+                    progress_callback=lambda rows: report_progress("plan", rows),
+                )
                 schema = plan.schema
                 file_features = plan.feature_columns
                 normalized_file_features = tuple(
