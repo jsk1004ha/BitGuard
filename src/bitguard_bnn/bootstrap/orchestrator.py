@@ -23,7 +23,11 @@ from .cleanup import inspection_command, scan_cleanup_debt
 from .download import DownloadResult, download_file
 from .extract import ExtractionResult, extract_rar, extract_zip
 from .fsops import rename_directory_noreplace
-from .inspect import SchemaInspectionReport, inspect_csv_dataset
+from .inspect import (
+    SCHEMA_INSPECTION_CONTRACT,
+    SchemaInspectionReport,
+    inspect_csv_dataset,
+)
 from .manifest import build_source_manifest, write_source_manifest
 from .preflight import (
     ArchiveInspection,
@@ -2838,6 +2842,7 @@ def run_bootstrap(
                     inspect_source_tokens.update(source_tokens)
                     return _json_signature(
                         {
+                            "inspection_contract": SCHEMA_INSPECTION_CONTRACT,
                             "raw": source_tokens,
                             "registry": {
                                 name: registry[name].to_dict()

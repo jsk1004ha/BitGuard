@@ -587,6 +587,53 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         second_download.assert_not_called()
         second_inspector.assert_not_called()
 
+    def test_inspection_contract_change_invalidates_cached_schema(self) -> None:
+        preparation_calls: list[Path] = []
+
+        def prepare(_config: Path, **kwargs: object) -> None:
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text(
+                json.dumps({"generation": kwargs["preparation_signature"]}),
+                encoding="utf-8",
+            )
+            preparation_calls.append(descriptor)
+
+        dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=lambda _descriptor: object(),
+            preparation_signature_token="fixture-preparer-v1",
+        )
+        first = run_bootstrap(self.options, dependencies=dependencies)
+        self.assertEqual(first["status"], "prepared")
+        changed_inspector = Mock(wraps=inspect_csv_dataset)
+
+        with patch.object(
+            orchestrator_module,
+            "SCHEMA_INSPECTION_CONTRACT",
+            "bitguard.schema-inspection.test-next",
+            create=True,
+        ):
+            rerun = run_bootstrap(
+                replace(self.options, restart_stage="shard"),
+                dependencies=replace(
+                    dependencies,
+                    inspector=changed_inspector,
+                ),
+            )
+
+        self.assertEqual(rerun["status"], "prepared")
+        self.assertEqual(
+            rerun["reused_stages"],
+            ["preflight", "environment", "acquire", "extract"],
+        )
+        self.assertEqual(
+            rerun["executed_stages"], ["inspect", "shard", "validate"]
+        )
+        self.assertEqual(changed_inspector.call_count, 2)
+        self.assertEqual(len(preparation_calls), 2)
+
     def test_source_mutation_invalidates_acquire_extract_and_inspect(self) -> None:
         initial = run_bootstrap(self.options, dependencies=self.dependencies())
         self.assertEqual(initial["status"], "sources_verified")

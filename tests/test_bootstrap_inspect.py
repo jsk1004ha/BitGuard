@@ -215,7 +215,7 @@ class SchemaInspectionTest(unittest.TestCase):
             report = inspect_csv_dataset("nbaiot", root, chunk_size=1)
 
             self.assertEqual(report.total_rows, 4)
-            self.assertEqual(report.feature_columns, ("mean", "std"))
+            self.assertEqual(report.feature_columns, ("std", "mean"))
             self.assertEqual(report.class_counts, (("benign", 2), ("flood_like", 2)))
             self.assertEqual(report.unique_devices, 2)
             self.assertEqual(
@@ -332,7 +332,7 @@ class SchemaInspectionTest(unittest.TestCase):
 
             self.assertEqual(report.accepted_rows, 2)
             self.assertEqual(report.rejected_rows, 0)
-            self.assertEqual(report.feature_columns, ("bytes", "mixed", "rate"))
+            self.assertEqual(report.feature_columns, ("bytes", "rate", "mixed"))
             self.assertEqual(report.unusable_columns, ("description", "proto"))
             self.assertEqual(
                 report.excluded_columns,

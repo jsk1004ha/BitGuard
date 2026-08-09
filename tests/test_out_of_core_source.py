@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from bitguard_bnn.bootstrap.inspect import inspect_csv_dataset
 from bitguard_bnn.config import DEFAULTS
 from bitguard_bnn.data import (
     LoadedDataset,
@@ -90,6 +91,29 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
             config = _base_config(root, "csv", "generic.csv")
 
             self._assert_parity(config)
+
+    def test_source_file_order_matches_casefolded_schema_inspection_order(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "ßa" / "benign_traffic.csv"
+            second = root / "st" / "benign_traffic.csv"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            first.write_text("std,mean\n2,1\n", encoding="utf-8")
+            second.write_text("mean,std\n1,2\n", encoding="utf-8")
+            config = _base_config(root, "nbaiot", ".")
+
+            schema = inspect_csv_dataset("nbaiot", root)
+            with open_normalized_source(config) as source:
+                proof = source.proof
+
+            self.assertEqual(
+                [item.relative_path for item in schema.files],
+                [item.relative_path for item in proof.files],
+            )
+            self.assertEqual(schema.feature_columns, proof.feature_names)
 
     def test_normalized_source_builds_one_verified_plan_for_repeated_passes(
         self,

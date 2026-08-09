@@ -1285,6 +1285,19 @@ def _logical_paths(files: tuple[Path, ...], anchor: Path) -> tuple[str, ...]:
     return tuple(relative_paths)
 
 
+def _ordered_source_paths(
+    files: tuple[Path, ...], anchor: Path
+) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+    resolved_anchor = anchor.resolve()
+
+    def inspection_order(path: Path) -> str:
+        relative = path.resolve().relative_to(resolved_anchor).as_posix()
+        return relative.casefold()
+
+    ordered = tuple(sorted(files, key=inspection_order))
+    return ordered, _logical_paths(ordered, anchor)
+
+
 def _resolve_source(
     config: dict[str, Any],
     path_override: Path | None = None,
@@ -1313,7 +1326,7 @@ def _resolve_source(
         )
         if not files:
             raise FileNotFoundError(f"no N-BaIoT CSV files under {anchor}")
-        relative_paths = _logical_paths(files, anchor)
+        files, relative_paths = _ordered_source_paths(files, anchor)
         return _SourceSpec(kind, files, relative_paths, anchor, label_overrides)
     pattern = path_override or cfg["path"]
     files = tuple(
@@ -1328,7 +1341,7 @@ def _resolve_source(
     selected = resolve_path(config, pattern)
     assert selected is not None
     anchor = _glob_anchor(Path(selected))
-    relative_paths = _logical_paths(files, anchor)
+    files, relative_paths = _ordered_source_paths(files, anchor)
     return _SourceSpec(kind, files, relative_paths, anchor, label_overrides)
 
 

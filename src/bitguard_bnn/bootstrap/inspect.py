@@ -30,6 +30,8 @@ from bitguard_bnn.constants import (
     normalize_token,
 )
 
+SCHEMA_INSPECTION_CONTRACT = "bitguard.schema-inspection.v2"
+
 _PANDAS_IMPORT_ERROR: Exception | None = None
 try:
     import pandas as pd
@@ -529,10 +531,7 @@ def _schema_for(
     }
     excluded = metadata | dropped
     candidates = tuple(
-        sorted(
-            (column for column in normalized_header if column not in excluded),
-            key=_column_key,
-        )
+        column for column in normalized_header if column not in excluded
     )
     if not candidates:
         raise SchemaInspectionError(f"no numeric feature columns remain in {path}")
@@ -876,9 +875,14 @@ def _plan_file_inspection(
         column for column in schema.candidates if _column_key(column) in numeric_keys
     )
     unusable = tuple(
-        column
-        for column in schema.candidates
-        if _column_key(column) not in numeric_keys
+        sorted(
+            (
+                column
+                for column in schema.candidates
+                if _column_key(column) not in numeric_keys
+            ),
+            key=_column_key,
+        )
     )
     if not features:
         raise SchemaInspectionError(f"no numeric feature columns found in {path}")
@@ -1010,7 +1014,9 @@ def _inspect_csv_dataset_unlocked(
                 file_unusable = plan.unusable_columns
                 if canonical_features is None:
                     canonical_features = normalized_file_features
-                elif normalized_file_features != canonical_features:
+                elif frozenset(normalized_file_features) != frozenset(
+                    canonical_features
+                ):
                     raise SchemaInspectionError(
                         f"feature schema mismatch in {path}: "
                         f"expected={list(canonical_features)}, "

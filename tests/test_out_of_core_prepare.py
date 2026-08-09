@@ -23,7 +23,12 @@ from bitguard_bnn.bootstrap.types import BootstrapOptions
 from bitguard_bnn.config import load_config, resolve_path
 
 
-def _write_nbaiot(root: Path, *, heldout_offset: float = 0.0) -> None:
+def _write_nbaiot(
+    root: Path,
+    *,
+    heldout_offset: float = 0.0,
+    feature_header: str = "mean,std",
+) -> None:
     devices = ("Ecobee_Thermostat", "Philips_B120N10_Baby_Monitor")
     for device_index, device in enumerate(devices):
         benign = root / device / "benign_traffic.csv"
@@ -31,14 +36,14 @@ def _write_nbaiot(root: Path, *, heldout_offset: float = 0.0) -> None:
         benign.parent.mkdir(parents=True, exist_ok=True)
         attack.parent.mkdir(parents=True, exist_ok=True)
         benign.write_text(
-            "mean,std\n"
+            f"{feature_header}\n"
             + "".join(
                 f"{1 + device_index + row},{2 + row / 10}\n" for row in range(8)
             ),
             encoding="utf-8",
         )
         attack.write_text(
-            "mean,std\n"
+            f"{feature_header}\n"
             + "".join(
                 f"{20 + device_index + row},{4 + row / 10}\n" for row in range(8)
             ),
@@ -48,7 +53,7 @@ def _write_nbaiot(root: Path, *, heldout_offset: float = 0.0) -> None:
     heldout = root / "Danmini_Doorbell" / "benign_traffic.csv"
     heldout.parent.mkdir(parents=True, exist_ok=True)
     heldout.write_text(
-        "mean,std\n"
+        f"{feature_header}\n"
         + "".join(
             f"{1000 + heldout_offset + row},{2000 + heldout_offset + row}\n"
             for row in range(8)
@@ -166,7 +171,12 @@ class FullProfileConfigTests(unittest.TestCase):
 
 class FullDatasetPreparationTests(unittest.TestCase):
     def _prepare(
-        self, dataset: str, root: Path, *, heldout_offset: float = 0.0
+        self,
+        dataset: str,
+        root: Path,
+        *,
+        heldout_offset: float = 0.0,
+        nbaiot_feature_header: str = "mean,std",
     ):
         from bitguard_bnn.out_of_core.prepare import prepare_full_dataset
 
@@ -175,7 +185,11 @@ class FullDatasetPreparationTests(unittest.TestCase):
         schema_report = root / "contract" / "schema.json"
         if not raw_root.exists():
             if dataset == "nbaiot":
-                _write_nbaiot(raw_root, heldout_offset=heldout_offset)
+                _write_nbaiot(
+                    raw_root,
+                    heldout_offset=heldout_offset,
+                    feature_header=nbaiot_feature_header,
+                )
             else:
                 _write_botiot(raw_root)
             source_manifest, schema_report = _source_contract(dataset, raw_root, root)
@@ -189,6 +203,26 @@ class FullDatasetPreparationTests(unittest.TestCase):
             descriptor_path=root / "control" / f"{dataset}.json",
             work_dir=root / "work",
         )
+
+    def test_nbaiot_prepare_preserves_first_source_feature_order(self) -> None:
+        from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            prepared = self._prepare(
+                "nbaiot", root, nbaiot_feature_header="std,mean"
+            )
+
+            feature_manifest = json.loads(
+                Path(prepared.feature_manifest_path).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                feature_manifest["source_feature_order"], ["std", "mean"]
+            )
+            self.assertEqual(
+                prepared, verify_prepared_dataset(prepared.descriptor_path)
+            )
 
     def test_nbaiot_and_botiot_prepare_every_source_row_and_reverify(self) -> None:
         from bitguard_bnn.out_of_core.prepare import (
