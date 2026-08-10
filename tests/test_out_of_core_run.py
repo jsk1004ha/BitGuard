@@ -10,7 +10,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -37,6 +37,18 @@ class _MaliciousCheckpointValue:
 
     def __reduce__(self):
         return (_write_marker, (self.marker,))
+
+
+class _PreparedBindingFixture(SimpleNamespace):
+    current: "_PreparedBindingFixture | None" = None
+
+    @classmethod
+    def from_dict(cls, path: Path, payload: object) -> "_PreparedBindingFixture":
+        assert cls.current is not None
+        return cls.current
+
+    def to_dict(self) -> dict[str, object]:
+        return {"fixture": "prepared-binding"}
 
 
 class OutOfCoreRunBoundaryTests(unittest.TestCase):
@@ -106,6 +118,220 @@ class OutOfCoreRunBoundaryTests(unittest.TestCase):
                 run_module.run_out_of_core_training(
                     "full.yaml", config=config, prepared_descriptor_path="prepared.json"
                 )
+
+    def test_public_run_verifies_prepared_dataset_exactly_once(self) -> None:
+        from bitguard_bnn.out_of_core import run as run_module
+
+        config = self._config()
+        prepared = SimpleNamespace(descriptor_path="prepared.json")
+
+        def exercise_internal_splits(loaded, verified, **kwargs):
+            self.assertEqual(
+                set(kwargs["_pinned_datasets"]),
+                {"train", "validation", "test"},
+            )
+            return Path("runs/verified-once")
+
+        with (
+            patch.object(
+                run_module,
+                "verify_prepared_dataset",
+                return_value=prepared,
+            ) as verify,
+            patch.object(
+                run_module.ParquetTrainingDataset,
+                "_from_verified_prepared",
+                return_value=SimpleNamespace(),
+            ) as dataset_factory,
+            patch.object(
+                run_module,
+                "_run_verified_neural_training",
+                side_effect=exercise_internal_splits,
+            ),
+        ):
+            actual = run_module.run_out_of_core_training(
+                "full.yaml",
+                config=config,
+                prepared_descriptor_path="prepared.json",
+            )
+
+        self.assertEqual(actual, Path("runs/verified-once"))
+        verify.assert_called_once_with("prepared.json")
+        self.assertEqual(dataset_factory.call_count, 3)
+
+    def test_training_split_set_is_pinned_once_and_reused(self) -> None:
+        from bitguard_bnn.out_of_core import run as run_module
+
+        prepared = SimpleNamespace()
+        config = self._config()
+        datasets = {
+            split: SimpleNamespace(split=split)
+            for split in ("train", "validation", "test")
+        }
+        with patch.object(
+            run_module,
+            "_dataset",
+            side_effect=lambda _prepared, _config, split: datasets[split],
+        ) as construct:
+            actual = run_module._pin_training_datasets(prepared, config)
+
+        self.assertIs(actual["train"], datasets["train"])
+        self.assertIs(actual["validation"], datasets["validation"])
+        self.assertIs(actual["test"], datasets["test"])
+        self.assertEqual(
+            [call.args[2] for call in construct.call_args_list],
+            ["train", "validation", "test"],
+        )
+
+    def test_trusted_preprocessor_open_closes_handle_when_load_fails(self) -> None:
+        from bitguard_bnn.out_of_core import run as run_module
+
+        artifact = SimpleNamespace(
+            load=lambda: (_ for _ in ()).throw(RuntimeError("unsafe pickle")),
+            close=Mock(),
+        )
+        with (
+            patch.object(
+                run_module._PinnedPreprocessorArtifact,
+                "open",
+                return_value=artifact,
+            ),
+            self.assertRaisesRegex(RuntimeError, "unsafe pickle"),
+        ):
+            run_module._open_trusted_preprocessor(
+                "preprocessor.joblib",
+                expected_sha256="0" * 64,
+            )
+
+        artifact.close.assert_called_once()
+
+    def test_resume_preflight_uses_supplied_trusted_preprocessor(self) -> None:
+        from bitguard_bnn.out_of_core import run as run_module
+
+        config = self._config()
+        config["loss"]["distillation_alpha"] = 0.0
+        prepared = SimpleNamespace(preprocessor_path="untrusted.joblib")
+        trusted = SimpleNamespace(active_labels=["benign"])
+        train_dataset = SimpleNamespace(
+            entries=(SimpleNamespace(label="benign", rows=2),),
+            row_count=2,
+        )
+        with (
+            patch.object(
+                run_module.FeaturePreprocessor,
+                "load",
+                side_effect=AssertionError("unpinned path load must not run"),
+            ) as unpinned_load,
+            patch(
+                "bitguard_bnn.out_of_core.trainer._validate_inputs",
+                side_effect=RuntimeError("trusted preprocessor reached validator"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "trusted preprocessor reached"),
+        ):
+            run_module._preflight_streaming_resume_checkpoint(
+                Path("resume.pt"),
+                prepared,
+                config,
+                {},
+                train_dataset,
+                trusted,
+            )
+
+        unpinned_load.assert_not_called()
+
+    def test_preverified_runner_skips_full_verifier_after_lightweight_binding(self) -> None:
+        from bitguard_bnn.out_of_core import run as run_module
+
+        config = self._config()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor = root / "prepared.json"
+            resolved = root / "resolved.yaml"
+            preprocessor = root / "preprocessor.joblib"
+            descriptor.write_text("{}", encoding="utf-8")
+            resolved.write_text("verified-config", encoding="utf-8")
+            preprocessor.write_text("verified-preprocessor", encoding="utf-8")
+            prepared = _PreparedBindingFixture(
+                descriptor_path=str(descriptor.resolve()),
+                resolved_config_path=str(resolved.resolve()),
+                template_config_path=str(resolved.resolve()),
+                config_sha256=run_module._sha256(resolved),
+                preprocessor_path=str(preprocessor.resolve()),
+                preprocessor_sha256=run_module._sha256(preprocessor),
+            )
+            _PreparedBindingFixture.current = prepared
+            expected = Path("runs/preverified")
+            with (
+                patch.object(run_module, "PreparedDataset", _PreparedBindingFixture),
+                patch.object(
+                    run_module,
+                    "verify_prepared_dataset",
+                    side_effect=AssertionError("full verifier must not run"),
+                ),
+                patch.object(
+                    run_module,
+                    "_run_verified_neural_training",
+                    return_value=expected,
+                ) as execute,
+                patch.object(
+                    run_module,
+                    "_pin_training_datasets",
+                    return_value={
+                        split: SimpleNamespace(split=split)
+                        for split in ("train", "validation", "test")
+                    },
+                ) as pin_datasets,
+            ):
+                actual = run_module._run_out_of_core_training_preverified(
+                    resolved,
+                    prepared,
+                    config=config,
+                    prepared_descriptor_path=descriptor,
+                )
+
+        self.assertEqual(actual, expected)
+        pin_datasets.assert_called_once_with(prepared, config)
+        execute.assert_called_once()
+
+    def test_preverified_runner_rejects_mismatched_config_before_execution(self) -> None:
+        from bitguard_bnn.out_of_core import run as run_module
+
+        config = self._config()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor = root / "prepared.json"
+            resolved = root / "resolved.yaml"
+            other = root / "other.yaml"
+            preprocessor = root / "preprocessor.joblib"
+            for path, payload in (
+                (descriptor, "{}"),
+                (resolved, "verified-config"),
+                (other, "other-config"),
+                (preprocessor, "verified-preprocessor"),
+            ):
+                path.write_text(payload, encoding="utf-8")
+            prepared = _PreparedBindingFixture(
+                descriptor_path=str(descriptor.resolve()),
+                resolved_config_path=str(resolved.resolve()),
+                template_config_path=str(resolved.resolve()),
+                config_sha256=run_module._sha256(resolved),
+                preprocessor_path=str(preprocessor.resolve()),
+                preprocessor_sha256=run_module._sha256(preprocessor),
+            )
+            _PreparedBindingFixture.current = prepared
+            with (
+                patch.object(run_module, "PreparedDataset", _PreparedBindingFixture),
+                patch.object(run_module, "_run_verified_neural_training") as execute,
+                self.assertRaisesRegex(ValueError, "config_path"),
+            ):
+                run_module._run_out_of_core_training_preverified(
+                    other,
+                    prepared,
+                    config=config,
+                    prepared_descriptor_path=descriptor,
+                )
+
+        execute.assert_not_called()
 
     def test_verified_config_model_guard_runs_before_run_directory_creation(
         self,

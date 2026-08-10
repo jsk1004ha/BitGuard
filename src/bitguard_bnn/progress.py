@@ -52,7 +52,12 @@ class TerminalProgress:
         completed = min(max(completed, 0), total)
         now = self.clock()
         final = status in {"completed", "failed"} and completed >= total
-        if not final and now - self._last_rendered_at < self.min_interval:
+        semantic_transition = status in {"started", "reused"}
+        if (
+            not final
+            and not semantic_transition
+            and now - self._last_rendered_at < self.min_interval
+        ):
             return
         self._last_rendered_at = now
         ratio = completed / total
@@ -108,7 +113,8 @@ class TerminalProgress:
     ) -> str:
         if len(label) <= limit:
             return label
-        if event.get("stage") == "inspect":
+        if event.get("stage") in {"inspect", "shard", "validate"}:
+            stage = str(event.get("stage"))
             dataset = str(event.get("dataset") or "inspect")
             phase = str(event.get("phase") or "working")
             path = str(event.get("relative_path") or "")
@@ -125,7 +131,7 @@ class TerminalProgress:
             if rows > 0:
                 details.append(f"{rows:,} rows")
 
-            prefix = f"{dataset} {phase}"
+            prefix = f"{stage} {dataset} {phase}"
             suffix = " ".join(details)
             required = " ".join(item for item in (prefix, suffix) if item)
             if len(required) > limit:
@@ -178,10 +184,10 @@ class TerminalProgress:
             epochs = TerminalProgress._count(event.get("epochs"))
             return f"{dataset}/{role} epoch {epoch}/{epochs}"
         stage = str(event.get("stage") or "setup")
-        inspect_dataset = event.get("dataset")
+        stage_dataset = event.get("dataset")
         phase = event.get("phase")
-        if stage == "inspect" and inspect_dataset and phase:
-            details = ["setup inspect", str(inspect_dataset), str(phase)]
+        if stage in {"inspect", "shard", "validate"} and stage_dataset and phase:
+            details = [f"setup {stage}", str(stage_dataset), str(phase)]
             relative_path = event.get("relative_path")
             if relative_path:
                 details.append(str(relative_path))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -15,8 +16,9 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, cast
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, cast
 
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -688,17 +690,16 @@ def _validation_calibration_cache(
             raise cleanup_error
 
 
-def _class_counts(prepared: PreparedDataset, labels: list[str]) -> dict[str, int]:
-    manifest = json.loads(
-        Path(prepared.shard_manifest_path).read_text(encoding="utf-8")
-    )
+def _class_counts(
+    train_dataset: ParquetTrainingDataset, labels: list[str]
+) -> dict[str, int]:
     counts = {label: 0 for label in labels}
-    for entry in manifest["entries"]:
-        if entry.get("split") == "train" and str(entry.get("label")) in counts:
-            counts[str(entry["label"])] += int(entry["rows"])
+    for entry in train_dataset.entries:
+        if entry.label in counts:
+            counts[entry.label] += entry.rows
     if (
         any(value <= 0 for value in counts.values())
-        or sum(counts.values()) != prepared.train_count
+        or sum(counts.values()) != train_dataset.row_count
     ):
         raise RuntimeError("prepared train class counts do not match active labels")
     return counts
@@ -708,8 +709,8 @@ def _dataset(
     prepared: PreparedDataset, config: Mapping[str, Any], split: str
 ) -> ParquetTrainingDataset:
     training = config["training"]
-    return ParquetTrainingDataset(
-        prepared.descriptor_path,
+    return ParquetTrainingDataset._from_verified_prepared(
+        prepared,
         split=split,
         batch_size=int(training["batch_size"]),
         seed=int(config["experiment"]["seed"]),
@@ -717,11 +718,22 @@ def _dataset(
     )
 
 
+def _pin_training_datasets(
+    prepared: PreparedDataset, config: Mapping[str, Any]
+) -> dict[str, ParquetTrainingDataset]:
+    return {
+        split: _dataset(prepared, config, split)
+        for split in ("train", "validation", "test")
+    }
+
+
 def _preflight_streaming_resume_checkpoint(
     path: Path,
     prepared: PreparedDataset,
     config: dict[str, Any],
     integrity: Mapping[str, object],
+    train_dataset: ParquetTrainingDataset | None = None,
+    preprocessor: FeaturePreprocessor | None = None,
 ) -> None:
     """Reject incompatible resume state before allocating a new run."""
 
@@ -739,10 +751,12 @@ def _preflight_streaming_resume_checkpoint(
     )
     from bitguard_bnn.trainer import _build_neural, _select_device
 
-    preprocessor = FeaturePreprocessor.load(Path(prepared.preprocessor_path))
+    if preprocessor is None:
+        preprocessor = FeaturePreprocessor.load(Path(prepared.preprocessor_path))
     labels = list(preprocessor.active_labels)
-    counts = _class_counts(prepared, labels)
-    train_dataset = _dataset(prepared, config, "train")
+    if train_dataset is None:
+        train_dataset = _dataset(prepared, config, "train")
+    counts = _class_counts(train_dataset, labels)
     validated_labels, feature_indices, _, normalized_counts = _validate_inputs(
         train_dataset,
         config,
@@ -1402,6 +1416,238 @@ def _prediction_batches(
             database_path.with_name(database_path.name + suffix).unlink(missing_ok=True)
 
 
+def _require_preverified_regular_file(
+    value: str | Path,
+    *,
+    subject: str,
+    expected_sha256: str | None = None,
+) -> Path:
+    path = Path(value)
+    try:
+        observed = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"preverified {subject} is unavailable: {path}") from exc
+    file_attributes = int(getattr(observed, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if (
+        path.is_symlink()
+        or bool(file_attributes & reparse_flag)
+        or not stat.S_ISREG(observed.st_mode)
+        or resolved != Path(os.path.abspath(path))
+    ):
+        raise RuntimeError(f"preverified {subject} is not a canonical regular file")
+    if expected_sha256 is not None and _sha256(resolved) != expected_sha256:
+        raise RuntimeError(f"preverified {subject} checksum mismatch")
+    return resolved
+
+
+def _read_stable_regular_bytes(path: Path, *, subject: str) -> bytes:
+    before = path.lstat()
+    with path.open("rb") as handle:
+        opened_before = os.fstat(handle.fileno())
+        payload = handle.read()
+        opened_after = os.fstat(handle.fileno())
+    after = path.lstat()
+    identities = tuple(
+        _checkpoint_identity(value)
+        for value in (before, opened_before, opened_after, after)
+    )
+    if len(set(identities)) != 1:
+        raise RuntimeError(f"preverified {subject} changed while read")
+    return payload
+
+
+class _PinnedPreprocessorArtifact:
+    def __init__(
+        self,
+        path: Path,
+        handle: BinaryIO,
+        identity: tuple[int, ...],
+        expected_sha256: str,
+    ) -> None:
+        self.path = path
+        self.handle = handle
+        self.identity = identity
+        self.expected_sha256 = expected_sha256
+        self._payload: bytes | None = None
+        self._processor: FeaturePreprocessor | None = None
+
+    @classmethod
+    def open(
+        cls, path: str | Path, *, expected_sha256: str
+    ) -> _PinnedPreprocessorArtifact:
+        resolved = _require_preverified_regular_file(
+            path,
+            subject="preprocessor",
+            expected_sha256=expected_sha256,
+        )
+        handle = resolved.open("rb")
+        try:
+            identity = _checkpoint_identity(os.fstat(handle.fileno()))
+            if identity != _checkpoint_identity(resolved.lstat()):
+                raise RuntimeError("preverified preprocessor changed while opened")
+            return cls(resolved, handle, identity, expected_sha256)
+        except BaseException:
+            handle.close()
+            raise
+
+    def close(self) -> None:
+        self.handle.close()
+
+    def _verified_bytes(self) -> bytes:
+        if self.handle.closed:
+            raise RuntimeError("preverified preprocessor handle is closed")
+        if (
+            _checkpoint_identity(os.fstat(self.handle.fileno())) != self.identity
+            or _checkpoint_identity(self.path.lstat()) != self.identity
+        ):
+            raise RuntimeError("preverified preprocessor changed before snapshot")
+        self.handle.seek(0)
+        payload = self.handle.read()
+        if (
+            hashlib.sha256(payload).hexdigest() != self.expected_sha256
+            or _checkpoint_identity(os.fstat(self.handle.fileno())) != self.identity
+            or _checkpoint_identity(self.path.lstat()) != self.identity
+        ):
+            raise RuntimeError("preverified preprocessor checksum or identity changed")
+        return payload
+
+    def materialize(self, destination: Path) -> FeaturePreprocessor:
+        processor = self.load()
+        assert self._payload is not None
+        payload = self._payload
+        created = False
+        try:
+            with destination.open("xb") as output:
+                created = True
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            if _sha256(destination) != self.expected_sha256:
+                raise RuntimeError("preprocessor snapshot checksum mismatch")
+        except BaseException:
+            if created:
+                destination.unlink(missing_ok=True)
+            raise
+        return processor
+
+    def load(self) -> FeaturePreprocessor:
+        if self._processor is not None:
+            return self._processor
+        payload = self._verified_bytes()
+        processor = joblib.load(io.BytesIO(payload))
+        if not isinstance(processor, FeaturePreprocessor):
+            raise TypeError("artifact is not a FeaturePreprocessor")
+        self._payload = payload
+        self._processor = processor
+        return processor
+
+
+def _open_trusted_preprocessor(
+    path: str | Path, *, expected_sha256: str
+) -> tuple[_PinnedPreprocessorArtifact, FeaturePreprocessor]:
+    artifact = _PinnedPreprocessorArtifact.open(
+        path, expected_sha256=expected_sha256
+    )
+    try:
+        return artifact, artifact.load()
+    except BaseException:
+        artifact.close()
+        raise
+
+
+def _validate_preverified_prepared_binding(
+    config_path: Path,
+    prepared: PreparedDataset,
+    *,
+    prepared_descriptor_path: str | Path | None,
+) -> None:
+    if not isinstance(prepared, PreparedDataset):
+        raise TypeError("prepared must be a verified PreparedDataset")
+    descriptor = _require_preverified_regular_file(
+        prepared.descriptor_path,
+        subject="prepared descriptor",
+    )
+    try:
+        descriptor_payload = json.loads(
+            _read_stable_regular_bytes(
+                descriptor, subject="prepared descriptor"
+            ).decode("utf-8")
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("preverified prepared descriptor is invalid") from exc
+    if not isinstance(descriptor_payload, Mapping):
+        raise RuntimeError("preverified prepared descriptor is invalid")
+    reparsed = PreparedDataset.from_dict(descriptor, descriptor_payload)
+    if (
+        reparsed.descriptor_path != prepared.descriptor_path
+        or reparsed.to_dict() != prepared.to_dict()
+    ):
+        raise RuntimeError(
+            "preverified prepared descriptor does not match the cached dataset"
+        )
+    if prepared_descriptor_path is not None:
+        supplied_descriptor = Path(prepared_descriptor_path).resolve(strict=True)
+        if supplied_descriptor != descriptor:
+            raise ValueError(
+                "prepared_descriptor_path does not match the preverified descriptor"
+            )
+    resolved_config = _require_preverified_regular_file(
+        prepared.resolved_config_path,
+        subject="resolved config",
+        expected_sha256=prepared.config_sha256,
+    )
+    template_config = Path(prepared.template_config_path).resolve(strict=True)
+    supplied_config = config_path.resolve(strict=True)
+    if supplied_config not in {resolved_config, template_config}:
+        raise ValueError(
+            "config_path does not match the preverified resolved or template config"
+        )
+    _require_preverified_regular_file(
+        prepared.preprocessor_path,
+        subject="preprocessor",
+        expected_sha256=prepared.preprocessor_sha256,
+    )
+
+
+def _run_out_of_core_training_preverified(
+    config_path: str | Path,
+    prepared: PreparedDataset,
+    *,
+    config: dict[str, Any] | None = None,
+    prepared_descriptor_path: str | Path | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+    event_callback: Callable[[Mapping[str, object]], None] | None = None,
+    resume_checkpoint_integrity: Mapping[str, object] | None = None,
+    available_disk_bytes: int | None = None,
+    available_ram_bytes: int | None = None,
+) -> Path:
+    """Run from a PreparedDataset already fully verified by bootstrap."""
+
+    path = Path(config_path)
+    _validate_preverified_prepared_binding(
+        path,
+        prepared,
+        prepared_descriptor_path=prepared_descriptor_path,
+    )
+    loaded = load_config(path) if config is None else config
+    if str(loaded["dataset"].get("storage", "csv")) != "parquet":
+        raise ValueError("out-of-core training requires dataset.storage=parquet")
+    _reject_unsupported_model(loaded)
+    datasets = _pin_training_datasets(prepared, loaded)
+    return _run_verified_neural_training(
+        loaded,
+        prepared,
+        _pinned_datasets=datasets,
+        progress_callback=progress_callback,
+        event_callback=event_callback,
+        resume_checkpoint_integrity=resume_checkpoint_integrity,
+        available_disk_bytes=available_disk_bytes,
+        available_ram_bytes=available_ram_bytes,
+    )
+
+
 def run_out_of_core_training(
     config_path: str | Path,
     *,
@@ -1430,11 +1676,13 @@ def run_out_of_core_training(
         if prepared_descriptor_path is not None
         else _resolve_prepared_descriptor(path, loaded)
     )
+    datasets = _pin_training_datasets(prepared, loaded)
 
     # Imported lazily to keep the storage dispatch boundary acyclic.
     return _run_verified_neural_training(
         loaded,
         prepared,
+        _pinned_datasets=datasets,
         progress_callback=progress_callback,
         event_callback=event_callback,
         resume_checkpoint_integrity=resume_checkpoint_integrity,
@@ -1447,6 +1695,7 @@ def _run_verified_neural_training(
     config: dict[str, Any],
     prepared: PreparedDataset,
     *,
+    _pinned_datasets: Mapping[str, ParquetTrainingDataset] | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     event_callback: Callable[[Mapping[str, object]], None] | None = None,
     resume_checkpoint_integrity: Mapping[str, object] | None = None,
@@ -1491,47 +1740,87 @@ def _run_verified_neural_training(
         available_disk_bytes=available_disk_bytes,
         available_ram_bytes=available_ram_bytes,
     )
+    train_dataset = (
+        None if _pinned_datasets is None else _pinned_datasets["train"]
+    )
     resume_value = runtime_config["training"].get("resume_from")
     resume_source_path = (
         resolve_path(runtime_config, resume_value) if resume_value else None
     )
+    pinned_preprocessor: _PinnedPreprocessorArtifact | None = None
+    trusted_preprocessor: FeaturePreprocessor | None = None
+    if _pinned_datasets is not None:
+        pinned_preprocessor, trusted_preprocessor = _open_trusted_preprocessor(
+            prepared.preprocessor_path,
+            expected_sha256=prepared.preprocessor_sha256,
+        )
     resume_integrity: dict[str, object] | None = None
-    if resume_source_path is not None:
-        resume_integrity = _validated_resume_integrity(
-            resume_source_path, resume_checkpoint_integrity
-        )
-        _preflight_streaming_resume_checkpoint(
-            resume_source_path,
-            prepared,
-            runtime_config,
-            resume_integrity,
-        )
-    elif resume_checkpoint_integrity is not None:
-        raise ValueError("resume checkpoint integrity requires training.resume_from")
+    try:
+        if resume_source_path is not None:
+            resume_integrity = _validated_resume_integrity(
+                resume_source_path, resume_checkpoint_integrity
+            )
+            _preflight_streaming_resume_checkpoint(
+                resume_source_path,
+                prepared,
+                runtime_config,
+                resume_integrity,
+                train_dataset,
+                trusted_preprocessor,
+            )
+        elif resume_checkpoint_integrity is not None:
+            raise ValueError("resume checkpoint integrity requires training.resume_from")
+    except BaseException:
+        if pinned_preprocessor is not None:
+            pinned_preprocessor.close()
+        raise
     seed = int(runtime_config["experiment"]["seed"])
-    seed_everything(seed)
-
+    try:
+        seed_everything(seed)
+    except BaseException:
+        if pinned_preprocessor is not None:
+            pinned_preprocessor.close()
+        raise
     # The caller verifies the complete prepared descriptor before reaching this
     # first allocation. Never move create_run_dir above that boundary.
-    run_dir = create_run_dir(runtime_config)
-    if progress_callback is not None:
-        progress_callback(
-            {
-                "status": "run_created",
-                "dataset": prepared.dataset,
-                "prepared_descriptor": prepared.descriptor_path,
-                "prepared_descriptor_fingerprint": prepared.to_dict()["fingerprint"],
-                "run_dir": str(run_dir.resolve(strict=True)),
-                "active_checkpoint": str(
-                    (run_dir / "last_training_state.pt").resolve(strict=False)
-                ),
-                "resume_checkpoint": (
-                    None
-                    if resume_source_path is None
-                    else str(resume_source_path.resolve(strict=False))
-                ),
-            }
-        )
+    try:
+        run_dir = create_run_dir(runtime_config)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "status": "run_created",
+                    "dataset": prepared.dataset,
+                    "prepared_descriptor": prepared.descriptor_path,
+                    "prepared_descriptor_fingerprint": prepared.to_dict()["fingerprint"],
+                    "run_dir": str(run_dir.resolve(strict=True)),
+                    "active_checkpoint": str(
+                        (run_dir / "last_training_state.pt").resolve(strict=False)
+                    ),
+                    "resume_checkpoint": (
+                        None
+                        if resume_source_path is None
+                        else str(resume_source_path.resolve(strict=False))
+                    ),
+                }
+            )
+        if pinned_preprocessor is None:
+            pinned_preprocessor = _PinnedPreprocessorArtifact.open(
+                prepared.preprocessor_path,
+                expected_sha256=prepared.preprocessor_sha256,
+            )
+        preprocessor_snapshot = run_dir / "prepared_preprocessor.joblib"
+        preprocessor = pinned_preprocessor.materialize(preprocessor_snapshot)
+    finally:
+        if pinned_preprocessor is not None:
+            pinned_preprocessor.close()
+    if _pinned_datasets is None:
+        _pinned_datasets = _pin_training_datasets(prepared, runtime_config)
+    train_dataset = _pinned_datasets["train"]
+    validation_dataset = _pinned_datasets["validation"]
+    test_dataset = _pinned_datasets["test"]
+    for dataset in (train_dataset, validation_dataset, test_dataset):
+        dataset.preprocessor_path = str(preprocessor_snapshot)
+        dataset.preprocessor_sha256 = prepared.preprocessor_sha256
     resume_path: Path | None = None
     if resume_source_path is not None:
         assert resume_integrity is not None
@@ -1548,12 +1837,10 @@ def _run_verified_neural_training(
     save_yaml(runtime_config, run_dir / "resolved_config.yaml")
     save_json(environment_manifest(), run_dir / "environment.json")
     save_json(prepared.to_dict(), run_dir / "prepared_dataset.json")
-    shutil.copy2(prepared.preprocessor_path, run_dir / "preprocessor.joblib")
-    preprocessor = FeaturePreprocessor.load(run_dir / "preprocessor.joblib")
     save_json(preprocessor.feature_manifest(), run_dir / "feature_manifest.json")
 
     labels = list(preprocessor.active_labels)
-    counts = _class_counts(prepared, labels)
+    counts = _class_counts(train_dataset, labels)
     attack_prior = _attack_prior(counts)
     training_contract = {
         "algorithm": "bitguard.full-validation-selection.v1",
@@ -1568,7 +1855,6 @@ def _run_verified_neural_training(
 
     training_event_callback = None if event_callback is None else training_event
     batch_size = int(runtime_config["training"]["batch_size"])
-    validation_dataset = _dataset(prepared, runtime_config, "validation")
     validation_callback = _validation_callback(
         validation_dataset, labels, temporary / "epoch-validation"
     )
@@ -1583,7 +1869,7 @@ def _run_verified_neural_training(
             teacher_model = _build_neural(teacher_config, preprocessor, len(labels))
             teacher_fit = fit_neural_streaming(
                 teacher_model,
-                _dataset(prepared, runtime_config, "train"),
+                train_dataset,
                 counts,
                 labels,
                 teacher_config,
@@ -1611,7 +1897,7 @@ def _run_verified_neural_training(
         main_model = _build_neural(runtime_config, preprocessor, len(labels))
         main_fit = fit_neural_streaming(
             main_model,
-            _dataset(prepared, runtime_config, "train"),
+            train_dataset,
             counts,
             labels,
             runtime_config,
@@ -1684,7 +1970,7 @@ def _run_verified_neural_training(
             )
             tiny_fit = fit_neural_streaming(
                 tiny_model,
-                _dataset(prepared, runtime_config, "train"),
+                train_dataset,
                 counts,
                 labels,
                 tiny_config,
@@ -1889,7 +2175,6 @@ def _run_verified_neural_training(
     )
     save_json(inference_contract, run_dir / "inference_contract.json")
     with _phase(phases, "test_evaluation", temporary):
-        test_dataset = _dataset(prepared, runtime_config, "test")
         evaluation = evaluate_prediction_batches(
             lambda: _prediction_batches(
                 test_dataset,

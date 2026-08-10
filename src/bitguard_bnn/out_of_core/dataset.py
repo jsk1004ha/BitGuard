@@ -381,6 +381,31 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             shuffle_buffer_rows=shuffle_buffer_rows,
         )
 
+    @classmethod
+    def _from_verified_prepared(
+        cls,
+        prepared: PreparedDataset,
+        *,
+        split: str = "train",
+        batch_size: int,
+        seed: int,
+        shuffle_buffer_rows: int | None = None,
+    ) -> ParquetTrainingDataset:
+        """Construct one split from a descriptor verified by the owning runner."""
+
+        if not isinstance(prepared, PreparedDataset):
+            raise TypeError("prepared must be a verified PreparedDataset")
+        instance = cls.__new__(cls)
+        torch.utils.data.IterableDataset.__init__(instance)
+        instance._initialize(
+            prepared,
+            split=split,
+            batch_size=batch_size,
+            seed=seed,
+            shuffle_buffer_rows=shuffle_buffer_rows,
+        )
+        return instance
+
     def _initialize(
         self,
         prepared: PreparedDataset,

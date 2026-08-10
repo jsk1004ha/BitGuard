@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import zipfile
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -438,7 +439,7 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
                 if with_progress:
                     self.assertTrue(events)
 
-    def test_inspect_started_event_includes_first_dataset_hash_detail(self) -> None:
+    def test_inspect_started_event_includes_first_dataset_manifest_detail(self) -> None:
         events: list[dict[str, object]] = []
 
         report = run_bootstrap(
@@ -455,11 +456,11 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(first_inspect["status"], "started")
         self.assertEqual(first_inspect["dataset"], "nbaiot")
-        self.assertEqual(first_inspect["phase"], "hash")
+        self.assertEqual(first_inspect["phase"], "manifest")
         self.assertEqual(first_inspect["dataset_index"], 1)
         self.assertEqual(first_inspect["dataset_count"], 2)
 
-    def test_inspect_stage_digests_each_raw_dataset_root_exactly_twice(self) -> None:
+    def test_inspect_stage_uses_manifests_instead_of_extra_tree_digests(self) -> None:
         active = False
         calls: Counter[str] = Counter()
         real_tree_digest = orchestrator_module._tree_digest
@@ -490,48 +491,528 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
             )
 
         self.assertEqual(report["status"], "sources_verified", msg=report.get("error"))
-        self.assertEqual(calls, Counter({"nbaiot": 2, "botiot": 2}))
+        self.assertEqual(calls, Counter())
 
-    def test_source_mutation_before_second_inspect_digest_fails_stage(self) -> None:
+    def test_inspect_builds_two_manifests_when_executed_and_one_when_reused(
+        self,
+    ) -> None:
+        with patch.object(
+            orchestrator_module,
+            "build_source_manifest",
+            wraps=orchestrator_module.build_source_manifest,
+        ) as build:
+            first = run_bootstrap(self.options, dependencies=self.dependencies())
+
+            self.assertEqual(
+                first["status"], "sources_verified", msg=first.get("error")
+            )
+            self.assertEqual(build.call_count, 4)
+            build.reset_mock()
+
+            second = run_bootstrap(self.options, dependencies=self.dependencies())
+
+        self.assertEqual(
+            second["status"], "sources_verified", msg=second.get("error")
+        )
+        self.assertEqual(build.call_count, 2)
+
+    def test_source_mutation_after_inspection_fails_even_with_unchanged_metadata(
+        self,
+    ) -> None:
+        mutated = False
+
+        def mutate_after_inspection(dataset, source, **kwargs):
+            nonlocal mutated
+            report = inspect_csv_dataset(dataset, source, **kwargs)
+            if dataset != "nbaiot" or mutated:
+                return report
+            path = next(Path(source).rglob("*.csv"))
+            before = path.stat()
+            payload = path.read_bytes()
+            replacement = payload.replace(b"1,2", b"9,2", 1)
+            self.assertEqual(len(replacement), len(payload))
+            self.assertNotEqual(replacement, payload)
+            path.write_bytes(replacement)
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            after = path.stat()
+            self.assertEqual(
+                (after.st_ino, after.st_size, after.st_mtime_ns),
+                (before.st_ino, before.st_size, before.st_mtime_ns),
+            )
+            mutated = True
+            return report
+
+        report = run_bootstrap(
+            self.options,
+            dependencies=self.dependencies(inspector=mutate_after_inspection),
+        )
+
+        self.assertTrue(mutated)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["failed_stage"], "inspect")
+        self.assertEqual(report["last_completed_stage"], "extract")
+
+    def test_shard_avoids_raw_tree_digests_and_forwards_phase_progress(self) -> None:
         active = False
-        calls: Counter[str] = Counter()
+        tree_calls: Counter[str] = Counter()
+        prepare_calls: list[dict[str, object]] = []
+        events: list[dict[str, object]] = []
         real_tree_digest = orchestrator_module._tree_digest
 
         def progress(event) -> None:
             nonlocal active
-            if event.get("stage") != "inspect":
+            payload = dict(event)
+            events.append(payload)
+            if payload.get("stage") != "shard":
                 return
-            if event.get("status") == "started":
+            if payload.get("status") == "started":
                 active = True
-            elif event.get("status") in {"completed", "reused", "failed"}:
+            elif payload.get("status") in {"completed", "reused", "failed"}:
                 active = False
 
-        def mutate_before_second_digest(path: Path):
+        def counting_tree_digest(path: Path):
             if active and path.parent == self.data_root / "raw":
-                dataset = path.name.split("-", 1)[0]
-                calls[dataset] += 1
-                if dataset == "nbaiot" and calls[dataset] == 2:
-                    (path / "changed-after-inspection.txt").write_text(
-                        "mutation",
-                        encoding="utf-8",
-                    )
+                tree_calls[path.name.split("-", 1)[0]] += 1
             return real_tree_digest(path)
 
+        def prepare(_config: Path, **kwargs: object) -> object:
+            prepare_calls.append(dict(kwargs))
+            callback = kwargs.get("progress_callback")
+            if callable(callback):
+                callback({"phase": "split", "rows": 2})
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text(
+                json.dumps({"dataset": descriptor.parent.name}),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(descriptor_path=str(descriptor))
+
+        def verify(descriptor: Path, *, progress_callback=None) -> object:
+            if progress_callback is not None:
+                progress_callback(
+                    {"phase": "verification-validate", "rows": 2}
+                )
+            dataset = json.loads(descriptor.read_text(encoding="utf-8"))["dataset"]
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "dataset": dataset,
+                    "descriptor_path": str(descriptor),
+                }
+            )
+
+        dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=verify,
+            preparation_signature_token="fixture-preparer-v2",
+        )
         with patch.object(
             orchestrator_module,
             "_tree_digest",
-            side_effect=mutate_before_second_digest,
+            side_effect=counting_tree_digest,
         ):
             report = run_bootstrap(
                 self.options,
-                dependencies=self.dependencies(),
+                dependencies=dependencies,
                 progress_callback=progress,
             )
 
-        self.assertEqual(calls["nbaiot"], 2)
-        self.assertEqual(report["status"], "failed")
-        self.assertEqual(report["failed_stage"], "inspect")
-        self.assertEqual(report["last_completed_stage"], "extract")
+        self.assertEqual(report["status"], "prepared", msg=report.get("error"))
+        self.assertEqual(tree_calls, Counter())
+        self.assertEqual(len(prepare_calls), 2)
+        self.assertTrue(
+            all("verify_on_return" not in call for call in prepare_calls)
+        )
+        forwarded = [
+            event
+            for event in events
+            if event.get("stage") == "shard" and event.get("phase") == "split"
+        ]
+        self.assertEqual([event["dataset"] for event in forwarded], ["nbaiot", "botiot"])
+        self.assertTrue(all(event["rows"] == 2 for event in forwarded))
+        validation = [
+            event
+            for event in events
+            if event.get("stage") == "validate"
+            and event.get("phase") == "verification-validate"
+        ]
+        self.assertEqual([event["dataset"] for event in validation], ["nbaiot", "botiot"])
+
+    def test_builtin_fresh_preparation_is_fully_verified_once_in_validate(self) -> None:
+        from bitguard_bnn.out_of_core import prepare as prepare_module
+
+        with zipfile.ZipFile(self.nbaiot_archive, "w") as archive:
+            for device_index, device in enumerate(
+                ("Ecobee_Thermostat", "Philips_B120N10_Baby_Monitor")
+            ):
+                archive.writestr(
+                    f"{device}/benign_traffic.csv",
+                    "mean,std\n"
+                    + "".join(
+                        f"{1 + device_index + row},{2 + row / 10}\n"
+                        for row in range(8)
+                    ),
+                )
+                archive.writestr(
+                    f"{device}/gafgyt_attacks/scan.csv",
+                    "mean,std\n"
+                    + "".join(
+                        f"{20 + device_index + row},{4 + row / 10}\n"
+                        for row in range(8)
+                    ),
+                )
+            archive.writestr(
+                "Danmini_Doorbell/benign_traffic.csv",
+                "mean,std\n"
+                + "".join(f"{1000 + row},{2000 + row}\n" for row in range(8)),
+            )
+        options = replace(self.options, datasets=("nbaiot",))
+        defaults = BootstrapDependencies(
+            nbaiot_archive=self.nbaiot_archive,
+            available_bytes=10**12,
+            preparation_available_bytes=10**12,
+            compute_resolver=lambda requested: {
+                "requested": requested,
+                "selected_profile": "cpu",
+                "device": "cpu",
+            },
+        )
+        real_verify = prepare_module.verify_prepared_dataset
+        verified_objects: list[object] = []
+
+        def record_verification(*args: object, **kwargs: object) -> object:
+            result = real_verify(*args, **kwargs)
+            verified_objects.append(result)
+            return result
+
+        with (
+            patch.object(
+                orchestrator_module,
+                "BootstrapDependencies",
+                return_value=defaults,
+            ),
+            patch.object(
+                prepare_module,
+                "verify_prepared_dataset",
+                side_effect=record_verification,
+            ) as verify,
+        ):
+            report = run_bootstrap(options)
+
+            self.assertEqual(report["status"], "prepared", msg=report.get("error"))
+            self.assertEqual(verify.call_count, 1)
+
+            reused = run_bootstrap(options)
+
+            training_handoffs: list[object] = []
+
+            def stop_after_handoff(
+                _config_path: Path,
+                prepared: object,
+                **_kwargs: object,
+            ) -> Path:
+                training_handoffs.append(prepared)
+                raise RuntimeError("stop after preverified training handoff")
+
+            with patch(
+                "bitguard_bnn.out_of_core.run."
+                "_run_out_of_core_training_preverified",
+                side_effect=stop_after_handoff,
+            ):
+                training = run_bootstrap(replace(options, prepare_only=False))
+
+        self.assertEqual(reused["status"], "prepared", msg=reused.get("error"))
+        self.assertIn("shard", reused["reused_stages"])
+        self.assertEqual(training["failed_stage"], "train")
+        self.assertIn("stop after preverified training handoff", str(training["error"]))
+        self.assertEqual(verify.call_count, 3)
+        self.assertEqual(len(training_handoffs), 1)
+        self.assertIs(training_handoffs[0], verified_objects[-1])
+
+    def test_custom_trainer_reverifies_descriptor_immediately_before_call(self) -> None:
+        descriptor_paths: list[Path] = []
+        verifier_calls = 0
+        trainer_called = False
+
+        def prepare(_config: Path, **kwargs: object) -> object:
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            descriptor_paths.append(descriptor)
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text('{"valid":true}', encoding="utf-8")
+            return SimpleNamespace(descriptor_path=str(descriptor))
+
+        def verify(descriptor: Path) -> object:
+            nonlocal verifier_calls
+            verifier_calls += 1
+            if json.loads(descriptor.read_text(encoding="utf-8")) != {"valid": True}:
+                raise RuntimeError("prepared descriptor changed before custom trainer")
+            return SimpleNamespace(
+                resolved_config_path=str(
+                    Path(__file__).resolve().parents[1]
+                    / "configs"
+                    / "full"
+                    / "nbaiot.yaml"
+                ),
+                to_dict=lambda: {
+                    "descriptor_path": str(descriptor),
+                    "fingerprint": "custom-trainer-fixture",
+                },
+            )
+
+        def train(**_kwargs: object) -> Path:
+            nonlocal trainer_called
+            trainer_called = True
+            raise AssertionError("custom trainer must not receive a changed descriptor")
+
+        def progress(event: Mapping[str, object]) -> None:
+            if event.get("stage") == "validate" and event.get("status") == "completed":
+                descriptor_paths[0].write_text('{"valid":false}', encoding="utf-8")
+
+        dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=verify,
+            trainer=train,
+            preparation_signature_token="custom-trainer-reverify-v1",
+        )
+        report = run_bootstrap(
+            replace(self.options, datasets=("nbaiot",), prepare_only=False),
+            dependencies=dependencies,
+            progress_callback=progress,
+        )
+
+        self.assertEqual(report["failed_stage"], "train")
+        self.assertIn(
+            "prepared descriptor changed before custom trainer",
+            str(report["error"]),
+        )
+        self.assertEqual(verifier_calls, 2)
+        self.assertFalse(trainer_called)
+
+    def test_validate_retry_token_survives_state_invalidation_failure(self) -> None:
+        prepare_calls: list[str] = []
+        prepared_paths: list[Path] = []
+        validation_calls = 0
+
+        def prepare(_config: Path, **kwargs: object) -> object:
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            dataset = descriptor.parent.name
+            prepare_calls.append(dataset)
+            prepared_paths.append(descriptor)
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text(
+                json.dumps({"dataset": dataset, "valid": True}),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(descriptor_path=str(descriptor))
+
+        def verify(descriptor: Path) -> object:
+            nonlocal validation_calls
+            validation_calls += 1
+            if validation_calls == 1:
+                raise RuntimeError("injected prepared validation failure")
+            dataset = json.loads(descriptor.read_text(encoding="utf-8"))["dataset"]
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "dataset": dataset,
+                    "descriptor_path": str(descriptor),
+                }
+            )
+
+        options = replace(self.options, datasets=("nbaiot",))
+        dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=verify,
+            preparation_signature_token="validate-retry-fixture-v1",
+        )
+
+        real_invalidate = orchestrator_module.BootstrapStateStore.invalidate_from
+        shard_invalidations = 0
+
+        def fail_recovery_invalidation(store, stage, order) -> None:
+            nonlocal shard_invalidations
+            if stage == "shard":
+                shard_invalidations += 1
+                if shard_invalidations == 2:
+                    raise RuntimeError("injected shard state invalidation failure")
+            real_invalidate(store, stage, order)
+
+        with patch.object(
+            orchestrator_module.BootstrapStateStore,
+            "invalidate_from",
+            new=fail_recovery_invalidation,
+        ):
+            failed = run_bootstrap(options, dependencies=dependencies)
+
+        self.assertEqual(failed["failed_stage"], "validate")
+        self.assertEqual(failed["last_completed_stage"], "inspect")
+        self.assertIn("--restart-stage shard", str(failed["recovery_command"]))
+        self.assertIn("injected prepared validation failure", str(failed["error"]))
+        self.assertIn("injected shard state invalidation failure", str(failed["error"]))
+        persisted = json.loads(Path(str(failed["state"])).read_text(encoding="utf-8"))
+        self.assertIn("shard", persisted["stages"])
+
+        retried = run_bootstrap(options, dependencies=dependencies)
+
+        self.assertEqual(retried["status"], "prepared", msg=retried.get("error"))
+        self.assertIn("shard", retried["executed_stages"])
+        self.assertIn("validate", retried["executed_stages"])
+        self.assertEqual(prepare_calls, ["nbaiot", "nbaiot"])
+        self.assertEqual(len(set(prepared_paths)), 2)
+        self.assertTrue(all(path.is_file() for path in prepared_paths))
+
+    def test_retry_token_failure_preserves_shard_state_and_primary_error(self) -> None:
+        def prepare(_config: Path, **kwargs: object) -> object:
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text('{"dataset":"nbaiot"}', encoding="utf-8")
+            return SimpleNamespace(descriptor_path=str(descriptor))
+
+        def verify(_descriptor: Path) -> object:
+            raise RuntimeError("injected prepared validation failure")
+
+        options = replace(self.options, datasets=("nbaiot",))
+        dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=verify,
+            preparation_signature_token="retry-token-failure-fixture-v1",
+        )
+        real_write = orchestrator_module._write_json
+        real_invalidate = orchestrator_module.BootstrapStateStore.invalidate_from
+        shard_invalidations = 0
+
+        def fail_retry_token(path: Path, value: Mapping[str, object]) -> None:
+            if path.parent.name == "preparation-retry":
+                raise RuntimeError("injected retry token publication failure")
+            real_write(path, value)
+
+        def count_invalidation(store, stage, order) -> None:
+            nonlocal shard_invalidations
+            if stage == "shard":
+                shard_invalidations += 1
+            real_invalidate(store, stage, order)
+
+        with (
+            patch.object(
+                orchestrator_module,
+                "_write_json",
+                side_effect=fail_retry_token,
+            ),
+            patch.object(
+                orchestrator_module.BootstrapStateStore,
+                "invalidate_from",
+                new=count_invalidation,
+            ),
+        ):
+            failed = run_bootstrap(options, dependencies=dependencies)
+
+        self.assertEqual(failed["failed_stage"], "validate")
+        self.assertEqual(failed["last_completed_stage"], "shard")
+        self.assertIn("injected prepared validation failure", str(failed["error"]))
+        self.assertIn("injected retry token publication failure", str(failed["error"]))
+        self.assertIn("--restart-stage validate", str(failed["recovery_command"]))
+        persisted = json.loads(Path(str(failed["state"])).read_text(encoding="utf-8"))
+        self.assertIn("shard", persisted["stages"])
+        self.assertEqual(shard_invalidations, 1)
+
+    def test_validation_rotates_only_the_failed_dataset_generation(self) -> None:
+        def prepare(_config: Path, **kwargs: object) -> object:
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text(
+                json.dumps({"dataset": descriptor.parent.name}),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(descriptor_path=str(descriptor))
+
+        def verify(descriptor: Path) -> object:
+            dataset = json.loads(descriptor.read_text(encoding="utf-8"))["dataset"]
+            if dataset == "botiot":
+                raise RuntimeError("injected botiot validation failure")
+            return SimpleNamespace(to_dict=lambda: {"dataset": dataset})
+
+        dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=verify,
+            preparation_signature_token="per-dataset-retry-fixture-v1",
+        )
+
+        failed = run_bootstrap(self.options, dependencies=dependencies)
+
+        self.assertEqual(failed["failed_stage"], "validate")
+        retry_root = self.data_root / ".bitguard" / "preparation-retry"
+        self.assertFalse((retry_root / "nbaiot.json").exists())
+        self.assertTrue((retry_root / "botiot.json").is_file())
+
+    def test_validation_base_exception_does_not_rotate_generation(self) -> None:
+        def prepare(_config: Path, **kwargs: object) -> object:
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text('{"dataset":"nbaiot"}', encoding="utf-8")
+            return SimpleNamespace(descriptor_path=str(descriptor))
+
+        def interrupt(_descriptor: Path) -> object:
+            raise KeyboardInterrupt("injected operator interrupt")
+
+        options = replace(self.options, datasets=("nbaiot",))
+        dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=interrupt,
+            preparation_signature_token="base-exception-fixture-v1",
+        )
+
+        failed = run_bootstrap(options, dependencies=dependencies)
+
+        self.assertEqual(failed["failed_stage"], "validate")
+        self.assertEqual(failed["last_completed_stage"], "shard")
+        self.assertIn("--restart-stage validate", str(failed["recovery_command"]))
+        retry_root = self.data_root / ".bitguard" / "preparation-retry"
+        self.assertFalse(retry_root.exists())
+
+    def test_validation_progress_failure_does_not_rotate_generation(self) -> None:
+        def prepare(_config: Path, **kwargs: object) -> object:
+            descriptor = Path(str(kwargs["descriptor_path"]))
+            descriptor.parent.mkdir(parents=True, exist_ok=True)
+            descriptor.write_text('{"dataset":"nbaiot"}', encoding="utf-8")
+            return SimpleNamespace(descriptor_path=str(descriptor))
+
+        def verify(_descriptor: Path, *, progress_callback=None) -> object:
+            assert progress_callback is not None
+            progress_callback({"phase": "verification-shards", "rows": 1})
+            return SimpleNamespace(to_dict=lambda: {"dataset": "nbaiot"})
+
+        def progress(event: Mapping[str, object]) -> None:
+            if (
+                event.get("stage") == "validate"
+                and event.get("phase") == "verification-shards"
+            ):
+                raise RuntimeError("injected progress transport failure")
+
+        options = replace(self.options, datasets=("nbaiot",))
+        dependencies = replace(
+            self.dependencies(),
+            preparer=prepare,
+            prepared_verifier=verify,
+            preparation_signature_token="progress-failure-fixture-v1",
+        )
+
+        failed = run_bootstrap(
+            options,
+            dependencies=dependencies,
+            progress_callback=progress,
+        )
+
+        self.assertEqual(failed["failed_stage"], "validate")
+        self.assertEqual(failed["last_completed_stage"], "shard")
+        self.assertIn("injected progress transport failure", str(failed["error"]))
+        self.assertIn("--restart-stage validate", str(failed["recovery_command"]))
+        retry_root = self.data_root / ".bitguard" / "preparation-retry"
+        self.assertFalse(retry_root.exists())
 
     def test_prepare_only_runs_to_verified_sources_and_reuses_every_stage(self) -> None:
         first = run_bootstrap(

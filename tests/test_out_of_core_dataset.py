@@ -131,6 +131,74 @@ class OutOfCoreDatasetTests(unittest.TestCase):
         dataset.set_epoch(epoch)
         return dataset
 
+    def test_internal_factory_reuses_preverified_prepared_dataset(self) -> None:
+        from bitguard_bnn.out_of_core.dataset import ParquetTrainingDataset
+
+        with patch(
+            "bitguard_bnn.out_of_core.dataset.verify_prepared_dataset",
+            side_effect=AssertionError("preverified dataset must not be reverified"),
+        ):
+            dataset = ParquetTrainingDataset._from_verified_prepared(
+                self.prepared,
+                split="validation",
+                batch_size=4,
+                seed=17,
+                shuffle_buffer_rows=3,
+            )
+
+        self.assertEqual(dataset.split, "validation")
+        self.assertEqual(dataset.row_count, self.prepared.validation_count)
+
+    def test_preverified_binding_reparses_descriptor_after_same_size_mutation(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core.run import (
+            _validate_preverified_prepared_binding,
+        )
+
+        descriptor = Path(self.prepared.descriptor_path)
+        original = descriptor.read_bytes()
+        observed = descriptor.stat()
+        mutated = original.replace(
+            self.prepared.shard_fingerprint.encode("ascii"),
+            ("0" * 64).encode("ascii"),
+            1,
+        )
+        self.assertEqual(len(mutated), len(original))
+        try:
+            descriptor.write_bytes(mutated)
+            descriptor.touch()
+            import os
+
+            os.utime(descriptor, ns=(observed.st_atime_ns, observed.st_mtime_ns))
+            with self.assertRaises(RuntimeError):
+                _validate_preverified_prepared_binding(
+                    Path(self.prepared.resolved_config_path),
+                    self.prepared,
+                    prepared_descriptor_path=descriptor,
+                )
+        finally:
+            descriptor.write_bytes(original)
+
+    def test_pinned_preprocessor_rejects_source_mutation_before_snapshot(self) -> None:
+        from bitguard_bnn.out_of_core.run import _PinnedPreprocessorArtifact
+
+        source = Path(self.prepared.preprocessor_path)
+        original = source.read_bytes()
+        destination = self.root / "raced-preprocessor.joblib"
+        artifact = _PinnedPreprocessorArtifact.open(
+            source,
+            expected_sha256=self.prepared.preprocessor_sha256,
+        )
+        try:
+            source.write_bytes(b"x" * len(original))
+            with self.assertRaisesRegex(RuntimeError, "changed|checksum"):
+                artifact.materialize(destination)
+            self.assertFalse(destination.exists())
+        finally:
+            artifact.close()
+            source.write_bytes(original)
+
     @staticmethod
     def _collect(dataset, workers: int):
         from bitguard_bnn.out_of_core.dataset import iter_ordered_batches

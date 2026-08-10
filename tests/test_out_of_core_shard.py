@@ -246,6 +246,73 @@ shard_module.write_parquet_shards(
                 pq.ParquetFile(first).schema_arrow.names[-2:], ["f1", "f2"]
             )
 
+    def test_verification_reports_cumulative_shard_progress(self) -> None:
+        from bitguard_bnn.out_of_core.shard import verify_shard_manifest
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split, plan = self._write(_rows(), root)
+            events: list[dict[str, object]] = []
+
+            manifest = verify_shard_manifest(
+                plan.manifest_path,
+                split_plan=split,
+                progress_callback=lambda event: events.append(dict(event)),
+            )
+
+            entries = manifest["entries"]
+            expected_rows: list[int] = []
+            cumulative_rows = 0
+            for entry in entries:
+                cumulative_rows += int(entry["rows"])
+                expected_rows.append(cumulative_rows)
+            self.assertEqual(
+                [event["phase"] for event in events],
+                ["verification-shards"] * len(entries),
+            )
+            self.assertEqual([event["rows"] for event in events], expected_rows)
+            self.assertEqual(
+                [event["file_index"] for event in events],
+                list(range(1, len(entries) + 1)),
+            )
+            self.assertEqual(
+                [event["file_count"] for event in events],
+                [len(entries)] * len(entries),
+            )
+            self.assertEqual(
+                [event["relative_path"] for event in events],
+                [entry["path"] for entry in entries],
+            )
+            self.assertEqual(events[-1]["rows"], sum(manifest["counts"].values()))
+
+    def test_verification_rejects_non_callable_progress_callback(self) -> None:
+        from bitguard_bnn.out_of_core.shard import verify_shard_manifest
+
+        with self.assertRaisesRegex(
+            TypeError, "progress_callback must be callable or None"
+        ):
+            verify_shard_manifest(
+                Path("manifest-does-not-need-to-exist.json"),
+                progress_callback=object(),  # type: ignore[arg-type]
+            )
+
+    def test_verification_none_progress_callback_preserves_manifest(self) -> None:
+        from bitguard_bnn.out_of_core.shard import verify_shard_manifest
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            split, plan = self._write(_rows(), root)
+            before = plan.manifest_path.read_bytes()
+
+            manifest = verify_shard_manifest(
+                plan.manifest_path,
+                split_plan=split,
+                progress_callback=None,
+            )
+
+            self.assertEqual(plan.manifest_path.read_bytes(), before)
+            self.assertEqual(manifest, json.loads(before))
+
     def test_recomputed_manifest_rejects_unknown_algorithm_versions(self) -> None:
         from bitguard_bnn.out_of_core import shard as shard_module
 

@@ -9,9 +9,10 @@ import os
 import sqlite3
 import stat
 import uuid
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Generator, Iterator, Mapping, Sequence
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -34,6 +35,7 @@ from bitguard_bnn.out_of_core.shard import (
 )
 from bitguard_bnn.out_of_core.split import build_split_plan
 from bitguard_bnn.out_of_core.source import (
+    NormalizedChunk,
     NormalizedSource,
     NormalizedSourceProof,
     open_normalized_source,
@@ -47,6 +49,8 @@ PREPARATION_ALGORITHM = "bitguard.full-dataset-preparation.v4"
 
 _PARTITIONS = ("train", "validation", "test")
 _MEMBERSHIP_COLUMNS = ("row_uid", "split", "behavior_label")
+
+PreparationProgressCallback = Callable[[Mapping[str, object]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,15 +437,52 @@ class _MembershipIndex:
         self.close()
 
 
+def _iter_source_chunks_with_progress(
+    source: NormalizedSource,
+    *,
+    phase: str,
+    progress_callback: PreparationProgressCallback | None,
+) -> Generator[NormalizedChunk, None, None]:
+    iterator = source.iter_chunks()
+    rows = 0
+    try:
+        for chunk in iterator:
+            rows += len(chunk.frame)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": phase,
+                        "rows": rows,
+                        "relative_path": chunk.source_relative_path,
+                    }
+                )
+            yield chunk
+    finally:
+        iterator.close()
+
+
 def _iter_train_batches(
     source: NormalizedSource,
     membership: _MembershipIndex,
     features: Sequence[str],
+    *,
+    phase: str,
+    progress_callback: PreparationProgressCallback | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Any]]:
     iterator = source.iter_chunks()
+    rows = 0
     try:
         for chunk in iterator:
             frame = chunk.frame
+            rows += len(frame)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": phase,
+                        "rows": rows,
+                        "relative_path": chunk.source_relative_path,
+                    }
+                )
             missing = [name for name in ("row_uid", *features) if name not in frame.columns]
             if missing:
                 raise RuntimeError(f"normalized source lost feature columns: {missing}")
@@ -472,6 +513,7 @@ def _fit_preprocessor(
     membership: _MembershipIndex,
     config: dict[str, Any],
     work_dir: Path,
+    progress_callback: PreparationProgressCallback | None = None,
 ) -> tuple[FeaturePreprocessor, Any]:
     features = list(source.proof.feature_names)
     builder_context = StreamingFeaturePreprocessor(
@@ -485,8 +527,14 @@ def _fit_preprocessor(
     )
     sample = None
     with builder_context as builder:
+        if progress_callback is not None:
+            progress_callback({"phase": "imputation", "rows": 0})
         for uids, values, labels, partitions, _frame in _iter_train_batches(
-            source, membership, features
+            source,
+            membership,
+            features,
+            phase="imputation",
+            progress_callback=progress_callback,
         ):
             builder.inspect_batch(
                 uids,
@@ -497,8 +545,14 @@ def _fit_preprocessor(
                 membership=partitions,
             )
         builder.finalize_imputation()
+        if progress_callback is not None:
+            progress_callback({"phase": "anova", "rows": 0})
         for uids, values, labels, partitions, _frame in _iter_train_batches(
-            source, membership, features
+            source,
+            membership,
+            features,
+            phase="anova",
+            progress_callback=progress_callback,
         ):
             builder.accumulate_anova_batch(
                 uids,
@@ -509,8 +563,14 @@ def _fit_preprocessor(
                 membership=partitions,
             )
         builder.finalize_selection()
+        if progress_callback is not None:
+            progress_callback({"phase": "calibration", "rows": 0})
         for uids, values, labels, partitions, frame in _iter_train_batches(
-            source, membership, features
+            source,
+            membership,
+            features,
+            phase="calibration",
+            progress_callback=progress_callback,
         ):
             builder.calibrate_selected_batch(
                 uids,
@@ -704,6 +764,8 @@ def estimate_preparation_disk(
 
 def _validate_source_contract_against_disk(
     prepared: PreparedDataset,
+    *,
+    progress_callback: PreparationProgressCallback | None = None,
 ) -> tuple[SourceManifest, dict[str, Any]]:
     manifest, schema, schema_fingerprint = _load_source_contract(
         Path(prepared.source_manifest_path), Path(prepared.schema_report_path)
@@ -715,6 +777,14 @@ def _validate_source_contract_against_disk(
     ):
         raise RuntimeError("prepared source provenance fingerprint mismatch")
     spec = load_registry()[prepared.dataset]
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "phase": "verification-manifest",
+                "rows": 0,
+                "relative_path": prepared.raw_root,
+            }
+        )
     rebuilt = build_source_manifest(
         Path(prepared.raw_root),
         spec,
@@ -723,17 +793,33 @@ def _validate_source_contract_against_disk(
     )
     if rebuilt.to_dict() != manifest.to_dict():
         raise RuntimeError("raw source no longer matches its source manifest")
+    def report_inspection(event: Mapping[str, object]) -> None:
+        if progress_callback is None:
+            return
+        payload = dict(event)
+        payload["phase"] = f"verification-{event.get('phase', 'scan')}"
+        progress_callback(payload)
+
     inspected = inspect_csv_dataset(
         prepared.dataset,
         Path(prepared.raw_root),
         required_columns=spec.required_columns,
+        progress_callback=(
+            report_inspection if progress_callback is not None else None
+        ),
     ).as_dict()
     if inspected != schema:
         raise RuntimeError("raw source no longer matches its schema report")
     return manifest, schema
 
 
-def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
+def verify_prepared_dataset(
+    descriptor_path: Path | str,
+    *,
+    progress_callback: PreparationProgressCallback | None = None,
+) -> PreparedDataset:
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
     supplied = Path(descriptor_path).expanduser()
     _reject_supplied_link(supplied, "prepared descriptor")
     path = supplied.resolve(strict=True)
@@ -755,7 +841,10 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
         raise RuntimeError("prepared resolved config shard manifest mismatch")
     if Path(prepared.output_dir).resolve() != Path(prepared.shard_manifest_path).resolve().parent:
         raise RuntimeError("prepared output directory mismatch")
-    _source_manifest, source_schema = _validate_source_contract_against_disk(prepared)
+    _source_manifest, source_schema = _validate_source_contract_against_disk(
+        prepared,
+        progress_callback=progress_callback,
+    )
 
     split = SplitPlan(
         strategy=str(config["split"]["strategy"]),
@@ -828,6 +917,7 @@ def verify_prepared_dataset(descriptor_path: Path | str) -> PreparedDataset:
         split_plan=split,
         preprocessing_fingerprint=prepared.preprocessing_fingerprint,
         max_rows_per_run=int(config["dataset"]["record_batch_rows"]),
+        progress_callback=progress_callback,
     )
     counts = shard["counts"]
     if (
@@ -864,8 +954,15 @@ def prepare_full_dataset(
     descriptor_path: Path | str | None = None,
     work_dir: Path | str | None = None,
     preparation_signature: str | None = None,
+    verify_on_return: bool = True,
+    progress_callback: PreparationProgressCallback | None = None,
 ) -> PreparedDataset:
     """Prepare all verified source rows into immutable Parquet shards."""
+
+    if type(verify_on_return) is not bool:
+        raise TypeError("verify_on_return must be a bool")
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
 
     template_config = Path(config_path).expanduser().resolve(strict=True)
     template_config_sha = _sha256_file(template_config)
@@ -916,7 +1013,10 @@ def prepare_full_dataset(
         }
     )
     if descriptor.exists():
-        existing = verify_prepared_dataset(descriptor)
+        existing = verify_prepared_dataset(
+            descriptor,
+            progress_callback=progress_callback,
+        )
         requested_paths = {
             "template_config_path": template_config,
             "raw_root": source_root,
@@ -963,29 +1063,47 @@ def prepare_full_dataset(
     preprocessor_path = output / "preprocessor.joblib"
     feature_manifest_path = output / "feature_manifest.json"
     source: NormalizedSource | None = None
+    prepared: PreparedDataset | None = None
     try:
+        if progress_callback is not None:
+            progress_callback({"phase": "source-plan", "rows": 0})
         source = open_normalized_source(
             config,
             path_override=source_root,
             apply_sampling_caps=False,
             work_dir=work,
+            progress_callback=progress_callback,
         )
         with source:
             _verify_source_proof(source.proof, source_manifest, schema)
-            split = build_split_plan(
-                source.iter_chunks(),
-                config,
-                split_dir,
-                max_rows_per_run=int(config["dataset"]["record_batch_rows"]),
-                source_manifest_fingerprint=source_manifest.content_sha256,
-            )
+            if progress_callback is not None:
+                progress_callback({"phase": "split", "rows": 0})
+            with closing(
+                _iter_source_chunks_with_progress(
+                    source,
+                    phase="split",
+                    progress_callback=progress_callback,
+                )
+            ) as split_chunks:
+                split = build_split_plan(
+                    split_chunks,
+                    config,
+                    split_dir,
+                    max_rows_per_run=int(config["dataset"]["record_batch_rows"]),
+                    source_manifest_fingerprint=source_manifest.content_sha256,
+                )
             with _MembershipIndex(
                 split,
                 work,
                 batch_rows=int(config["dataset"]["record_batch_rows"]),
             ) as membership:
                 processor, sample = _fit_preprocessor(
-                    source, split, membership, config, work
+                    source,
+                    split,
+                    membership,
+                    config,
+                    work,
+                    progress_callback=progress_callback,
                 )
             processor, preprocessor_sha = _publish_preprocessor(
                 processor, sample, preprocessor_path
@@ -1004,25 +1122,37 @@ def prepare_full_dataset(
             materialization = _materialization_contract(
                 processor, config, source.proof.feature_names
             )
-            shards = write_parquet_shards(
-                source.iter_chunks(),
-                split,
-                processor.selected_features,
-                output,
-                dataset_name=dataset,
-                preprocessing_fingerprint=preprocessing_fingerprint,
-                materialized_features=materialization["materialized_features"],
-                boolean_fast_path_features=materialization["configured_features"],
-                missing_boolean_fast_path_features=materialization["missing_features"],
-                shard_target_rows=int(config["dataset"]["shard_target_rows"]),
-                record_batch_rows=int(config["dataset"]["record_batch_rows"]),
-                max_rows_per_run=int(config["dataset"]["record_batch_rows"]),
-            )
+            if progress_callback is not None:
+                progress_callback({"phase": "materialization", "rows": 0})
+            with closing(
+                _iter_source_chunks_with_progress(
+                    source,
+                    phase="materialization",
+                    progress_callback=progress_callback,
+                )
+            ) as materialization_chunks:
+                shards = write_parquet_shards(
+                    materialization_chunks,
+                    split,
+                    processor.selected_features,
+                    output,
+                    dataset_name=dataset,
+                    preprocessing_fingerprint=preprocessing_fingerprint,
+                    materialized_features=materialization["materialized_features"],
+                    boolean_fast_path_features=materialization["configured_features"],
+                    missing_boolean_fast_path_features=materialization["missing_features"],
+                    shard_target_rows=int(config["dataset"]["shard_target_rows"]),
+                    record_batch_rows=int(config["dataset"]["record_batch_rows"]),
+                    max_rows_per_run=int(config["dataset"]["record_batch_rows"]),
+                )
+            if progress_callback is not None:
+                progress_callback({"phase": "verification", "rows": 0})
             verified_shard = verify_shard_manifest(
                 shards.manifest_path,
                 split_plan=split,
                 preprocessing_fingerprint=preprocessing_fingerprint,
                 max_rows_per_run=int(config["dataset"]["record_batch_rows"]),
+                progress_callback=progress_callback,
             )
             split_manifest = read_split_manifest(split)
             prepared = PreparedDataset(
@@ -1068,7 +1198,20 @@ def prepare_full_dataset(
             except RuntimeError as exc:
                 if "closed" not in str(exc):
                     raise
-    result = verify_prepared_dataset(descriptor)
+    if prepared is None:  # pragma: no cover - guarded by successful publication
+        raise RuntimeError("prepared dataset was not constructed")
+    result = (
+        verify_prepared_dataset(
+            descriptor,
+            progress_callback=progress_callback,
+        )
+        if verify_on_return
+        else prepared
+    )
+    if progress_callback is not None:
+        progress_callback(
+            {"phase": "verification", "rows": result.total_count}
+        )
     try:
         if work.exists() and not any(work.iterdir()):
             work.rmdir()

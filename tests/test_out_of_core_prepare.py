@@ -177,6 +177,8 @@ class FullDatasetPreparationTests(unittest.TestCase):
         *,
         heldout_offset: float = 0.0,
         nbaiot_feature_header: str = "mean,std",
+        verify_on_return: bool = True,
+        progress_callback=None,
     ):
         from bitguard_bnn.out_of_core.prepare import prepare_full_dataset
 
@@ -202,7 +204,86 @@ class FullDatasetPreparationTests(unittest.TestCase):
             output_dir=root / "prepared",
             descriptor_path=root / "control" / f"{dataset}.json",
             work_dir=root / "work",
+            verify_on_return=verify_on_return,
+            progress_callback=progress_callback,
         )
+
+    def test_verify_on_return_requires_a_strict_bool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(TypeError, "verify_on_return must be a bool"):
+                self._prepare(
+                    "botiot",
+                    Path(temporary),
+                    verify_on_return=1,  # type: ignore[arg-type]
+                )
+
+    def test_prepared_verification_forwards_shard_phase_and_rows(self) -> None:
+        from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
+
+        with tempfile.TemporaryDirectory() as temporary:
+            prepared = self._prepare(
+                "botiot",
+                Path(temporary),
+                verify_on_return=False,
+            )
+            events: list[dict[str, object]] = []
+
+            verified = verify_prepared_dataset(
+                prepared.descriptor_path,
+                progress_callback=lambda event: events.append(dict(event)),
+            )
+
+        shard_events = [
+            event
+            for event in events
+            if event.get("phase") == "verification-shards"
+        ]
+        self.assertTrue(shard_events)
+        self.assertEqual(shard_events[-1]["rows"], verified.total_count)
+
+    def test_preparation_reports_each_full_data_phase_with_monotonic_rows(self) -> None:
+        events: list[dict[str, object]] = []
+        expected = (
+            "source-plan",
+            "split",
+            "imputation",
+            "anova",
+            "calibration",
+            "materialization",
+            "verification",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            self._prepare(
+                "botiot",
+                Path(temporary),
+                progress_callback=lambda event: events.append(dict(event)),
+            )
+
+        first_occurrence = tuple(
+            dict.fromkeys(
+                str(event["phase"])
+                for event in events
+                if event.get("phase") in expected
+            )
+        )
+        self.assertEqual(first_occurrence, expected)
+        reported_phases = {str(event.get("phase")) for event in events}
+        self.assertTrue(
+            {
+                "verification-manifest",
+                "verification-plan",
+                "verification-validate",
+            }.issubset(reported_phases)
+        )
+        for phase in expected:
+            rows = [
+                int(event.get("rows", 0))
+                for event in events
+                if event.get("phase") == phase
+            ]
+            self.assertTrue(rows, phase)
+            self.assertEqual(rows, sorted(rows), phase)
 
     def test_nbaiot_prepare_preserves_first_source_feature_order(self) -> None:
         from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
@@ -827,7 +908,7 @@ class BootstrapPreparationStageTests(unittest.TestCase):
                 ["preflight", "environment", "acquire", "extract", "inspect", "shard"],
             )
             self.assertEqual(second["executed_stages"], ["validate"])
-            self.assertEqual(len(verification_calls), 3)
+            self.assertEqual(len(verification_calls), 2)
             self.assertEqual(len(preparation_calls), 1)
             first_descriptor, first_output, first_work = preparation_calls[0]
             first_bytes = first_descriptor.read_bytes()

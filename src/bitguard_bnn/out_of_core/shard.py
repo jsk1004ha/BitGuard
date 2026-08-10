@@ -82,6 +82,8 @@ _MEMBERSHIP_SCHEMA = pa.schema(
 )
 _COVERAGE_SCHEMA = _MEMBERSHIP_SCHEMA
 
+ShardVerificationProgressCallback = Callable[[Mapping[str, object]], None]
+
 
 @dataclass(frozen=True, slots=True)
 class ShardPlan:
@@ -6142,9 +6144,12 @@ def verify_shard_manifest(
     max_rows_per_run: int = 65_536,
     merge_fan_in: int = 32,
     merge_read_rows: int = 1_024,
+    progress_callback: ShardVerificationProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Verify immutable shard bytes, schemas, counts and exact UID coverage."""
 
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
     max_rows_per_run = _validate_positive("max_rows_per_run", max_rows_per_run)
     merge_fan_in = _validate_positive("merge_fan_in", merge_fan_in, minimum=2)
     merge_read_rows = _validate_positive("merge_read_rows", merge_read_rows)
@@ -6221,6 +6226,7 @@ def verify_shard_manifest(
         bucket_entries: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(
             list
         )
+        verified_rows = 0
         for entry_index, entry in enumerate(entries):
             if not isinstance(entry, Mapping):
                 raise RuntimeError("invalid shard manifest entry")
@@ -6266,6 +6272,18 @@ def verify_shard_manifest(
             for split, values in entry_classes.items():
                 classes[split].update(values)
             sources.update(entry_sources)
+            verified_rows += int(entry["rows"])
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": "verification-shards",
+                        "rows": verified_rows,
+                        "relative_path": str(entry["path"]),
+                        "file_index": entry_index + 1,
+                        "file_count": len(entries),
+                        "file_rows": int(entry["rows"]),
+                    }
+                )
         for bucket, bucket_values in bucket_entries.items():
             previous_max: tuple[Any, ...] | None = None
             for index, entry in enumerate(bucket_values):

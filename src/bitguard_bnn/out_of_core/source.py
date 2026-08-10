@@ -21,7 +21,7 @@ import weakref
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterable, Iterator, Sequence
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -1835,6 +1835,9 @@ def _plan_file(
     selection: _SelectionIndex | None,
     snapshots: _SnapshotStore,
     drop_columns: set[str],
+    progress_callback: Callable[[Mapping[str, object]], None] | None = None,
+    progress_rows: list[int] | None = None,
+    file_count: int = 0,
 ) -> _FilePlan:
     pinned = _pinned_stat(path)
     schema: _Schema | None = None
@@ -1864,6 +1867,20 @@ def _plan_file(
             )
         rows = len(chunk)
         budget.consume(rows)
+        if progress_callback is not None:
+            if progress_rows is None:  # pragma: no cover - internal contract
+                raise RuntimeError("source planning progress state is unavailable")
+            progress_rows[0] += rows
+            progress_callback(
+                {
+                    "phase": "source-plan",
+                    "rows": progress_rows[0],
+                    "relative_path": relative_path,
+                    "file_index": file_id + 1,
+                    "file_count": file_count,
+                    "file_rows": offset + rows,
+                }
+            )
         if rows == 0:
             continue
         positions = range(offset, offset + rows)
@@ -2277,6 +2294,7 @@ def _build_iteration_plan(
     dataset_type: str | None = None,
     *,
     work_dir: Path | None = None,
+    progress_callback: Callable[[Mapping[str, object]], None] | None = None,
 ) -> _IterationPlan:
     source = _resolve_source(config, path_override, dataset_type)
     cfg = config["dataset"]
@@ -2293,6 +2311,7 @@ def _build_iteration_plan(
     snapshots = _SnapshotStore(work_dir)
     selection: _SelectionIndex | None = None
     file_plans: list[_FilePlan] = []
+    progress_rows = [0]
     drop_columns = set(cfg.get("drop_columns", []))
     try:
         selection = (
@@ -2324,6 +2343,9 @@ def _build_iteration_plan(
                     selection=selection,
                     snapshots=snapshots,
                     drop_columns=drop_columns,
+                    progress_callback=progress_callback,
+                    progress_rows=progress_rows,
+                    file_count=len(source.files),
                 )
             )
         files = tuple(file_plans)
@@ -2781,6 +2803,7 @@ def open_normalized_source(
     path_override: Path | None = None,
     apply_sampling_caps: bool = True,
     work_dir: Path | None = None,
+    progress_callback: Callable[[Mapping[str, object]], None] | None = None,
 ) -> NormalizedSource:
     """Build one verified source plan that can drive multiple bounded passes."""
 
@@ -2790,6 +2813,7 @@ def open_normalized_source(
         path_override,
         apply_sampling_caps,
         work_dir=work_dir,
+        progress_callback=progress_callback,
     )
     try:
         return NormalizedSource(

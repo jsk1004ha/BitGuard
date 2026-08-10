@@ -115,6 +115,63 @@ class TerminalProgressTest(unittest.TestCase):
         self.assertIn("100%", rendered)
         self.assertTrue(rendered.endswith("\n"))
 
+    def test_new_stage_is_rendered_even_inside_throttle_interval(self) -> None:
+        stream = _TTY()
+        timestamps = iter((100.0, 100.001))
+        progress = TerminalProgress(
+            stream=stream,
+            min_interval=0.1,
+            clock=lambda: next(timestamps),
+        )
+
+        progress(
+            {
+                "scope": "bootstrap",
+                "status": "completed",
+                "stage": "inspect",
+                "completed": 5,
+                "total": 9,
+            }
+        )
+        progress(
+            {
+                "scope": "bootstrap",
+                "status": "started",
+                "stage": "shard",
+                "completed": 5,
+                "total": 9,
+            }
+        )
+
+        rendered = stream.getvalue()
+        self.assertIn("setup inspect", rendered)
+        self.assertIn("setup shard", rendered)
+
+    def test_shard_progress_shows_dataset_phase_and_rows(self) -> None:
+        stream = _TTY()
+        progress = TerminalProgress(stream=stream, min_interval=0.0)
+
+        progress(
+            {
+                "scope": "bootstrap",
+                "status": "advanced",
+                "stage": "shard",
+                "completed": 5,
+                "total": 9,
+                "dataset": "botiot",
+                "phase": "materialization",
+                "dataset_index": 2,
+                "dataset_count": 2,
+                "rows": 1_250_000,
+            }
+        )
+
+        rendered = stream.getvalue()
+        self.assertIn("setup shard", rendered)
+        self.assertIn("botiot", rendered)
+        self.assertIn("materialization", rendered)
+        self.assertIn("1,250,000 rows", rendered)
+
     def test_training_progress_shows_dataset_role_epoch_and_rows(self) -> None:
         stream = _TTY()
         progress = TerminalProgress(stream=stream, min_interval=0.0)

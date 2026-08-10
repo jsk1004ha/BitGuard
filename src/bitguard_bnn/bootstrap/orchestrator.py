@@ -28,7 +28,7 @@ from .inspect import (
     SchemaInspectionReport,
     inspect_csv_dataset,
 )
-from .manifest import build_source_manifest, write_source_manifest
+from .manifest import SourceManifest, build_source_manifest, write_source_manifest
 from .preflight import (
     ArchiveInspection,
     choose_compute,
@@ -68,6 +68,7 @@ class Stage:
     input_signature: Callable[[], str]
     run: Callable[[], Sequence[Path]]
     always_run: bool = False
+    completion_signature: Callable[[], str] | None = None
 
 
 class SourceContext(TypedDict):
@@ -1901,6 +1902,7 @@ def run_bootstrap(
     manifest_root = metadata_root / "manifests"
     schema_root = metadata_root / "schema"
     prepared_descriptor_root = metadata_root / "prepared"
+    preparation_retry_root = metadata_root / "preparation-retry"
     preparation_report_path = metadata_root / "preparation.json"
     training_report_path = metadata_root / "training.json"
     summary_report_path = metadata_root / "summary.json"
@@ -1915,6 +1917,7 @@ def run_bootstrap(
     executed: list[str] = []
     reused: list[str] = []
     failed_stage: str | None = None
+    recovery_stage: str | None = None
     last_completed: str | None = None
     report_persistence_error: BaseException | None = None
     lock_release_error: BaseException | None = None
@@ -1924,6 +1927,7 @@ def run_bootstrap(
     acquisition_journals: dict[str, str] = {}
     extraction_journals: dict[str, str] = {}
     prepared_datasets: dict[str, str] = {}
+    validated_prepared_datasets: dict[str, object] = {}
     trained_runs: dict[str, str] = {}
     dataset_statuses: dict[str, object] = {}
     cleanup_roots: set[Path] = {
@@ -1936,6 +1940,7 @@ def run_bootstrap(
         manifest_root,
         schema_root,
         prepared_descriptor_root,
+        preparation_retry_root,
         preparation_work_root,
         prepared_output_root,
     }
@@ -1997,7 +2002,9 @@ def run_bootstrap(
                 None if lock_release_error is None else _safe_error(lock_release_error)
             ),
             "recovery_command": (
-                _recovery(failed_stage, error, compute) if error is not None else None
+                _recovery(recovery_stage or failed_stage, error, compute)
+                if error is not None
+                else None
             ),
             "inputs": {"original": original, "resolved": options.to_dict()},
             "compute": compute,
@@ -2805,6 +2812,7 @@ def run_bootstrap(
                     return tuple(outputs)
 
                 inspect_source_tokens: dict[str, str] = {}
+                inspect_manifests: dict[str, SourceManifest] = {}
 
                 def report_inspection_progress(
                     event: Mapping[str, object],
@@ -2822,59 +2830,25 @@ def run_bootstrap(
                     )
                     progress_callback(payload)
 
-                def inspect_input_signature() -> str:
-                    source_tokens: dict[str, str] = {}
+                def build_inspect_manifests(
+                    *, phase: str
+                ) -> dict[str, SourceManifest]:
+                    built: dict[str, SourceManifest] = {}
                     for dataset_index, dataset in enumerate(options.datasets, start=1):
                         raw_root = raw_roots[dataset]
                         report_inspection_progress(
                             {
                                 "status": "advanced",
                                 "dataset": dataset,
-                                "phase": "hash",
+                                "phase": phase,
                                 "relative_path": str(raw_root),
                                 "dataset_index": dataset_index,
                                 "dataset_count": len(options.datasets),
                                 "rows": 0,
                             }
                         )
-                        source_tokens[dataset] = _tree_digest(raw_root)[0]
-                    inspect_source_tokens.clear()
-                    inspect_source_tokens.update(source_tokens)
-                    return _json_signature(
-                        {
-                            "inspection_contract": SCHEMA_INSPECTION_CONTRACT,
-                            "raw": source_tokens,
-                            "registry": {
-                                name: registry[name].to_dict()
-                                for name in options.datasets
-                            },
-                        }
-                    )
-
-                def run_inspect() -> Sequence[Path]:
-                    _ensure_durable_directory(manifest_root)
-                    _ensure_durable_directory(schema_root)
-                    outputs: list[Path] = []
-                    for dataset_index, dataset in enumerate(options.datasets, start=1):
-                        spec: DatasetSpec = registry[dataset]
-                        raw_root = raw_roots[dataset]
-                        source_token = inspect_source_tokens.get(dataset)
-                        if source_token is None:
-                            raise RuntimeError(
-                                f"inspect source digest is unavailable for {dataset}"
-                            )
-                        report_inspection_progress(
-                            {
-                                "status": "advanced",
-                                "dataset": dataset,
-                                "phase": "manifest",
-                                "relative_path": str(raw_root),
-                                "dataset_index": dataset_index,
-                                "dataset_count": len(options.datasets),
-                                "rows": 0,
-                            }
-                        )
-                        manifest = build_source_manifest(
+                        spec = registry[dataset]
+                        built[dataset] = build_source_manifest(
                             raw_root,
                             spec,
                             acquisition_method=source_context[dataset][
@@ -2884,6 +2858,63 @@ def run_bootstrap(
                                 "acquisition_url"
                             ],
                         )
+                    return built
+
+                def inspect_signature(
+                    values: Mapping[str, SourceManifest],
+                ) -> str:
+                    source_tokens = {
+                        dataset: values[dataset].content_sha256
+                        for dataset in options.datasets
+                    }
+                    return _json_signature(
+                        {
+                            "signature_contract": "bitguard.inspect-stage.v2",
+                            "inspection_contract": SCHEMA_INSPECTION_CONTRACT,
+                            "raw": source_tokens,
+                            "registry": {
+                                name: registry[name].to_dict()
+                                for name in options.datasets
+                            },
+                        }
+                    )
+
+                def inspect_input_signature() -> str:
+                    built = build_inspect_manifests(phase="manifest")
+                    source_tokens = {
+                        dataset: built[dataset].content_sha256
+                        for dataset in options.datasets
+                    }
+                    inspect_source_tokens.clear()
+                    inspect_source_tokens.update(source_tokens)
+                    inspect_manifests.clear()
+                    inspect_manifests.update(built)
+                    return inspect_signature(built)
+
+                def inspect_completion_signature() -> str:
+                    # A fresh manifest preserves the former post-inspection mutation
+                    # guard without adding a separate full-tree digest pass.
+                    return inspect_signature(
+                        build_inspect_manifests(phase="verify")
+                    )
+
+                def run_inspect() -> Sequence[Path]:
+                    _ensure_durable_directory(manifest_root)
+                    _ensure_durable_directory(schema_root)
+                    outputs: list[Path] = []
+                    for dataset in options.datasets:
+                        spec: DatasetSpec = registry[dataset]
+                        raw_root = raw_roots[dataset]
+                        source_token = inspect_source_tokens.get(dataset)
+                        if source_token is None:
+                            raise RuntimeError(
+                                f"inspect source digest is unavailable for {dataset}"
+                            )
+                        manifest = inspect_manifests.get(dataset)
+                        if manifest is None:
+                            raise RuntimeError(
+                                f"inspect source manifest is unavailable for {dataset}"
+                            )
                         manifest_path = manifest_root / f"{dataset}-{source_token}.json"
                         write_source_manifest(manifest_path, manifest)
                         inspector_arguments: dict[str, object] = {
@@ -2931,6 +2962,40 @@ def run_bootstrap(
                 preparation_signature_cache: dict[str, str] = {}
                 preparation_contract_cache: dict[str, object] | None = None
 
+                def preparation_retry_path(dataset: str) -> Path:
+                    return preparation_retry_root / f"{dataset}.json"
+
+                def preparation_retry_token(dataset: str) -> str:
+                    record = _load_journal(
+                        preparation_retry_path(dataset),
+                        "preparation retry",
+                    )
+                    if record is None:
+                        return "initial"
+                    if set(record) != {"schema_version", "dataset", "token"}:
+                        raise RuntimeError(
+                            "preparation retry record has an invalid field set"
+                        )
+                    if (
+                        record["schema_version"] != "bitguard.preparation-retry.v1"
+                        or record["dataset"] != dataset
+                        or not isinstance(record["token"], str)
+                        or not record["token"]
+                    ):
+                        raise RuntimeError("preparation retry record is invalid")
+                    return str(record["token"])
+
+                def rotate_preparation_retry_token(dataset: str) -> None:
+                    _write_json(
+                        preparation_retry_path(dataset),
+                        {
+                            "schema_version": "bitguard.preparation-retry.v1",
+                            "dataset": dataset,
+                            "token": uuid.uuid4().hex,
+                        },
+                    )
+                    preparation_signature_cache.pop(dataset, None)
+
                 def preparation_contract(*, refresh: bool = False) -> dict[str, object]:
                     nonlocal preparation_contract_cache
                     if preparation_contract_cache is not None and not refresh:
@@ -2976,9 +3041,13 @@ def run_bootstrap(
                         return cached
                     signature = _json_signature(
                         {
+                            "signature_contract": "bitguard.preparation-stage.v2",
                             "dataset": dataset,
                             "inputs": {
-                                "raw": _tree_digest(raw_roots[dataset])[0],
+                                # Inspection just sealed this cryptographic manifest;
+                                # preparation proofs and mandatory validation recheck
+                                # every raw file, so another signature-only tree pass
+                                # would provide no additional successful-run guarantee.
                                 "source_manifest": _regular_digest(
                                     Path(manifests[dataset])
                                 )[0],
@@ -2990,6 +3059,7 @@ def run_bootstrap(
                                 if contract is not None
                                 else preparation_contract(refresh=refresh)
                             ),
+                            "retry_token": preparation_retry_token(dataset),
                         }
                     )
                     if not refresh:
@@ -3014,7 +3084,10 @@ def run_bootstrap(
                 def preparation_generation(dataset: str) -> str:
                     return dataset_preparation_signature(dataset)
 
-                def preparation_disk_requirements() -> dict[str, object]:
+                def preparation_disk_requirements(
+                    *,
+                    preverified: set[str] | None = None,
+                ) -> dict[str, object]:
                     from bitguard_bnn.out_of_core.prepare import (
                         estimate_preparation_disk,
                         verify_prepared_dataset,
@@ -3039,7 +3112,8 @@ def run_bootstrap(
                                 "existing prepared descriptor is not a regular file: "
                                 f"{descriptor}"
                             )
-                        verifier(descriptor)
+                        if preverified is None or dataset not in preverified:
+                            verifier(descriptor)
                         prepared_datasets[dataset] = str(descriptor)
                         verified_existing.append(dataset)
 
@@ -3098,6 +3172,29 @@ def run_bootstrap(
                     }
 
                 preparation_disk: dict[str, object] = {}
+                validation_failed_dataset: str | None = None
+
+                def report_preparation_progress(
+                    dataset: str,
+                    dataset_index: int,
+                    event: Mapping[str, object],
+                ) -> None:
+                    if progress_callback is None:
+                        return
+                    payload = dict(event)
+                    payload.setdefault("status", "advanced")
+                    payload.update(
+                        {
+                            "scope": "bootstrap",
+                            "stage": "shard",
+                            "completed": stage_index,
+                            "total": total_stages,
+                            "dataset": dataset,
+                            "dataset_index": dataset_index,
+                            "dataset_count": len(options.datasets),
+                        }
+                    )
+                    progress_callback(payload)
 
                 def run_shard() -> Sequence[Path]:
                     nonlocal preparation_disk
@@ -3112,22 +3209,45 @@ def run_bootstrap(
                     pending = set(
                         cast(Sequence[str], preparation_disk["pending_datasets"])
                     )
-                    for dataset in options.datasets:
+                    for dataset_index, dataset in enumerate(options.datasets, start=1):
                         descriptor = prepared_descriptor_path(dataset)
                         if dataset not in pending:
                             prepared_datasets[dataset] = str(descriptor)
                             outputs.append(descriptor)
                             continue
                         generation = preparation_generation(dataset)
-                        preparer(
+                        report_preparation_progress(
+                            dataset,
+                            dataset_index,
+                            {"phase": "prepare", "rows": 0},
+                        )
+                        preparation_arguments: dict[str, object] = {
+                            "raw_root": raw_roots[dataset],
+                            "source_manifest_path": Path(manifests[dataset]),
+                            "schema_report_path": Path(schemas[dataset]),
+                            "output_dir": prepared_generation_output(dataset),
+                            "descriptor_path": descriptor,
+                            "work_dir": prepared_generation_work(dataset),
+                            "preparation_signature": generation,
+                        }
+                        if _accepts_keyword_argument(preparer, "progress_callback"):
+                            preparation_arguments["progress_callback"] = (
+                                lambda event, dataset=dataset, dataset_index=dataset_index: (
+                                    report_preparation_progress(
+                                        dataset,
+                                        dataset_index,
+                                        cast(Mapping[str, object], event),
+                                    )
+                                )
+                            )
+                        if (
+                            deps.preparer is None
+                            and _accepts_keyword_argument(preparer, "verify_on_return")
+                        ):
+                            preparation_arguments["verify_on_return"] = False
+                        cast(Callable[..., object], preparer)(
                             full_config_path(dataset),
-                            raw_root=raw_roots[dataset],
-                            source_manifest_path=Path(manifests[dataset]),
-                            schema_report_path=Path(schemas[dataset]),
-                            output_dir=prepared_generation_output(dataset),
-                            descriptor_path=descriptor,
-                            work_dir=prepared_generation_work(dataset),
-                            preparation_signature=generation,
+                            **preparation_arguments,
                         )
                         if not descriptor.is_file() or descriptor.is_symlink():
                             raise RuntimeError(
@@ -3148,14 +3268,59 @@ def run_bootstrap(
                     )
 
                 def run_validate() -> Sequence[Path]:
+                    nonlocal validation_failed_dataset
                     from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
 
                     verifier = deps.prepared_verifier or verify_prepared_dataset
                     verified: dict[str, object] = {}
-                    for dataset in options.datasets:
+                    for dataset_index, dataset in enumerate(options.datasets, start=1):
                         descriptor = prepared_descriptor_path(dataset)
-                        result = verifier(descriptor)
+                        validation_progress_failed = False
+
+                        def report_validation_progress(
+                            event: Mapping[str, object],
+                        ) -> None:
+                            nonlocal validation_progress_failed
+                            if progress_callback is None:
+                                return
+                            payload = dict(event)
+                            payload.setdefault("status", "advanced")
+                            payload.update(
+                                {
+                                    "scope": "bootstrap",
+                                    "stage": "validate",
+                                    "completed": stage_index,
+                                    "total": total_stages,
+                                    "dataset": dataset,
+                                    "dataset_index": dataset_index,
+                                    "dataset_count": len(options.datasets),
+                                }
+                            )
+                            try:
+                                progress_callback(payload)
+                            except BaseException:
+                                validation_progress_failed = True
+                                raise
+
+                        report_validation_progress(
+                            {"phase": "verification", "rows": 0}
+                        )
+                        verification_arguments: dict[str, object] = {}
+                        if _accepts_keyword_argument(verifier, "progress_callback"):
+                            verification_arguments["progress_callback"] = (
+                                report_validation_progress
+                            )
+                        try:
+                            result = cast(Callable[..., object], verifier)(
+                                descriptor,
+                                **verification_arguments,
+                            )
+                        except Exception:
+                            if not validation_progress_failed:
+                                validation_failed_dataset = dataset
+                            raise
                         prepared_datasets[dataset] = str(descriptor)
+                        validated_prepared_datasets[dataset] = result
                         if hasattr(result, "to_dict"):
                             verified[dataset] = result.to_dict()
                         else:
@@ -3163,8 +3328,18 @@ def run_bootstrap(
                                 "descriptor_path": str(descriptor),
                                 "descriptor_sha256": _regular_digest(descriptor)[0],
                             }
+                        report_validation_progress(
+                            {
+                                "phase": "verification",
+                                "rows": int(getattr(result, "total_count", 0)),
+                            }
+                        )
                     if not preparation_disk:
-                        preparation_disk.update(preparation_disk_requirements())
+                        preparation_disk.update(
+                            preparation_disk_requirements(
+                                preverified=set(verified),
+                            )
+                        )
                     _write_json(
                         preparation_report_path,
                         {
@@ -3209,10 +3384,15 @@ def run_bootstrap(
 
                 def run_train() -> Sequence[Path]:
                     from bitguard_bnn.config import load_config
-                    from bitguard_bnn.out_of_core.prepare import verify_prepared_dataset
-                    from bitguard_bnn.out_of_core.run import run_out_of_core_training
+                    from bitguard_bnn.out_of_core.prepare import (
+                        PreparedDataset,
+                        verify_prepared_dataset,
+                    )
+                    from bitguard_bnn.out_of_core.run import (
+                        _run_out_of_core_training_preverified,
+                        run_out_of_core_training,
+                    )
 
-                    verifier = deps.prepared_verifier or verify_prepared_dataset
                     persisted_statuses: Mapping[str, object] = {}
                     if (
                         options.restart_stage != "train"
@@ -3230,7 +3410,19 @@ def run_bootstrap(
                             persisted_statuses = {}
                     for dataset in training_order():
                         descriptor = prepared_descriptor_path(dataset)
-                        prepared = verifier(descriptor)
+                        if deps.trainer is not None:
+                            trainer_verifier = (
+                                deps.prepared_verifier or verify_prepared_dataset
+                            )
+                            prepared = trainer_verifier(descriptor)
+                        else:
+                            try:
+                                prepared = validated_prepared_datasets[dataset]
+                            except KeyError as error:
+                                raise RuntimeError(
+                                    "validated prepared dataset is unavailable before "
+                                    f"training: {dataset}"
+                                ) from error
                         try:
                             if options.restart_stage != "train" and _compute_uses_cpu(
                                 compute
@@ -3331,14 +3523,29 @@ def run_bootstrap(
                                     training_runtime_options["available_ram_bytes"] = (
                                         deps.training_available_ram_bytes
                                     )
-                                run_value: object = run_out_of_core_training(
-                                    resolved_path,
-                                    config=training_config,
-                                    prepared_descriptor_path=descriptor,
-                                    progress_callback=record_progress,
-                                    event_callback=progress_callback,
-                                    **training_runtime_options,
-                                )
+                                run_value: object
+                                if (
+                                    deps.prepared_verifier is None
+                                    and isinstance(prepared, PreparedDataset)
+                                ):
+                                    run_value = _run_out_of_core_training_preverified(
+                                        resolved_path,
+                                        prepared,
+                                        config=training_config,
+                                        prepared_descriptor_path=descriptor,
+                                        progress_callback=record_progress,
+                                        event_callback=progress_callback,
+                                        **training_runtime_options,
+                                    )
+                                else:
+                                    run_value = run_out_of_core_training(
+                                        resolved_path,
+                                        config=training_config,
+                                        prepared_descriptor_path=descriptor,
+                                        progress_callback=record_progress,
+                                        event_callback=progress_callback,
+                                        **training_runtime_options,
+                                    )
                             else:
                                 run_value = deps.trainer(
                                     dataset=dataset,
@@ -3500,6 +3707,7 @@ def run_bootstrap(
                         "inspect",
                         inspect_input_signature,
                         run_inspect,
+                        completion_signature=inspect_completion_signature,
                     ),
                 )
                 if preparation_enabled:
@@ -3539,7 +3747,7 @@ def run_bootstrap(
                             stage_event.update(
                                 {
                                     "dataset": first_dataset,
-                                    "phase": "hash",
+                                    "phase": "manifest",
                                     "relative_path": str(raw_roots[first_dataset]),
                                     "dataset_index": 1,
                                     "dataset_count": len(options.datasets),
@@ -3555,7 +3763,9 @@ def run_bootstrap(
                         if not reusable:
                             state.invalidate_from(stage.name, STAGE_ORDER)
                         outputs = tuple(stage.run())
-                        completion_signature = stage.input_signature()
+                        completion_signature = (
+                            stage.completion_signature or stage.input_signature
+                        )()
                         if stage.name == "shard":
                             completion_signature = preparation_signature(refresh=True)
                             if completion_signature != signature:
@@ -3634,7 +3844,47 @@ def run_bootstrap(
                 )
             except BaseException as error:
                 failed_stage = current_stage
-                primary_error = error
+                if (
+                    current_stage == "validate"
+                    and validation_failed_dataset is not None
+                ):
+                    recovery_errors: list[BaseException] = []
+                    retry_token_rotated = False
+                    try:
+                        rotate_preparation_retry_token(validation_failed_dataset)
+                        retry_token_rotated = True
+                    except BaseException as recovery_error:
+                        recovery_errors.append(recovery_error)
+                    if retry_token_rotated:
+                        recovery_stage = "shard"
+                        try:
+                            state.invalidate_from("shard", STAGE_ORDER)
+                        except BaseException as recovery_error:
+                            recovery_errors.append(recovery_error)
+                        effective = tuple(
+                            stage
+                            for stage in state.completed_stages
+                            if STAGE_ORDER.index(stage) < STAGE_ORDER.index("shard")
+                        )
+                        last_completed = effective[-1] if effective else None
+                    else:
+                        completed = state.completed_stages
+                        last_completed = completed[-1] if completed else None
+                    if recovery_errors:
+                        recovery_details = "; ".join(
+                            _safe_error(item) for item in recovery_errors
+                        )
+                        combined = RuntimeError(
+                            "Prepared dataset validation failed: "
+                            f"{_safe_error(error)}; automatic shard recovery state "
+                            f"update also failed: {recovery_details}"
+                        )
+                        combined.__cause__ = error
+                        primary_error = combined
+                    else:
+                        primary_error = error
+                else:
+                    primary_error = error
                 final_status = "failed"
         finally:
             if lock_entered:
