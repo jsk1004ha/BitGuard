@@ -13,15 +13,15 @@ jobs:
   audit:
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'security/naver-readonly-audit-20260819' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
-      - name: Fetch and inspect public CLOVA application bundles
+      - name: Test public CLOVA search APIs with harmless markers
         shell: bash
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/naver-clova-bundles"
+          ROOT="$RUNNER_TEMP/naver-clova-api"
           OUT="$ROOT/out"
-          mkdir -p "$OUT/chunks"
+          mkdir -p "$OUT/responses"
 
           cat > "$ROOT/audit.py" <<'PY'
           from __future__ import annotations
@@ -32,39 +32,60 @@ jobs:
           import re
           import time
           import urllib.error
+          import urllib.parse
           import urllib.request
           from pathlib import Path
+          from typing import Any
 
-          ROOT = Path(os.environ['RUNNER_TEMP']) / 'naver-clova-bundles'
+          ROOT = Path(os.environ['RUNNER_TEMP']) / 'naver-clova-api'
           OUT = ROOT / 'out'
-          CHUNKS = OUT / 'chunks'
-          CHUNKS.mkdir(parents=True, exist_ok=True)
+          RESPONSES = OUT / 'responses'
+          RESPONSES.mkdir(parents=True, exist_ok=True)
 
-          URLS = [
-              'https://clova.ai/_next/static/chunks/716-4bc8895918653ea2.js',
-              'https://clova.ai/_next/static/chunks/356-3dd847132a3b795f.js',
-              'https://clova.ai/_next/static/chunks/pages/index-69eb870b26bec00f.js',
-              'https://clova.ai/_next/static/chunks/891-974e99e6ac994be0.js',
-              'https://clova.ai/_next/static/chunks/205-6cdb0f0222e1fa21.js',
-              'https://clova.ai/_next/static/chunks/pages/tech-blog-731cde12a8ad2854.js',
-              'https://clova.ai/_next/static/chunks/pages/search/%5Bterm%5D-0dbd3fc5b25289ed.js',
-              'https://clova.ai/_next/static/chunks/pages/hyperclova-e015d3d516dd33fa.js',
-          ]
+          BASE = 'https://clova.ai'
+          MARKER = 'NBB_SAFE_20260819_5f6f2'
+          HTML_PROBE = MARKER + '<b data-nbb-probe="5f6f2">SAFE</b>'
+          SYNTAX_PROBE = MARKER + '["{'
+          PARAM_PROBE = MARKER + '&nbb_extra=5f6f2'
+          ORIGIN = 'https://example.invalid'
           UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/142 Safari/537.36'
-          MAX_BYTES = 8 * 1024 * 1024
-          ENDPOINT_RE = re.compile(r'''(?:https://[^"'\s]+|["'](/(?:api|graphql|search|v\d)/[^"'\s]{0,260})["'])''')
-          INTERESTING = {
-              'dangerouslySetInnerHTML': re.compile(r'dangerouslySetInnerHTML'),
-              'innerHTML': re.compile(r'\.innerHTML\s*='),
-              'router.query': re.compile(r'(?:router|query|asPath|pathname|location\.(?:search|hash|pathname))'),
-              'URLSearchParams': re.compile(r'URLSearchParams'),
-              'decodeURIComponent': re.compile(r'decodeURIComponent'),
-              'fetch': re.compile(r'\bfetch\s*\('),
-              'axios': re.compile(r'\.(?:get|post)\s*\('),
-          }
+          MAX_BYTES = 2 * 1024 * 1024
 
-          def fetch(url: str) -> tuple[int, dict[str, str], bytes, str | None]:
-              req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept-Encoding': 'identity'}, method='GET')
+          SEARCH_ENDPOINTS = [
+              ('tech-blog', '/api/techBlog', {'locale': 'ko', 'after': '', 'category': 'tech-blog'}, 'term'),
+              ('hcx-tech-blog', '/api/hcxTechBlogSearchOnly', {'locale': 'ko', 'after': '', 'category': 'tech-blog'}, 'term'),
+              ('hcx-use-case', '/api/hcxUseCaseSearchOnly', {'locale': 'ko', 'after': ''}, 'term'),
+              ('hcx-products', '/api/hcxAiProductsSearchOnly', {'locale': 'ko', 'after': ''}, 'term'),
+          ]
+          AUX_ENDPOINTS = [
+              ('popular-tags', '/api/hcxPopularTags', {'locale': 'ko'}),
+              ('use-cases', '/api/hcxUseCase', {'locale': 'ko', 'after': '', 'subCategory': ''}),
+              ('tech-blog-tag', '/api/techBlogByTag', {'locale': 'ko', 'after': '', 'category': 'tech-blog', 'tag': 'ai'}),
+          ]
+          PROBES = [
+              ('baseline', MARKER),
+              ('html', HTML_PROBE),
+              ('syntax', SYNTAX_PROBE),
+              ('parameter', PARAM_PROBE),
+          ]
+
+          request_count = 0
+          total_bytes = 0
+
+          def make_url(path: str, params: dict[str, str]) -> str:
+              return BASE + path + '?' + urllib.parse.urlencode(params, doseq=False, safe='')
+
+          def fetch(url: str, origin: str | None = None) -> tuple[int, dict[str, str], bytes, str | None]:
+              global request_count, total_bytes
+              headers = {
+                  'User-Agent': UA,
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Accept-Encoding': 'identity',
+              }
+              if origin:
+                  headers['Origin'] = origin
+              request_count += 1
+              req = urllib.request.Request(url, headers=headers, method='GET')
               try:
                   with urllib.request.urlopen(req, timeout=25) as resp:
                       body = resp.read(MAX_BYTES + 1)
@@ -77,63 +98,161 @@ jobs:
                   body = exc.read(MAX_BYTES + 1)[:MAX_BYTES]
                   result = int(exc.code), {k.lower(): v for k, v in exc.headers.items()}, body, f'HTTP {exc.code}'
               except Exception as exc:  # noqa: BLE001
-                  result = 0, {}, b'', f'{type(exc).__name__}: {exc}'
-              time.sleep(0.9)
+                  body = b''
+                  result = 0, {}, body, f'{type(exc).__name__}: {exc}'
+              total_bytes += len(body)
+              time.sleep(1.0)
               return result
 
-          def contexts(text: str, pattern: re.Pattern[str], radius: int = 700, limit: int = 30) -> list[dict[str, object]]:
-              out: list[dict[str, object]] = []
-              for match in pattern.finditer(text):
-                  out.append({
-                      'offset': match.start(),
-                      'snippet': text[max(0, match.start()-radius):min(len(text), match.end()+radius)],
-                  })
-                  if len(out) >= limit:
-                      break
+          def walk_json(value: Any, path: str = '$') -> list[tuple[str, str]]:
+              out: list[tuple[str, str]] = []
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      out.extend(walk_json(child, f'{path}.{key}'))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value[:500]):
+                      out.extend(walk_json(child, f'{path}[{index}]'))
+              elif isinstance(value, str):
+                  out.append((path, value))
               return out
 
-          records = []
-          endpoint_set: set[str] = set()
-          for index, url in enumerate(URLS, start=1):
-              status, headers, body, error = fetch(url)
-              filename = f'{index:02d}-{hashlib.sha256(url.encode()).hexdigest()[:12]}.js'
-              (CHUNKS / filename).write_bytes(body)
+          def inspect_body(body: bytes, headers: dict[str, str]) -> dict[str, Any]:
               text = body.decode('utf-8', errors='replace')
-              endpoints = []
-              for match in ENDPOINT_RE.finditer(text):
-                  value = match.group(1) or match.group(0)
-                  value = value.strip('"\'')
-                  if value not in endpoints:
-                      endpoints.append(value)
-                      endpoint_set.add(value)
-              hits = {name: contexts(text, pattern) for name, pattern in INTERESTING.items()}
+              parsed: Any = None
+              parse_error = None
+              try:
+                  parsed = json.loads(text)
+              except Exception as exc:  # noqa: BLE001
+                  parse_error = f'{type(exc).__name__}: {exc}'
+              strings = walk_json(parsed) if parsed is not None else [('$raw', text)]
+              reflections = []
+              html_fields = []
+              error_fields = []
+              sensitive_key_hits = []
+              for path, value in strings:
+                  if MARKER in value:
+                      reflections.append({'path': path, 'value': value[:2500]})
+                  if re.search(r'<(?:script|img|svg|iframe|object|embed|style|a|p|div|span|em|b)\b|on\w+\s*=|javascript:', value, re.I):
+                      html_fields.append({'path': path, 'value': value[:2500]})
+                  if re.search(r'(?:stack|traceback|graphql|syntax error|exception|internal server|wpgraphql|wordpress|query failed)', value, re.I):
+                      error_fields.append({'path': path, 'value': value[:4000]})
+              if isinstance(parsed, dict):
+                  def scan_keys(obj: Any, path: str = '$') -> None:
+                      if isinstance(obj, dict):
+                          for key, child in obj.items():
+                              if re.search(r'(?:secret|token|password|authorization|cookie|email|phone|private|draft|internal)', str(key), re.I):
+                                  sensitive_key_hits.append({'path': f'{path}.{key}', 'type': type(child).__name__})
+                              scan_keys(child, f'{path}.{key}')
+                      elif isinstance(obj, list):
+                          for index, child in enumerate(obj[:500]):
+                              scan_keys(child, f'{path}[{index}]')
+                  scan_keys(parsed)
+              return {
+                  'text_length': len(text),
+                  'sha256': hashlib.sha256(body).hexdigest(),
+                  'json_parsed': parsed is not None,
+                  'json_parse_error': parse_error,
+                  'top_level_type': type(parsed).__name__ if parsed is not None else None,
+                  'top_level_keys': sorted(parsed.keys()) if isinstance(parsed, dict) else None,
+                  'marker_reflections': reflections[:50],
+                  'html_like_fields': html_fields[:100],
+                  'error_like_fields': error_fields[:50],
+                  'sensitive_key_name_hits': sensitive_key_hits[:100],
+              }
+
+          records = []
+          counter = 0
+          for endpoint_name, path, defaults, term_name in SEARCH_ENDPOINTS:
+              for probe_name, probe_value in PROBES:
+                  params = dict(defaults)
+                  params[term_name] = probe_value
+                  url = make_url(path, params)
+                  status, headers, body, error = fetch(url)
+                  counter += 1
+                  filename = f'{counter:02d}-{endpoint_name}-{probe_name}.bin'
+                  (RESPONSES / filename).write_bytes(body)
+                  records.append({
+                      'endpoint': endpoint_name,
+                      'probe': probe_name,
+                      'url': url,
+                      'status': status,
+                      'error': error,
+                      'content_type': headers.get('content-type'),
+                      'headers': {
+                          key: headers.get(key)
+                          for key in ('access-control-allow-origin', 'access-control-allow-credentials', 'vary', 'cache-control', 'x-powered-by')
+                      },
+                      'body_file': filename,
+                      'inspection': inspect_body(body, headers),
+                  })
+
+              params = dict(defaults)
+              params[term_name] = MARKER
+              url = make_url(path, params)
+              status, headers, body, error = fetch(url, ORIGIN)
+              counter += 1
+              filename = f'{counter:02d}-{endpoint_name}-cors.bin'
+              (RESPONSES / filename).write_bytes(body)
               records.append({
+                  'endpoint': endpoint_name,
+                  'probe': 'cors',
                   'url': url,
-                  'filename': filename,
                   'status': status,
                   'error': error,
                   'content_type': headers.get('content-type'),
-                  'length': len(body),
-                  'sha256': hashlib.sha256(body).hexdigest(),
-                  'endpoints': endpoints,
-                  'interesting': {name: values for name, values in hits.items() if values},
+                  'headers': {
+                      key: headers.get(key)
+                      for key in ('access-control-allow-origin', 'access-control-allow-credentials', 'vary', 'cache-control', 'x-powered-by')
+                  },
+                  'body_file': filename,
+                  'inspection': inspect_body(body, headers),
               })
 
+          for endpoint_name, path, params in AUX_ENDPOINTS:
+              url = make_url(path, params)
+              status, headers, body, error = fetch(url, ORIGIN)
+              counter += 1
+              filename = f'{counter:02d}-{endpoint_name}.bin'
+              (RESPONSES / filename).write_bytes(body)
+              records.append({
+                  'endpoint': endpoint_name,
+                  'probe': 'baseline-cors',
+                  'url': url,
+                  'status': status,
+                  'error': error,
+                  'content_type': headers.get('content-type'),
+                  'headers': {
+                      key: headers.get(key)
+                      for key in ('access-control-allow-origin', 'access-control-allow-credentials', 'vary', 'cache-control', 'x-powered-by')
+                  },
+                  'body_file': filename,
+                  'inspection': inspect_body(body, headers),
+              })
+
+          reflected = [r for r in records if r['inspection']['marker_reflections']]
+          server_errors = [r for r in records if r['status'] >= 500 or r['inspection']['error_like_fields']]
+          cors_reflections = [r for r in records if r['headers'].get('access-control-allow-origin') == ORIGIN]
+          html_reflections = [
+              r for r in records
+              if r['inspection']['marker_reflections'] and any(MARKER in item['value'] for item in r['inspection']['html_like_fields'])
+          ]
           report = {
               'generated_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-              'safety': {'methods': ['GET'], 'authentication': False, 'state_changes': False},
-              'request_count': len(URLS),
-              'bundles': records,
-              'unique_endpoints': sorted(endpoint_set),
+              'safety': {'methods': ['GET'], 'authentication': False, 'cookies': False, 'state_changes': False},
+              'request_count': request_count,
+              'downloaded_bytes': total_bytes,
+              'marker': MARKER,
+              'origin_probe': ORIGIN,
+              'records': records,
+              'triage': {
+                  'records_with_marker_reflection': len(reflected),
+                  'records_with_marker_inside_html_like_field': len(html_reflections),
+                  'records_with_server_error_or_error_detail': len(server_errors),
+                  'records_reflecting_arbitrary_origin': len(cors_reflections),
+              },
           }
           (OUT / 'summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-          public = {
-              'audit_complete': True,
-              'requests': len(URLS),
-              'bundles_downloaded': sum(1 for item in records if item['status'] == 200),
-              'unique_endpoint_strings': len(endpoint_set),
-              'bundles_with_html_sinks': sum(1 for item in records if 'dangerouslySetInnerHTML' in item['interesting'] or 'innerHTML' in item['interesting']),
-          }
+          public = {'audit_complete': True, 'requests': request_count, **report['triage']}
           (ROOT / 'public-summary.json').write_text(json.dumps(public, indent=2), encoding='utf-8')
           print(json.dumps(public))
           PY
@@ -159,14 +278,14 @@ jobs:
           sha256sum "$ROOT/evidence.tar.gz.enc" "$ROOT/key.enc" > "$ROOT/checksums.txt"
           rm -rf "$OUT" "$ROOT/evidence.tar.gz" "$ROOT/key.bin" "$ROOT/public.pem" "$ROOT/audit.py"
 
-      - name: Upload encrypted bundle evidence
+      - name: Upload encrypted API evidence
         uses: actions/upload-artifact@v4
         with:
-          name: naver-clova-bundle-evidence-encrypted
+          name: naver-clova-api-evidence-encrypted
           path: |
-            ${{ runner.temp }}/naver-clova-bundles/evidence.tar.gz.enc
-            ${{ runner.temp }}/naver-clova-bundles/key.enc
-            ${{ runner.temp }}/naver-clova-bundles/checksums.txt
-            ${{ runner.temp }}/naver-clova-bundles/public-summary.json
+            ${{ runner.temp }}/naver-clova-api/evidence.tar.gz.enc
+            ${{ runner.temp }}/naver-clova-api/key.enc
+            ${{ runner.temp }}/naver-clova-api/checksums.txt
+            ${{ runner.temp }}/naver-clova-api/public-summary.json
           retention-days: 1
           if-no-files-found: error
