@@ -4,10 +4,7 @@ on:
   pull_request:
     branches:
       - main
-    types:
-      - opened
-      - synchronize
-      - reopened
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -16,588 +13,160 @@ jobs:
   audit:
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'security/naver-readonly-audit-20260819' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Run bounded GET-only assessment
+      - name: Fetch and inspect public CLOVA application bundles
         shell: bash
         run: |
           set -euo pipefail
-          AUDIT_ROOT="$RUNNER_TEMP/naver-audit"
-          OUT="$AUDIT_ROOT/out"
-          mkdir -p "$OUT"
+          ROOT="$RUNNER_TEMP/naver-clova-bundles"
+          OUT="$ROOT/out"
+          mkdir -p "$OUT/chunks"
 
-          cat > "$AUDIT_ROOT/audit.py" <<'PY'
+          cat > "$ROOT/audit.py" <<'PY'
           from __future__ import annotations
 
           import hashlib
           import json
           import os
           import re
-          import shutil
-          import subprocess
           import time
           import urllib.error
-          import urllib.parse
           import urllib.request
-          from dataclasses import dataclass
-          from html.parser import HTMLParser
           from pathlib import Path
-          from typing import Any
 
-          ROOT = Path(os.environ["RUNNER_TEMP"]) / "naver-audit"
-          OUT = ROOT / "out"
-          OUT.mkdir(parents=True, exist_ok=True)
-          RAW = OUT / "raw"
-          RAW.mkdir(exist_ok=True)
-          CANDIDATES = OUT / "candidate-assets"
-          CANDIDATES.mkdir(exist_ok=True)
+          ROOT = Path(os.environ['RUNNER_TEMP']) / 'naver-clova-bundles'
+          OUT = ROOT / 'out'
+          CHUNKS = OUT / 'chunks'
+          CHUNKS.mkdir(parents=True, exist_ok=True)
 
-          MARKER = "NBB_SAFE_20260819_5f6f2"
-          HTML_PROBE = MARKER + '<b data-nbb-probe="5f6f2">SAFE</b>'
-          EXEC_PROBE = (
-              MARKER
-              + '<img src=x data-nbb-exec-probe="5f6f2" '
-              + 'onerror="document.documentElement.setAttribute(\'data-nbb-exec\',\'5f6f2\')">'
-          )
-
-          SEARCH_PLAIN = "https://clova.ai/search/" + urllib.parse.quote(MARKER, safe="")
-          SEARCH_HTML = "https://clova.ai/search/" + urllib.parse.quote(HTML_PROBE, safe="")
-          SEARCH_EXEC = "https://clova.ai/search/" + urllib.parse.quote(EXEC_PROBE, safe="")
-          HASH_HTML = "https://clova.ai/#" + urllib.parse.quote(HTML_PROBE, safe="")
-          HASH_EXEC = "https://clova.ai/#" + urllib.parse.quote(EXEC_PROBE, safe="")
-
-          HTTP_TARGETS = [
-              "https://clova.ai/",
-              "https://clova.ai/tech-blog",
-              SEARCH_PLAIN,
-              SEARCH_HTML,
+          URLS = [
+              'https://clova.ai/_next/static/chunks/716-4bc8895918653ea2.js',
+              'https://clova.ai/_next/static/chunks/356-3dd847132a3b795f.js',
+              'https://clova.ai/_next/static/chunks/pages/index-69eb870b26bec00f.js',
+              'https://clova.ai/_next/static/chunks/891-974e99e6ac994be0.js',
+              'https://clova.ai/_next/static/chunks/205-6cdb0f0222e1fa21.js',
+              'https://clova.ai/_next/static/chunks/pages/tech-blog-731cde12a8ad2854.js',
+              'https://clova.ai/_next/static/chunks/pages/search/%5Bterm%5D-0dbd3fc5b25289ed.js',
+              'https://clova.ai/_next/static/chunks/pages/hyperclova-e015d3d516dd33fa.js',
           ]
-          RENDER_VECTORS = [
-              {"name": "search-path", "html_url": SEARCH_HTML, "exec_url": SEARCH_EXEC},
-              {"name": "location-hash", "html_url": HASH_HTML, "exec_url": HASH_EXEC},
-          ]
-
-          USER_AGENT = (
-              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-          )
-          MAX_HTML = 8 * 1024 * 1024
-          MAX_JS = 6 * 1024 * 1024
-          MAX_ASSETS = 20
-          DELAY = 0.9
-
-          SOURCES = {
-              "location.search": r"(?:window\.)?location\.search",
-              "location.hash": r"(?:window\.)?location\.hash",
-              "location.pathname": r"(?:window\.)?location\.pathname",
-              "document.URL": r"document\.(?:URL|documentURI)",
-              "document.referrer": r"document\.referrer",
-              "URLSearchParams": r"URLSearchParams\s*\(",
-              "message-event": r"(?:addEventListener\s*\(\s*['\"]message|onmessage\s*=)",
-              "window.name": r"window\.name",
-          }
-          SINKS = {
-              "innerHTML": r"\.innerHTML\s*=",
-              "outerHTML": r"\.outerHTML\s*=",
-              "insertAdjacentHTML": r"\.insertAdjacentHTML\s*\(",
-              "document.write": r"document\.write(?:ln)?\s*\(",
-              "dangerouslySetInnerHTML": r"dangerouslySetInnerHTML",
-              "eval": r"(?<![\w.])eval\s*\(",
-              "Function": r"(?:new\s+)?Function\s*\(",
-              "srcdoc": r"\.srcdoc\s*=|setAttribute\s*\(\s*['\"]srcdoc",
-              "DOMParser": r"new\s+DOMParser\s*\(",
-          }
-          SANITIZERS = {
-              "DOMPurify": r"DOMPurify",
-              "Sanitizer": r"new\s+Sanitizer\s*\(|\.sanitize(?:For)?\s*\(",
-              "escapeHTML": r"escapeHTML|escapeHtml|htmlEscape",
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/142 Safari/537.36'
+          MAX_BYTES = 8 * 1024 * 1024
+          ENDPOINT_RE = re.compile(r'''(?:https://[^"'\s]+|["'](/(?:api|graphql|search|v\d)/[^"'\s]{0,260})["'])''')
+          INTERESTING = {
+              'dangerouslySetInnerHTML': re.compile(r'dangerouslySetInnerHTML'),
+              'innerHTML': re.compile(r'\.innerHTML\s*='),
+              'router.query': re.compile(r'(?:router|query|asPath|pathname|location\.(?:search|hash|pathname))'),
+              'URLSearchParams': re.compile(r'URLSearchParams'),
+              'decodeURIComponent': re.compile(r'decodeURIComponent'),
+              'fetch': re.compile(r'\bfetch\s*\('),
+              'axios': re.compile(r'\.(?:get|post)\s*\('),
           }
 
-          request_count = 0
-          downloaded_bytes = 0
-
-
-          @dataclass
-          class Response:
-              requested_url: str
-              final_url: str
-              status: int
-              headers: dict[str, str]
-              body: bytes
-              error: str | None = None
-
-
-          def fetch(url: str, max_bytes: int, extra_headers: dict[str, str] | None = None) -> Response:
-              global request_count, downloaded_bytes
-              headers = {
-                  "User-Agent": USER_AGENT,
-                  "Accept-Encoding": "identity",
-                  "Accept": "text/html,application/javascript,application/json;q=0.9,*/*;q=0.8",
-              }
-              if extra_headers:
-                  headers.update(extra_headers)
-              request_count += 1
-              req = urllib.request.Request(url, headers=headers, method="GET")
+          def fetch(url: str) -> tuple[int, dict[str, str], bytes, str | None]:
+              req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept-Encoding': 'identity'}, method='GET')
               try:
                   with urllib.request.urlopen(req, timeout=25) as resp:
-                      body = resp.read(max_bytes + 1)
-                      truncated = len(body) > max_bytes
-                      body = body[:max_bytes]
-                      downloaded_bytes += len(body)
-                      result = Response(
-                          requested_url=url,
-                          final_url=resp.geturl(),
-                          status=int(resp.status),
-                          headers={k.lower(): v for k, v in resp.headers.items()},
-                          body=body,
-                          error=f"truncated at {max_bytes} bytes" if truncated else None,
-                      )
+                      body = resp.read(MAX_BYTES + 1)
+                      error = None
+                      if len(body) > MAX_BYTES:
+                          body = body[:MAX_BYTES]
+                          error = 'truncated'
+                      result = int(resp.status), {k.lower(): v for k, v in resp.headers.items()}, body, error
               except urllib.error.HTTPError as exc:
-                  body = exc.read(max_bytes + 1)[:max_bytes]
-                  downloaded_bytes += len(body)
-                  result = Response(
-                      requested_url=url,
-                      final_url=exc.geturl(),
-                      status=int(exc.code),
-                      headers={k.lower(): v for k, v in exc.headers.items()},
-                      body=body,
-                      error=f"HTTP {exc.code}",
-                  )
+                  body = exc.read(MAX_BYTES + 1)[:MAX_BYTES]
+                  result = int(exc.code), {k.lower(): v for k, v in exc.headers.items()}, body, f'HTTP {exc.code}'
               except Exception as exc:  # noqa: BLE001
-                  result = Response(url, url, 0, {}, b"", f"{type(exc).__name__}: {exc}")
-              time.sleep(DELAY)
+                  result = 0, {}, b'', f'{type(exc).__name__}: {exc}'
+              time.sleep(0.9)
               return result
 
-
-          def decode(body: bytes, headers: dict[str, str]) -> str:
-              match = re.search(r"charset=([\w.-]+)", headers.get("content-type", ""), re.I)
-              encoding = match.group(1) if match else "utf-8"
-              try:
-                  return body.decode(encoding, errors="replace")
-              except LookupError:
-                  return body.decode("utf-8", errors="replace")
-
-
-          class DocumentParser(HTMLParser):
-              def __init__(self) -> None:
-                  super().__init__(convert_charrefs=True)
-                  self.scripts: list[str] = []
-                  self.inline_scripts: list[str] = []
-                  self.probe_elements: list[dict[str, Any]] = []
-                  self.marker_attrs: list[dict[str, str]] = []
-                  self.marker_text_count = 0
-                  self.exec_seen = False
-                  self._in_script = False
-                  self._buf: list[str] = []
-
-              def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-                  values = dict(attrs)
-                  if tag.lower() == "script":
-                      if values.get("src"):
-                          self.scripts.append(values["src"] or "")
-                      else:
-                          self._in_script = True
-                          self._buf = []
-                  if values.get("data-nbb-probe") == "5f6f2":
-                      self.probe_elements.append({"tag": tag, "attrs": values})
-                  if values.get("data-nbb-exec") == "5f6f2":
-                      self.exec_seen = True
-                  for key, value in attrs:
-                      if value and MARKER in value:
-                          self.marker_attrs.append({"tag": tag, "attribute": key, "value": value[:600]})
-
-              def handle_endtag(self, tag: str) -> None:
-                  if tag.lower() == "script" and self._in_script:
-                      self.inline_scripts.append("".join(self._buf))
-                      self._in_script = False
-                      self._buf = []
-
-              def handle_data(self, data: str) -> None:
-                  if self._in_script:
-                      self._buf.append(data)
-                  self.marker_text_count += data.count(MARKER)
-
-
-          def parse_document(text: str) -> tuple[DocumentParser, str | None]:
-              parser = DocumentParser()
-              try:
-                  parser.feed(text)
-                  return parser, None
-              except Exception as exc:  # noqa: BLE001
-                  return parser, f"{type(exc).__name__}: {exc}"
-
-
-          def marker_contexts(text: str, limit: int = 8, radius: int = 220) -> list[str]:
-              contexts: list[str] = []
-              cursor = 0
-              while len(contexts) < limit:
-                  index = text.find(MARKER, cursor)
-                  if index < 0:
+          def contexts(text: str, pattern: re.Pattern[str], radius: int = 700, limit: int = 30) -> list[dict[str, object]]:
+              out: list[dict[str, object]] = []
+              for match in pattern.finditer(text):
+                  out.append({
+                      'offset': match.start(),
+                      'snippet': text[max(0, match.start()-radius):min(len(text), match.end()+radius)],
+                  })
+                  if len(out) >= limit:
                       break
-                  contexts.append(
-                      text[max(0, index - radius): min(len(text), index + len(MARKER) + radius)]
-                      .replace("\n", " ")[:1000]
-                  )
-                  cursor = index + len(MARKER)
-              return contexts
+              return out
 
-
-          def inspect_document(text: str) -> dict[str, Any]:
-              parser, error = parse_document(text)
-              return {
-                  "length": len(text),
-                  "sha256": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
-                  "literal_marker_count": text.count(MARKER),
-                  "actual_probe_elements": parser.probe_elements,
-                  "marker_attributes": parser.marker_attrs[:30],
-                  "marker_text_count": parser.marker_text_count,
-                  "exec_seen": parser.exec_seen or 'data-nbb-exec="5f6f2"' in text,
-                  "marker_contexts": marker_contexts(text),
-                  "parse_error": error,
-              }
-
-
-          def find_chrome() -> str | None:
-              for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
-                  if path := shutil.which(name):
-                      return path
-              return None
-
-
-          def render(url: str, label: str) -> tuple[dict[str, Any], str]:
-              chrome = find_chrome()
-              if not chrome:
-                  return {"available": False, "error": "Chrome not found"}, ""
-              profile = ROOT / f"chrome-{hashlib.sha256(label.encode()).hexdigest()[:8]}"
-              cmd = [
-                  chrome,
-                  "--headless=new",
-                  "--no-sandbox",
-                  "--disable-gpu",
-                  "--disable-dev-shm-usage",
-                  "--disable-background-networking",
-                  "--disable-component-update",
-                  "--disable-sync",
-                  "--metrics-recording-only",
-                  "--no-first-run",
-                  f"--user-data-dir={profile}",
-                  "--virtual-time-budget=7000",
-                  "--dump-dom",
-                  url,
-              ]
-              try:
-                  proc = subprocess.run(cmd, capture_output=True, text=True, timeout=50, check=False)
-                  dom = proc.stdout
-                  return {
-                      "available": True,
-                      "returncode": proc.returncode,
-                      "inspection": inspect_document(dom),
-                      "stderr_tail": proc.stderr[-1200:] if proc.returncode else None,
-                  }, dom
-              except Exception as exc:  # noqa: BLE001
-                  return {"available": True, "error": f"{type(exc).__name__}: {exc}"}, ""
-
-
-          def allowed_asset(url: str) -> bool:
-              parsed = urllib.parse.urlsplit(url)
-              if parsed.scheme != "https" or not parsed.hostname:
-                  return False
-              host = parsed.hostname.lower()
-              return host == "clova.ai" or host.endswith(".clova.ai") or host.endswith(".pstatic.net")
-
-
-          def hits(text: str, patterns: dict[str, str], limit: int = 8) -> dict[str, list[dict[str, Any]]]:
-              output: dict[str, list[dict[str, Any]]] = {}
-              for name, pattern in patterns.items():
-                  items: list[dict[str, Any]] = []
-                  for match in re.finditer(pattern, text, re.I):
-                      items.append(
-                          {
-                              "offset": match.start(),
-                              "snippet": text[max(0, match.start() - 220): min(len(text), match.end() + 320)]
-                              .replace("\n", " ")[:1100],
-                          }
-                      )
-                      if len(items) >= limit:
-                          break
-                  if items:
-                      output[name] = items
-              return output
-
-
-          def offsets(found: dict[str, list[dict[str, Any]]]) -> list[int]:
-              return [item["offset"] for values in found.values() for item in values]
-
-
-          def min_distance(source: dict[str, list[dict[str, Any]]], sink: dict[str, list[dict[str, Any]]]) -> int | None:
-              left = offsets(source)
-              right = offsets(sink)
-              if not left or not right:
-                  return None
-              return min(abs(a - b) for a in left for b in right)
-
-
-          pages: list[dict[str, Any]] = []
-          asset_urls: list[str] = []
-          inline_candidates: list[dict[str, Any]] = []
-
-          for page_index, target in enumerate(HTTP_TARGETS, start=1):
-              response = fetch(target, MAX_HTML)
-              text = decode(response.body, response.headers)
-              (RAW / f"page-{page_index:02d}.html").write_text(text, encoding="utf-8")
-              parser, parse_error = parse_document(text)
-              for src in parser.scripts:
-                  resolved = urllib.parse.urljoin(response.final_url, src)
-                  if allowed_asset(resolved) and resolved not in asset_urls:
-                      asset_urls.append(resolved)
-              for inline_index, block in enumerate(parser.inline_scripts):
-                  source = hits(block, SOURCES)
-                  sink = hits(block, SINKS)
-                  if source or sink:
-                      inline_candidates.append(
-                          {
-                              "page": response.final_url,
-                              "index": inline_index,
-                              "length": len(block),
-                              "sha256": hashlib.sha256(block.encode()).hexdigest(),
-                              "sources": source,
-                              "sinks": sink,
-                              "sanitizers": hits(block, SANITIZERS),
-                              "minimum_distance": min_distance(source, sink),
-                          }
-                      )
-              pages.append(
-                  {
-                      "requested_url": target,
-                      "final_url": response.final_url,
-                      "status": response.status,
-                      "error": response.error,
-                      "content_type": response.headers.get("content-type"),
-                      "body_length": len(response.body),
-                      "body_sha256": hashlib.sha256(response.body).hexdigest(),
-                      "security_headers": {
-                          key: response.headers.get(key)
-                          for key in (
-                              "content-security-policy",
-                              "strict-transport-security",
-                              "x-content-type-options",
-                              "referrer-policy",
-                              "permissions-policy",
-                              "cross-origin-opener-policy",
-                              "cross-origin-resource-policy",
-                          )
-                      },
-                      "inspection": inspect_document(text),
-                      "parse_error": parse_error,
-                      "script_count": len(parser.scripts),
-                  }
-              )
-
-          rendered_vectors: list[dict[str, Any]] = []
-          for vector in RENDER_VECTORS:
-              html_result, html_dom = render(vector["html_url"], vector["name"] + "-html")
-              if html_dom:
-                  (RAW / f"rendered-{vector['name']}-html.html").write_text(html_dom, encoding="utf-8")
-                  parsed, _ = parse_document(html_dom)
-                  for src in parsed.scripts:
-                      resolved = urllib.parse.urljoin(vector["html_url"], src)
-                      if allowed_asset(resolved) and resolved not in asset_urls:
-                          asset_urls.append(resolved)
-              actual_html_element = bool(
-                  ((html_result.get("inspection") or {}).get("actual_probe_elements") or [])
-              )
-              exec_result: dict[str, Any] | None = None
-              if actual_html_element:
-                  exec_result, exec_dom = render(vector["exec_url"], vector["name"] + "-exec")
-                  if exec_dom:
-                      (RAW / f"rendered-{vector['name']}-exec.html").write_text(exec_dom, encoding="utf-8")
-              rendered_vectors.append(
-                  {
-                      "name": vector["name"],
-                      "html_url": vector["html_url"],
-                      "html_result": html_result,
-                      "conditional_exec_test_performed": actual_html_element,
-                      "exec_url": vector["exec_url"] if actual_html_element else None,
-                      "exec_result": exec_result,
-                  }
-              )
-
-          assets: list[dict[str, Any]] = []
-          for index, url in enumerate(asset_urls[:MAX_ASSETS], start=1):
-              response = fetch(url, MAX_JS)
-              text = decode(response.body, response.headers)
-              source = hits(text, SOURCES)
-              sink = hits(text, SINKS)
-              sanitizer = hits(text, SANITIZERS)
-              distance = min_distance(source, sink)
-              endpoints = sorted(
-                  set(
-                      re.findall(r"https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text)
-                      + re.findall(r"['\"](/(?:api|graphql|search|v\d)/[^'\"\s]{0,260})['\"]", text)
-                  )
-              )[:160]
-              maps = re.findall(r"sourceMappingURL=([^\s*]+)", text)[:15]
-              result = {
-                  "url": url,
-                  "status": response.status,
-                  "error": response.error,
-                  "content_type": response.headers.get("content-type"),
-                  "length": len(response.body),
-                  "sha256": hashlib.sha256(response.body).hexdigest(),
-                  "sources": source,
-                  "sinks": sink,
-                  "sanitizers": sanitizer,
-                  "minimum_distance": distance,
-                  "endpoint_candidates": endpoints,
-                  "source_maps": maps,
-              }
-              assets.append(result)
-              if source and sink:
-                  filename = f"candidate-{index:02d}-{hashlib.sha256(url.encode()).hexdigest()[:10]}.js"
-                  (CANDIDATES / filename).write_bytes(response.body)
-
-          cors: list[dict[str, Any]] = []
-          test_origin = "https://example.invalid"
-          for target in HTTP_TARGETS:
-              response = fetch(target, 512 * 1024, {"Origin": test_origin})
-              cors.append(
-                  {
-                      "url": target,
-                      "status": response.status,
-                      "acao": response.headers.get("access-control-allow-origin"),
-                      "acac": response.headers.get("access-control-allow-credentials"),
-                      "vary": response.headers.get("vary"),
-                  }
-              )
-
-          source_sink_assets = [item for item in assets if item["sources"] and item["sinks"]]
-          close_assets = [
-              item
-              for item in source_sink_assets
-              if item["minimum_distance"] is not None and item["minimum_distance"] <= 5000
-          ]
-          html_injection_vectors = [
-              item
-              for item in rendered_vectors
-              if ((item.get("html_result") or {}).get("inspection") or {}).get("actual_probe_elements")
-          ]
-          exec_vectors = [
-              item
-              for item in rendered_vectors
-              if (((item.get("exec_result") or {}).get("inspection") or {}).get("exec_seen"))
-          ]
-          reflected_cors = [item for item in cors if item.get("acao") == test_origin]
+          records = []
+          endpoint_set: set[str] = set()
+          for index, url in enumerate(URLS, start=1):
+              status, headers, body, error = fetch(url)
+              filename = f'{index:02d}-{hashlib.sha256(url.encode()).hexdigest()[:12]}.js'
+              (CHUNKS / filename).write_bytes(body)
+              text = body.decode('utf-8', errors='replace')
+              endpoints = []
+              for match in ENDPOINT_RE.finditer(text):
+                  value = match.group(1) or match.group(0)
+                  value = value.strip('"\'')
+                  if value not in endpoints:
+                      endpoints.append(value)
+                      endpoint_set.add(value)
+              hits = {name: contexts(text, pattern) for name, pattern in INTERESTING.items()}
+              records.append({
+                  'url': url,
+                  'filename': filename,
+                  'status': status,
+                  'error': error,
+                  'content_type': headers.get('content-type'),
+                  'length': len(body),
+                  'sha256': hashlib.sha256(body).hexdigest(),
+                  'endpoints': endpoints,
+                  'interesting': {name: values for name, values in hits.items() if values},
+              })
 
           report = {
-              "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "audit_type": "bounded unauthenticated GET-only assessment",
-              "safety": {
-                  "authentication_or_cookies": False,
-                  "state_changing_methods": False,
-                  "personal_data_requested": False,
-                  "methods": ["GET"],
-                  "conditional_script_probe": "benign DOM attribute mutation only; executed solely after confirmed harmless HTML element injection",
-                  "marker": MARKER,
-              },
-              "request_count_explicit": request_count,
-              "downloaded_bytes_explicit": downloaded_bytes,
-              "http_targets": HTTP_TARGETS,
-              "pages": pages,
-              "rendered_vectors": rendered_vectors,
-              "cors": cors,
-              "assets_discovered": len(asset_urls),
-              "assets_downloaded": len(assets),
-              "assets": assets,
-              "inline_candidates": inline_candidates,
-              "triage": {
-                  "source_sink_assets": len(source_sink_assets),
-                  "source_sink_assets_within_5000_bytes": len(close_assets),
-                  "actual_html_injection_vectors": len(html_injection_vectors),
-                  "confirmed_benign_script_execution_vectors": len(exec_vectors),
-                  "arbitrary_origin_cors_reflections": len(reflected_cors),
-              },
+              'generated_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'safety': {'methods': ['GET'], 'authentication': False, 'state_changes': False},
+              'request_count': len(URLS),
+              'bundles': records,
+              'unique_endpoints': sorted(endpoint_set),
           }
-          (OUT / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-
-          evidence = [
-              "# NAVER CLOVA bounded audit evidence",
-              "",
-              f"Generated: {report['generated_at_utc']}",
-              f"Explicit HTTP requests: {request_count}",
-              f"Explicit bytes downloaded: {downloaded_bytes}",
-              "Authentication/cookies: none",
-              "Methods: GET only",
-              "State changes/personal-data access: none",
-              "",
-              "## Automated triage",
-              f"- Source+sink assets: {len(source_sink_assets)}",
-              f"- Source+sink proximity <= 5000 bytes: {len(close_assets)}",
-              f"- Harmless HTML injection vectors: {len(html_injection_vectors)}",
-              f"- Confirmed benign script-execution vectors: {len(exec_vectors)}",
-              f"- Reflected arbitrary Origin responses: {len(reflected_cors)}",
-              "",
-              "This is candidate generation. A reportable vulnerability requires manual data-flow and impact validation.",
-          ]
-          (OUT / "evidence.md").write_text("\n".join(evidence) + "\n", encoding="utf-8")
-
-          public_summary = {
-              "audit_complete": True,
-              "explicit_requests": request_count,
-              "pages": len(pages),
-              "assets_downloaded": len(assets),
-              "source_sink_candidates": len(source_sink_assets),
-              "close_source_sink_candidates": len(close_assets),
-              "html_injection_vectors": len(html_injection_vectors),
-              "confirmed_exec_vectors": len(exec_vectors),
-              "reflected_cors": len(reflected_cors),
+          (OUT / 'summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+          public = {
+              'audit_complete': True,
+              'requests': len(URLS),
+              'bundles_downloaded': sum(1 for item in records if item['status'] == 200),
+              'unique_endpoint_strings': len(endpoint_set),
+              'bundles_with_html_sinks': sum(1 for item in records if 'dangerouslySetInnerHTML' in item['interesting'] or 'innerHTML' in item['interesting']),
           }
-          (ROOT / "public-summary.json").write_text(json.dumps(public_summary, indent=2), encoding="utf-8")
-          print(json.dumps(public_summary))
+          (ROOT / 'public-summary.json').write_text(json.dumps(public, indent=2), encoding='utf-8')
+          print(json.dumps(public))
           PY
 
-          python3 "$AUDIT_ROOT/audit.py"
-
-          tar -C "$OUT" -czf "$AUDIT_ROOT/evidence.tar.gz" .
-          openssl rand 32 > "$AUDIT_ROOT/key.bin"
-          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
-            -in "$AUDIT_ROOT/evidence.tar.gz" \
-            -out "$AUDIT_ROOT/evidence.tar.gz.enc" \
-            -pass file:"$AUDIT_ROOT/key.bin"
-
-          cat > "$AUDIT_ROOT/public.pem" <<'PEM'
+          python3 "$ROOT/audit.py"
+          tar -C "$OUT" -czf "$ROOT/evidence.tar.gz" .
+          openssl rand 32 > "$ROOT/key.bin"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$ROOT/evidence.tar.gz" -out "$ROOT/evidence.tar.gz.enc" -pass file:"$ROOT/key.bin"
+          cat > "$ROOT/public.pem" <<'PEM'
           -----BEGIN PUBLIC KEY-----
-          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAuYxNFglspVUuZ+dkHr6N
-          cWTGyrV9SB3oqa7TkEPKwDEz4zy37eiu2iXcMtHw9LSeiur8uyTwaRGc9io76+WB
-          DYvAyXUzVgGpsK5Q93dJPCh0f6I9ZQEK3j8sw79+go1qtKco9xcx08swZgZVhB7c
-          MOUy2M9TpbE3/oZUlW6sUQUJC2Bk87mrJk6ebZAviKIfeKcTsLq4ck9+1MFJ/xIS
-          yOdyu7Os616z/TKKy7Qf9d0DyZ1fyCBccIlwZpw6buGv2tk8FPceCq9Oudod3DnS
-          nHjShVfVeetF96eILhLaGNVVNgwHzIIKXqT4Fw7e0ujRQPktDR1XGdfhLzkPzcvh
-          fPqGUbq64sx26MmkeNYP/OJYV5NyzcC5BX8/uWNJDH5cds6emLeNkkgEABrGrBo/
-          r9NyEcZQwlva6ct4h1l5zN0OmcZK549O0u4oYHNE8kk5g3T7rT2gn01mrMtif8D1
-          4hzvF+NaC1jVUnxIE/CG41F9qaBrEyaEnFG5WYVplWxZAgMBAAE=
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAu9ZB1cO7Xoi8jMR0XGgd
+          qHKKqUkz+hSyrBFdvFJ5ca/yo7yeKN0ZqRumi99Sbl4v49jTT7oF6s1YDrNpjRWS
+          iWgVt4FhOo/8fbs8ZOQDOUZQLqWr0zTbvrmXnG5uMTn5dmOlE5MaWiQA0CvxUuXK
+          chNicVzG6/kBSv6iHZNhw3gKuTFbN0httgqss4AKkXNgl3UPhEHEQEhw241o+PxX
+          0vzVqE0kFDNlkvVzOX1s/8w03qQwDCHI7SpqwWAXJP/2F6Av4VzXr95jwUE/Icy2
+          jUxapf3tjpD47NpGAhtQRukIF/fAFA6wfSpveEYgHKctn9bxfLZriKWGKzXCPzB9
+          oBpU5mnToaMAHvQABbeWDRpbHeVm3TkVgXNq/qGJhmEsqP1O80yiEyHAUFD0XINZ
+          KA4DTlLuLmM9piz9r9VNZEakL9Co+yiWtq5CdLy+nwh205z2/vT55keYBzonJiAS
+          md2fazTVTarygfyb+it15LkUN3sZzAMJVpuX4OY0H1h1AgMBAAE=
           -----END PUBLIC KEY-----
           PEM
+          openssl pkeyutl -encrypt -pubin -inkey "$ROOT/public.pem" -in "$ROOT/key.bin" -out "$ROOT/key.enc" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          sha256sum "$ROOT/evidence.tar.gz.enc" "$ROOT/key.enc" > "$ROOT/checksums.txt"
+          rm -rf "$OUT" "$ROOT/evidence.tar.gz" "$ROOT/key.bin" "$ROOT/public.pem" "$ROOT/audit.py"
 
-          openssl pkeyutl -encrypt -pubin \
-            -inkey "$AUDIT_ROOT/public.pem" \
-            -in "$AUDIT_ROOT/key.bin" \
-            -out "$AUDIT_ROOT/key.enc" \
-            -pkeyopt rsa_padding_mode:oaep \
-            -pkeyopt rsa_oaep_md:sha256
-
-          sha256sum "$AUDIT_ROOT/evidence.tar.gz.enc" "$AUDIT_ROOT/key.enc" > "$AUDIT_ROOT/checksums.txt"
-          rm -rf "$OUT" "$AUDIT_ROOT/evidence.tar.gz" "$AUDIT_ROOT/key.bin" "$AUDIT_ROOT/public.pem" "$AUDIT_ROOT/audit.py"
-
-      - name: Upload encrypted evidence only
+      - name: Upload encrypted bundle evidence
         uses: actions/upload-artifact@v4
         with:
-          name: naver-readonly-audit-encrypted
+          name: naver-clova-bundle-evidence-encrypted
           path: |
-            ${{ runner.temp }}/naver-audit/evidence.tar.gz.enc
-            ${{ runner.temp }}/naver-audit/key.enc
-            ${{ runner.temp }}/naver-audit/checksums.txt
-            ${{ runner.temp }}/naver-audit/public-summary.json
-          if-no-files-found: error
+            ${{ runner.temp }}/naver-clova-bundles/evidence.tar.gz.enc
+            ${{ runner.temp }}/naver-clova-bundles/key.enc
+            ${{ runner.temp }}/naver-clova-bundles/checksums.txt
+            ${{ runner.temp }}/naver-clova-bundles/public-summary.json
           retention-days: 1
+          if-no-files-found: error
