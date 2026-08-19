@@ -1,0 +1,22 @@
+name: NAVER read-only audit runner
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'security/naver-readonly-audit-20260819' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Confirm public runner
+        run: echo '{"runner_ready":true}'
