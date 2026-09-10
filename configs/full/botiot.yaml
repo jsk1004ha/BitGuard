@@ -19,7 +19,7 @@ dataset:
   raw_attack_column: subcategory
   device_column: saddr
   time_column: stime
-  drop_columns: [pkSeqID, seq, saddr, daddr, sport, dport, smac, dmac]
+  drop_columns: [category, label, subcategory, attack, pkSeqID, seq, saddr, daddr, sport, dport, smac, dmac]
 
 split:
   strategy: time
@@ -47,24 +47,29 @@ model:
   dropout: 0.05
   binary_first_layer: true
   gate_temperature: 1.0
+  minimum_active_fraction: 0.5
 
 loss:
   type: focal
   focal_gamma: 2.0
   class_weighted: true
   lambda_feature: 0.01
+  feature_penalty_warmup_fraction: 0.05
+  feature_penalty_ramp_fraction: 0.15
   beta_fn: 0.25
   gamma_fp: 0.05
+  distillation_alpha: 0.0
 
 training:
   epochs: 30
   batch_size: 2048
   learning_rate: 0.001
   weight_decay: 0.0001
-  patience: 6
+  patience: 10
   num_workers: 4
   device: auto
   amp: true
+  selection_weights: {macro_f1: 0.4, macro_auprc: 0.2, attack_recall: 0.4}
 
 cascade:
   enabled: false
@@ -90,3 +95,17 @@ evaluation:
   make_plots: true
   benchmark_warmup: 50
   benchmark_repeats: 500
+  deployment_candidate:
+    enabled: true
+    required_classes: [benign, flood_like, exfil_like]
+    min_required_class_support: 100
+    min_required_class_recall: 0.85
+    high_risk_classes: [flood_like, exfil_like]
+    min_high_risk_recall: 0.95
+    min_balanced_accuracy: 0.90
+    min_macro_f1: 0.88
+    fixed_fpr_target: 0.001
+    min_attack_recall_at_fixed_fpr: 0.90
+    max_observed_benign_fpr: 0.001
+    max_ece: 0.03
+    min_active_groups: 8

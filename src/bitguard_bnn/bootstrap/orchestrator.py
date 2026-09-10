@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import inspect as python_inspect
 import json
+import math
 import os
 import platform
 import re
@@ -16,9 +17,13 @@ import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral, Real
 from pathlib import Path, PurePosixPath
 from typing import Any, TypedDict, cast
 
+from bitguard_bnn.deployment_quality import assess_deployment_candidate
+
+from . import inspect as inspect_module
 from .cleanup import inspection_command, scan_cleanup_debt
 from .download import DownloadResult, download_file
 from .extract import ExtractionResult, extract_rar, extract_zip
@@ -219,12 +224,8 @@ def _regular_digest(path: Path) -> tuple[str, int]:
             size += len(chunk)
         opened = os.fstat(stream.fileno())
     final = path.lstat()
-    identity = lambda item: (
-        item.st_dev,
-        item.st_ino,
-        item.st_size,
-        item.st_mtime_ns,
-    )
+    def identity(item: os.stat_result) -> tuple[int, int, int, int]:
+        return item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns
     if identity(first) != identity(opened) or identity(first) != identity(final):
         raise RuntimeError(f"Bootstrap source changed while it was hashed: {path}")
     return digest.hexdigest(), size
@@ -391,8 +392,281 @@ def _artifact_graph_snapshot(
     return {name: _artifact_path_snapshot(root, path) for name, path in paths.items()}
 
 
+_DEPLOYMENT_QUALITY_CHECKS = frozenset(
+    {
+        "macro_f1",
+        "balanced_accuracy",
+        "required_class_support",
+        "required_class_recall",
+        "high_risk_recall",
+        "fixed_fpr_attack_recall",
+        "fixed_fpr_benign_fpr",
+        "ece",
+        "active_groups",
+    }
+)
+_DEPLOYMENT_POLICY_KEYS = frozenset(
+    {
+        "enabled",
+        "required_classes",
+        "min_required_class_support",
+        "min_required_class_recall",
+        "high_risk_classes",
+        "min_high_risk_recall",
+        "min_balanced_accuracy",
+        "min_macro_f1",
+        "fixed_fpr_target",
+        "min_attack_recall_at_fixed_fpr",
+        "max_observed_benign_fpr",
+        "max_ece",
+        "min_active_groups",
+    }
+)
+_DEPLOYMENT_POLICY_PROBABILITIES = frozenset(
+    {
+        "min_required_class_recall",
+        "min_high_risk_recall",
+        "min_balanced_accuracy",
+        "min_macro_f1",
+        "fixed_fpr_target",
+        "min_attack_recall_at_fixed_fpr",
+        "max_observed_benign_fpr",
+        "max_ece",
+    }
+)
+
+
+def _finite_quality_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    normalized = float(value)
+    return normalized if math.isfinite(normalized) else None
+
+
+def _deployment_quality_policy(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping) or set(value) != _DEPLOYMENT_POLICY_KEYS:
+        return None
+    if value.get("enabled") is not True:
+        return None
+    for name in _DEPLOYMENT_POLICY_PROBABILITIES:
+        number = _finite_quality_number(value.get(name))
+        if number is None or not 0.0 <= number <= 1.0:
+            return None
+    target = _finite_quality_number(value.get("fixed_fpr_target"))
+    if target is None or target <= 0.0:
+        return None
+    for name, minimum in (
+        ("min_required_class_support", 1),
+        ("min_active_groups", 0),
+    ):
+        item = value.get(name)
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, Integral)
+            or int(item) < minimum
+        ):
+            return None
+    labels: dict[str, tuple[str, ...]] = {}
+    for name in ("required_classes", "high_risk_classes"):
+        items = value.get(name)
+        if (
+            not isinstance(items, list)
+            or not items
+            or any(not isinstance(item, str) or not item for item in items)
+            or len(set(items)) != len(items)
+        ):
+            return None
+        labels[name] = tuple(items)
+    required = set(labels["required_classes"])
+    high_risk = set(labels["high_risk_classes"])
+    if "benign" in high_risk or not high_risk.issubset(required):
+        return None
+    return value
+
+
+def _quality_bound_record(
+    checks: Mapping[str, object],
+    policy: Mapping[str, object],
+    *,
+    check_name: str,
+    bound_name: str,
+    policy_name: str,
+    minimum: bool,
+) -> bool:
+    record = checks.get(check_name)
+    if (
+        not isinstance(record, Mapping)
+        or set(record) != {"passed", "actual", bound_name}
+        or record.get("passed") is not True
+    ):
+        return False
+    actual = _finite_quality_number(record.get("actual"))
+    bound = _finite_quality_number(record.get(bound_name))
+    expected = _finite_quality_number(policy.get(policy_name))
+    if (
+        actual is None
+        or bound is None
+        or expected is None
+        or not 0.0 <= actual <= 1.0
+        or bound != expected
+    ):
+        return False
+    return actual >= bound if minimum else actual <= bound
+
+
+def _quality_label_record(
+    checks: Mapping[str, object],
+    policy: Mapping[str, object],
+    *,
+    check_name: str,
+    labels_name: str,
+    policy_name: str,
+    integer_values: bool,
+) -> bool:
+    record = checks.get(check_name)
+    if (
+        not isinstance(record, Mapping)
+        or set(record) != {"passed", "actual", "minimum"}
+        or record.get("passed") is not True
+    ):
+        return False
+    actual = record.get("actual")
+    labels = policy.get(labels_name)
+    if not isinstance(actual, Mapping) or not isinstance(labels, list):
+        return False
+    if set(actual) != set(labels):
+        return False
+    threshold = _finite_quality_number(record.get("minimum"))
+    expected = _finite_quality_number(policy.get(policy_name))
+    if threshold is None or expected is None or threshold != expected:
+        return False
+    for label in labels:
+        observed = _finite_quality_number(actual.get(label))
+        if observed is None or observed < threshold:
+            return False
+        if integer_values:
+            if not observed.is_integer():
+                return False
+        elif not 0.0 <= observed <= 1.0:
+            return False
+    return True
+
+
+def _deployment_quality_report_passes(
+    quality: object,
+    *,
+    expected_policy: Mapping[str, object] | None,
+) -> bool:
+    if (
+        not isinstance(quality, Mapping)
+        or set(quality)
+        != {
+            "format_version",
+            "eligible",
+            "status",
+            "failed_checks",
+            "checks",
+            "policy",
+        }
+        or isinstance(quality.get("format_version"), bool)
+        or quality.get("format_version") != 1
+        or quality.get("eligible") is not True
+        or quality.get("status") != "deployment_candidate"
+        or quality.get("failed_checks") != []
+    ):
+        return False
+    checks = quality.get("checks")
+    policy = _deployment_quality_policy(quality.get("policy"))
+    if (
+        not isinstance(checks, Mapping)
+        or set(checks) != _DEPLOYMENT_QUALITY_CHECKS
+        or policy is None
+        or (
+            expected_policy is not None
+            and _json_signature(policy) != _json_signature(dict(expected_policy))
+        )
+    ):
+        return False
+    minimum_checks = (
+        ("macro_f1", "min_macro_f1"),
+        ("balanced_accuracy", "min_balanced_accuracy"),
+        ("fixed_fpr_attack_recall", "min_attack_recall_at_fixed_fpr"),
+    )
+    if any(
+        not _quality_bound_record(
+            checks,
+            policy,
+            check_name=check_name,
+            bound_name="minimum",
+            policy_name=policy_name,
+            minimum=True,
+        )
+        for check_name, policy_name in minimum_checks
+    ):
+        return False
+    maximum_checks = (
+        ("fixed_fpr_benign_fpr", "max_observed_benign_fpr"),
+        ("ece", "max_ece"),
+    )
+    if any(
+        not _quality_bound_record(
+            checks,
+            policy,
+            check_name=check_name,
+            bound_name="maximum",
+            policy_name=policy_name,
+            minimum=False,
+        )
+        for check_name, policy_name in maximum_checks
+    ):
+        return False
+    if not _quality_label_record(
+        checks,
+        policy,
+        check_name="required_class_support",
+        labels_name="required_classes",
+        policy_name="min_required_class_support",
+        integer_values=True,
+    ):
+        return False
+    for check_name, labels_name, policy_name in (
+        (
+            "required_class_recall",
+            "required_classes",
+            "min_required_class_recall",
+        ),
+        ("high_risk_recall", "high_risk_classes", "min_high_risk_recall"),
+    ):
+        if not _quality_label_record(
+            checks,
+            policy,
+            check_name=check_name,
+            labels_name=labels_name,
+            policy_name=policy_name,
+            integer_values=False,
+        ):
+            return False
+    active = checks.get("active_groups")
+    minimum_active = policy.get("min_active_groups")
+    return bool(
+        isinstance(active, Mapping)
+        and set(active) == {"passed", "actual", "minimum"}
+        and active.get("passed") is True
+        and isinstance(active.get("actual"), Integral)
+        and not isinstance(active.get("actual"), bool)
+        and isinstance(active.get("minimum"), Integral)
+        and not isinstance(active.get("minimum"), bool)
+        and active.get("minimum") == minimum_active
+        and int(cast(Integral, active.get("actual")))
+        >= int(cast(Integral, active.get("minimum")))
+    )
+
+
 def _training_artifact_paths(
-    summary: Mapping[str, object], run_dir: Path
+    summary: Mapping[str, object],
+    run_dir: Path,
+    *,
+    expected_deployment_policy: Mapping[str, object] | None = None,
 ) -> dict[str, Path]:
     export = summary.get("export")
     if not isinstance(export, Mapping):
@@ -404,6 +678,37 @@ def _training_artifact_paths(
         "inference_contract": summary.get("inference_contract"),
         "export_manifest": export.get("manifest"),
     }
+    has_deployment_quality = "deployment_quality" in summary
+    has_deployment_candidate = "deployment_candidate" in summary
+    deployment_quality = summary.get("deployment_quality")
+    policy_enabled = (
+        expected_deployment_policy is not None
+        and expected_deployment_policy.get("enabled") is True
+    )
+    if policy_enabled and not (
+        has_deployment_quality and has_deployment_candidate
+    ):
+        raise RuntimeError(
+            "enabled deployment candidate policy requires a quality report"
+        )
+    if (
+        expected_deployment_policy is not None
+        and expected_deployment_policy.get("enabled") is False
+        and (has_deployment_quality or has_deployment_candidate)
+    ):
+        raise RuntimeError(
+            "disabled deployment candidate policy cannot publish a quality candidate"
+        )
+    if has_deployment_quality or has_deployment_candidate:
+        if (
+            not has_deployment_quality
+            or summary.get("deployment_candidate") is not True
+        ):
+            raise RuntimeError(
+                "training deployment quality summary is not an eligible candidate"
+            )
+        locators["deployment_quality"] = deployment_quality
+        locators["model_summary"] = run_dir / "model_summary.json"
     artifacts: dict[str, Path] = {}
     root = Path(os.path.abspath(run_dir))
     _artifact_path_snapshot(root, root, final_directory=True)
@@ -427,6 +732,56 @@ def _training_artifact_paths(
     for name, value in locators.items():
         path, _resolved = contained_path(name, value)
         artifacts[name] = path
+
+    if has_deployment_quality:
+        quality, _digest, _size, _snapshot = _read_artifact_json_record(
+            root,
+            artifacts["deployment_quality"],
+            subject="training deployment quality report",
+        )
+        if not _deployment_quality_report_passes(
+            quality,
+            expected_policy=expected_deployment_policy,
+        ):
+            raise RuntimeError(
+                "training deployment quality report did not pass eligibility checks"
+            )
+        metrics, _digest, _size, _snapshot = _read_artifact_json_record(
+            root,
+            artifacts["metrics"],
+            subject="training test metrics",
+        )
+        model_summary, _digest, _size, _snapshot = _read_artifact_json_record(
+            root,
+            artifacts["model_summary"],
+            subject="training model summary",
+        )
+        policy = (
+            expected_deployment_policy
+            if expected_deployment_policy is not None
+            else cast(
+                Mapping[str, object],
+                cast(Mapping[str, object], quality)["policy"],
+            )
+        )
+        try:
+            recalculated = assess_deployment_candidate(
+                cast(Mapping[str, object], metrics),
+                cast(Mapping[str, object], model_summary),
+                policy,
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "training deployment quality evidence cannot be reassessed"
+            ) from error
+        if (
+            not isinstance(metrics, Mapping)
+            or not isinstance(model_summary, Mapping)
+            or _json_signature(quality) != _json_signature(recalculated)
+        ):
+            raise RuntimeError(
+                "training deployment quality report does not match pinned evidence"
+            )
 
     output_dir, output_root = contained_path(
         "export output directory", export.get("output_dir"), final_directory=True
@@ -501,6 +856,8 @@ def _completed_training_status(
     descriptor: Path,
     run_dir: Path,
     summary: Mapping[str, object],
+    *,
+    expected_deployment_policy: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     summary_path = run_dir / "run_summary.json"
     pinned_summary, summary_sha256, summary_bytes, initial_summary_snapshot = (
@@ -516,7 +873,11 @@ def _completed_training_status(
     if verified_summary.get("prepared_descriptor") != str(descriptor):
         raise RuntimeError("training summary prepared descriptor locator mismatch")
     descriptor_sha256, descriptor_bytes = _regular_digest(descriptor)
-    artifact_paths = _training_artifact_paths(verified_summary, run_dir)
+    artifact_paths = _training_artifact_paths(
+        verified_summary,
+        run_dir,
+        expected_deployment_policy=expected_deployment_policy,
+    )
     initial_graph = _artifact_graph_snapshot(
         run_dir, {"run_summary": summary_path, **artifact_paths}
     )
@@ -529,7 +890,11 @@ def _completed_training_status(
         for name, path in artifact_paths.items()
         for digest, size in [_artifact_digest(run_dir, path)]
     }
-    final_paths = _training_artifact_paths(verified_summary, run_dir)
+    final_paths = _training_artifact_paths(
+        verified_summary,
+        run_dir,
+        expected_deployment_policy=expected_deployment_policy,
+    )
     if {
         name: os.path.normcase(os.path.abspath(path))
         for name, path in artifact_paths.items()
@@ -572,13 +937,25 @@ def _completed_training_status(
         "metrics": verified_summary.get("metrics"),
         "predictions": verified_summary.get("predictions"),
         "inference_contract": verified_summary.get("inference_contract"),
+        **(
+            {
+                "deployment_quality": verified_summary["deployment_quality"],
+                "deployment_candidate": True,
+            }
+            if "deployment_quality" in verified_summary
+            else {}
+        ),
         "export": verified_summary.get("export"),
         "artifacts": artifacts,
     }
 
 
 def _verified_completed_training_status(
-    dataset: str, descriptor: Path, value: object
+    dataset: str,
+    descriptor: Path,
+    value: object,
+    *,
+    expected_deployment_policy: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
     if not isinstance(value, Mapping) or value.get("status") != "completed":
         return None
@@ -614,12 +991,330 @@ def _verified_completed_training_status(
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if not isinstance(summary, Mapping):
             return None
-        expected = _completed_training_status(dataset, descriptor, run_dir, summary)
+        expected = _completed_training_status(
+            dataset,
+            descriptor,
+            run_dir,
+            summary,
+            expected_deployment_policy=expected_deployment_policy,
+        )
         if expected != dict(value):
             return None
         return expected
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
         return None
+
+
+class _TerminalRejectionIndexError(RuntimeError):
+    """Raised when the durable terminal-rejection index cannot be trusted."""
+
+
+_TERMINAL_REJECTION_INDEX_FORMAT_VERSION = 1
+_REJECTED_TRAINING_ARTIFACTS = {
+    "checkpoint": "best_model.pt",
+    "terminal_checkpoint": "last_training_state.pt",
+    "metrics": "metrics.json",
+    "model_summary": "model_summary.json",
+    "predictions": "predictions.parquet",
+    "inference_contract": "inference_contract.json",
+    "deployment_quality": "deployment_quality.json",
+    "phase_resources": "phase_resources.json",
+}
+
+
+def _terminal_rejection_index_payload(
+    datasets: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    normalized = {
+        dataset: dict(status) for dataset, status in sorted(datasets.items())
+    }
+    signed: dict[str, object] = {
+        "format_version": _TERMINAL_REJECTION_INDEX_FORMAT_VERSION,
+        "datasets": normalized,
+    }
+    return {**signed, "payload_sha256": _json_signature(signed)}
+
+
+def _read_terminal_rejection_index(
+    path: Path, *, metadata_root: Path
+) -> dict[str, dict[str, object]]:
+    if not os.path.lexists(path):
+        return {}
+    try:
+        payload, _digest, _size, _snapshot = _read_artifact_json_record(
+            metadata_root,
+            path,
+            subject="terminal rejection index",
+        )
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != {"format_version", "datasets", "payload_sha256"}
+            or isinstance(payload.get("format_version"), bool)
+            or payload.get("format_version")
+            != _TERMINAL_REJECTION_INDEX_FORMAT_VERSION
+            or not isinstance(payload.get("payload_sha256"), str)
+        ):
+            raise RuntimeError("terminal rejection index envelope is invalid")
+        datasets = payload.get("datasets")
+        if not isinstance(datasets, Mapping):
+            raise RuntimeError("terminal rejection index datasets mapping is invalid")
+        normalized: dict[str, dict[str, object]] = {}
+        for dataset, status in datasets.items():
+            if (
+                not isinstance(dataset, str)
+                or not dataset
+                or not isinstance(status, Mapping)
+                or status.get("status") != "rejected"
+                or status.get("terminal") is not True
+                or status.get("reason") != "deployment_quality"
+            ):
+                raise RuntimeError("terminal rejection index entry is invalid")
+            normalized[dataset] = dict(status)
+        signed: dict[str, object] = {
+            "format_version": _TERMINAL_REJECTION_INDEX_FORMAT_VERSION,
+            "datasets": normalized,
+        }
+        if payload.get("payload_sha256") != _json_signature(signed):
+            raise RuntimeError("terminal rejection index integrity check failed")
+        return normalized
+    except _TerminalRejectionIndexError:
+        raise
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        raise _TerminalRejectionIndexError(
+            f"Terminal rejection index is malformed or untrusted: {path}: {error}"
+        ) from error
+
+
+def _write_terminal_rejection_index(
+    path: Path, datasets: Mapping[str, Mapping[str, object]]
+) -> None:
+    try:
+        _write_json(path, _terminal_rejection_index_payload(datasets))
+    except BaseException as error:
+        raise _TerminalRejectionIndexError(
+            f"Terminal rejection index could not be published atomically: {path}: {error}"
+        ) from error
+
+
+def _updated_terminal_rejection_entries(
+    datasets: Mapping[str, Mapping[str, object]],
+    dataset: str,
+    status: Mapping[str, object] | None,
+) -> dict[str, dict[str, object]]:
+    updated = {name: dict(value) for name, value in datasets.items()}
+    if status is None:
+        updated.pop(dataset, None)
+    else:
+        updated[dataset] = dict(status)
+    return updated
+
+
+def _rejected_training_status(
+    dataset: str,
+    descriptor: Path,
+    prepared_descriptor_fingerprint: str,
+    run_dir: Path,
+    assessment_path: Path,
+    failed_checks: Sequence[str],
+    *,
+    runs_root: Path,
+    expected_deployment_policy: Mapping[str, object] | None,
+) -> dict[str, object]:
+    policy = _deployment_quality_policy(expected_deployment_policy)
+    if policy is None:
+        raise RuntimeError(
+            "deployment quality rejection requires an enabled complete policy"
+        )
+    if not prepared_descriptor_fingerprint:
+        raise RuntimeError(
+            "deployment quality rejection requires a prepared descriptor fingerprint"
+        )
+
+    root = Path(os.path.abspath(runs_root))
+    run = Path(os.path.abspath(run_dir))
+    _artifact_path_snapshot(root, run, final_directory=True)
+    if run == root:
+        raise RuntimeError("rejected training run must be below runs_root")
+
+    artifacts_paths = {
+        name: run / filename for name, filename in _REJECTED_TRAINING_ARTIFACTS.items()
+    }
+    expected_assessment = artifacts_paths["deployment_quality"]
+    if Path(os.path.abspath(assessment_path)) != expected_assessment:
+        raise RuntimeError("deployment quality rejection assessment locator is invalid")
+    if os.path.lexists(run / "run_summary.json") or os.path.lexists(run / "edge"):
+        raise RuntimeError(
+            "deployment quality rejection unexpectedly published deployment artifacts"
+        )
+
+    initial_graph = _artifact_graph_snapshot(run, artifacts_paths)
+    quality, quality_sha256, quality_bytes, quality_snapshot = (
+        _read_artifact_json_record(
+            run,
+            expected_assessment,
+            subject="rejected training deployment quality report",
+        )
+    )
+    metrics, metrics_sha256, metrics_bytes, metrics_snapshot = (
+        _read_artifact_json_record(
+            run,
+            artifacts_paths["metrics"],
+            subject="rejected training test metrics",
+        )
+    )
+    model_summary, model_summary_sha256, model_summary_bytes, model_summary_snapshot = (
+        _read_artifact_json_record(
+            run,
+            artifacts_paths["model_summary"],
+            subject="rejected training model summary",
+        )
+    )
+    if not isinstance(metrics, Mapping) or not isinstance(model_summary, Mapping):
+        raise RuntimeError("rejected training quality evidence must contain JSON objects")
+    try:
+        recalculated = assess_deployment_candidate(metrics, model_summary, policy)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "rejected training deployment quality evidence cannot be reassessed"
+        ) from error
+    recalculated_failed = recalculated.get("failed_checks")
+    if (
+        not isinstance(quality, Mapping)
+        or _json_signature(quality) != _json_signature(recalculated)
+        or recalculated.get("eligible") is not False
+        or recalculated.get("status") != "rejected"
+        or not isinstance(recalculated_failed, list)
+        or not recalculated_failed
+        or any(not isinstance(name, str) or not name for name in recalculated_failed)
+        or tuple(recalculated_failed) != tuple(failed_checks)
+    ):
+        raise RuntimeError(
+            "rejected training deployment quality report does not match pinned evidence"
+        )
+
+    pinned_json = {
+        "deployment_quality": (
+            quality,
+            quality_sha256,
+            quality_bytes,
+            quality_snapshot,
+        ),
+        "metrics": (metrics, metrics_sha256, metrics_bytes, metrics_snapshot),
+        "model_summary": (
+            model_summary,
+            model_summary_sha256,
+            model_summary_bytes,
+            model_summary_snapshot,
+        ),
+    }
+    artifacts: dict[str, dict[str, object]] = {
+        name: {
+            "path": str(artifacts_paths[name]),
+            "sha256": digest,
+            "bytes": size,
+        }
+        for name, (_payload, digest, size, _snapshot) in pinned_json.items()
+    }
+    for name, path in artifacts_paths.items():
+        if name in pinned_json:
+            continue
+        digest, size = _artifact_digest(run, path)
+        artifacts[name] = {
+            "path": str(path),
+            "sha256": digest,
+            "bytes": size,
+        }
+
+    for name, (payload, digest, size, snapshot) in pinned_json.items():
+        final_payload, final_digest, final_size, final_snapshot = (
+            _read_artifact_json_record(
+                run,
+                artifacts_paths[name],
+                subject=f"rejected training {name.replace('_', ' ')}",
+            )
+        )
+        if (
+            _json_signature(final_payload) != _json_signature(payload)
+            or final_digest != digest
+            or final_size != size
+            or final_snapshot != snapshot
+        ):
+            raise RuntimeError(
+                "rejected training quality evidence changed while it was verified"
+            )
+    if initial_graph != _artifact_graph_snapshot(run, artifacts_paths):
+        raise RuntimeError(
+            "rejected training artifact graph changed while it was verified"
+        )
+
+    descriptor_sha256, descriptor_bytes = _regular_digest(descriptor)
+    terminal_checkpoint = artifacts["terminal_checkpoint"]
+    return {
+        "status": "rejected",
+        "terminal": True,
+        "reason": "deployment_quality",
+        "dataset": dataset,
+        "descriptor": str(descriptor),
+        "descriptor_sha256": descriptor_sha256,
+        "descriptor_bytes": descriptor_bytes,
+        "prepared_descriptor_fingerprint": prepared_descriptor_fingerprint,
+        "deployment_policy_sha256": _json_signature(dict(policy)),
+        "run": str(run),
+        "checkpoint": str(artifacts_paths["checkpoint"]),
+        "terminal_checkpoint": dict(terminal_checkpoint),
+        "metrics": str(artifacts_paths["metrics"]),
+        "predictions": str(artifacts_paths["predictions"]),
+        "inference_contract": str(artifacts_paths["inference_contract"]),
+        "deployment_quality": str(expected_assessment),
+        "failed_checks": list(recalculated_failed),
+        "artifacts": artifacts,
+    }
+
+
+def _verified_rejected_training_status(
+    dataset: str,
+    descriptor: Path,
+    prepared_descriptor_fingerprint: str,
+    value: object,
+    *,
+    runs_root: Path,
+    expected_deployment_policy: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("status") != "rejected"
+        or value.get("terminal") is not True
+        or value.get("reason") != "deployment_quality"
+        or value.get("dataset") != dataset
+        or value.get("descriptor") != str(descriptor)
+        or value.get("prepared_descriptor_fingerprint")
+        != prepared_descriptor_fingerprint
+    ):
+        return None
+    run_value = value.get("run")
+    assessment_value = value.get("deployment_quality")
+    failed_checks = value.get("failed_checks")
+    if (
+        not isinstance(run_value, str)
+        or not isinstance(assessment_value, str)
+        or not isinstance(failed_checks, list)
+        or any(not isinstance(name, str) or not name for name in failed_checks)
+    ):
+        return None
+    try:
+        expected = _rejected_training_status(
+            dataset,
+            descriptor,
+            prepared_descriptor_fingerprint,
+            Path(run_value),
+            Path(assessment_value),
+            cast(list[str], failed_checks),
+            runs_root=runs_root,
+            expected_deployment_policy=expected_deployment_policy,
+        )
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        return None
+    return expected if expected == dict(value) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1138,13 +1833,14 @@ def _fsync_regular_file(path: Path) -> None:
         or bool(getattr(before, "st_reparse_tag", 0))
     ):
         raise RuntimeError(f"Durability target must be a regular file: {path}")
-    object_identity = lambda result: (
-        result.st_dev,
-        result.st_ino,
-        stat.S_IFMT(result.st_mode),
-        result.st_size,
-        result.st_mtime_ns,
-    )
+    def object_identity(result: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            result.st_dev,
+            result.st_ino,
+            stat.S_IFMT(result.st_mode),
+            result.st_size,
+            result.st_mtime_ns,
+        )
     original_mode = stat.S_IMODE(before.st_mode)
     mode_changed = False
     descriptor = -1
@@ -1509,7 +2205,8 @@ def _retained_candidate(
         )
     candidate = expected_parent / supplied.name
     current = candidate.lstat()
-    identity = lambda item: (item.st_dev, item.st_ino, item.st_mode)
+    def identity(item: os.stat_result) -> tuple[int, int, int]:
+        return item.st_dev, item.st_ino, item.st_mode
     if identity(first) != identity(current):
         raise RuntimeError(
             f"Retained journal candidate changed during validation: {candidate}"
@@ -1525,7 +2222,8 @@ def _publish_candidate(candidate: Path, destination: Path, kind: str) -> None:
     expected_mode = stat.S_IFDIR if kind == "directory" else stat.S_IFREG
     if stat.S_IFMT(initial.st_mode) != expected_mode:
         raise RuntimeError(f"Publication candidate has an invalid type: {candidate}")
-    identity = lambda item: (item.st_dev, item.st_ino, stat.S_IFMT(item.st_mode))
+    def identity(item: os.stat_result) -> tuple[int, int, int]:
+        return item.st_dev, item.st_ino, stat.S_IFMT(item.st_mode)
     if kind == "directory":
         rename_directory_noreplace(candidate, destination)
         published = destination.lstat()
@@ -1846,6 +2544,23 @@ def _recovery(
             "Inspect the environment-stage error, correct it, then rerun the original "
             "command with --restart-stage environment."
         )
+    if stage == "train" and isinstance(error, _TerminalRejectionIndexError):
+        return (
+            "The durable terminal rejection index is malformed, untrusted, or could "
+            "not be updated atomically. Inspect retained artifacts, then rerun the "
+            "original command with --restart-stage train to authorize fresh training."
+        )
+    if stage == "train":
+        from bitguard_bnn.out_of_core.run import DeploymentQualityError
+
+        if isinstance(error, DeploymentQualityError):
+            return (
+                "The completed model was rejected by the deployment quality gate. "
+                "Inspect deployment_quality.json, improve the model, data, or training "
+                "configuration, then rerun the original command with --restart-stage "
+                "train. The rejected terminal checkpoint is retained for audit and is "
+                "not eligible for automatic resume."
+            )
     if (
         stage == "train"
         and _compute_uses_cuda(compute)
@@ -1905,6 +2620,7 @@ def run_bootstrap(
     preparation_retry_root = metadata_root / "preparation-retry"
     preparation_report_path = metadata_root / "preparation.json"
     training_report_path = metadata_root / "training.json"
+    terminal_rejection_index_path = metadata_root / "terminal-rejections.json"
     summary_report_path = metadata_root / "summary.json"
     preparation_work_root = metadata_root / "preparation-work"
     prepared_output_root = options.data_root / "prepared"
@@ -1986,6 +2702,9 @@ def run_bootstrap(
             reports["preparation"] = existing_locator(preparation_report_path)
         if training_enabled:
             reports["training"] = existing_locator(training_report_path)
+            reports["terminal_rejections"] = existing_locator(
+                terminal_rejection_index_path
+            )
             reports["summary"] = existing_locator(summary_report_path)
         result: dict[str, object] = {
             "version": REPORT_FORMAT_VERSION,
@@ -2871,6 +3590,9 @@ def run_bootstrap(
                         {
                             "signature_contract": "bitguard.inspect-stage.v2",
                             "inspection_contract": SCHEMA_INSPECTION_CONTRACT,
+                            "inspection_contract_version": (
+                                inspect_module.SCHEMA_INSPECTION_CONTRACT_VERSION
+                            ),
                             "raw": source_tokens,
                             "registry": {
                                 name: registry[name].to_dict()
@@ -3005,7 +3727,6 @@ def run_bootstrap(
                         preprocess as preprocess_module,
                         quantiles as quantiles_module,
                         shard as shard_module,
-                        source as source_module,
                         split as split_module,
                     )
 
@@ -3390,6 +4111,7 @@ def run_bootstrap(
                     )
                     from bitguard_bnn.out_of_core.run import (
                         _run_out_of_core_training_preverified,
+                        DeploymentQualityError,
                         run_out_of_core_training,
                     )
 
@@ -3408,6 +4130,45 @@ def run_bootstrap(
                                     persisted_statuses = candidates
                         except (OSError, UnicodeError, json.JSONDecodeError):
                             persisted_statuses = {}
+                    try:
+                        rejection_markers = _read_terminal_rejection_index(
+                            terminal_rejection_index_path,
+                            metadata_root=metadata_root,
+                        )
+                    except _TerminalRejectionIndexError:
+                        if options.restart_stage != "train":
+                            raise
+                        rejection_markers = {}
+                        _write_terminal_rejection_index(
+                            terminal_rejection_index_path, rejection_markers
+                        )
+
+                    def publish_rejection_marker(
+                        dataset: str, status: Mapping[str, object]
+                    ) -> None:
+                        nonlocal rejection_markers
+                        updated = _updated_terminal_rejection_entries(
+                            rejection_markers, dataset, status
+                        )
+                        _write_terminal_rejection_index(
+                            terminal_rejection_index_path, updated
+                        )
+                        rejection_markers = updated
+
+                    def clear_rejection_marker(dataset: str) -> None:
+                        nonlocal rejection_markers
+                        if dataset not in rejection_markers and os.path.lexists(
+                            terminal_rejection_index_path
+                        ):
+                            return
+                        updated = _updated_terminal_rejection_entries(
+                            rejection_markers, dataset, None
+                        )
+                        _write_terminal_rejection_index(
+                            terminal_rejection_index_path, updated
+                        )
+                        rejection_markers = updated
+
                     for dataset in training_order():
                         descriptor = prepared_descriptor_path(dataset)
                         if deps.trainer is not None:
@@ -3423,6 +4184,22 @@ def run_bootstrap(
                                     "validated prepared dataset is unavailable before "
                                     f"training: {dataset}"
                                 ) from error
+                        expected_deployment_policy: Mapping[str, object] | None = None
+                        resolved_config_value = getattr(
+                            prepared, "resolved_config_path", None
+                        )
+                        if isinstance(resolved_config_value, (str, os.PathLike)):
+                            prepared_config = load_config(Path(resolved_config_value))
+                            configured_policy = prepared_config["evaluation"].get(
+                                "deployment_candidate"
+                            )
+                            if not isinstance(configured_policy, Mapping):
+                                raise RuntimeError(
+                                    "resolved training config has no deployment "
+                                    "candidate policy"
+                                )
+                            expected_deployment_policy = dict(configured_policy)
+                        prepared_fingerprint: str | None = None
                         try:
                             if options.restart_stage != "train" and _compute_uses_cpu(
                                 compute
@@ -3442,14 +4219,11 @@ def run_bootstrap(
                                         "--compute cpu --restart-stage train"
                                     )
                             completed = _verified_completed_training_status(
-                                dataset, descriptor, persisted_statuses.get(dataset)
+                                dataset,
+                                descriptor,
+                                persisted_statuses.get(dataset),
+                                expected_deployment_policy=expected_deployment_policy,
                             )
-                            if completed is not None:
-                                persisted_run = completed["run"]
-                                trained_runs[dataset] = str(persisted_run)
-                                dataset_statuses[dataset] = completed
-                                write_training_report("running")
-                                continue
                             if deps.trainer is None:
                                 prepared_payload = (
                                     prepared.to_dict()
@@ -3468,6 +4242,111 @@ def run_bootstrap(
                                     raise RuntimeError(
                                         "verified prepared descriptor has no fingerprint"
                                     )
+                                if options.restart_stage != "train":
+                                    report_status = persisted_statuses.get(dataset)
+                                    marker_status = rejection_markers.get(dataset)
+                                    persisted = (
+                                        marker_status
+                                        if marker_status is not None
+                                        else report_status
+                                    )
+                                    rejected = _verified_rejected_training_status(
+                                        dataset,
+                                        descriptor,
+                                        prepared_fingerprint,
+                                        persisted,
+                                        runs_root=options.runs_root,
+                                        expected_deployment_policy=(
+                                            expected_deployment_policy
+                                        ),
+                                    )
+                                    if rejected is not None:
+                                        dataset_statuses[dataset] = rejected
+                                        if marker_status != rejected:
+                                            publish_rejection_marker(dataset, rejected)
+                                        raise DeploymentQualityError(
+                                            "persisted deployment candidate quality "
+                                            "rejection is terminal; explicit fresh "
+                                            "training requires --restart-stage train",
+                                            run_dir=cast(str, rejected["run"]),
+                                            assessment_path=cast(
+                                                str, rejected["deployment_quality"]
+                                            ),
+                                            failed_checks=cast(
+                                                list[str], rejected["failed_checks"]
+                                            ),
+                                        )
+                                    if (
+                                        isinstance(persisted, Mapping)
+                                        and persisted.get("status") == "rejected"
+                                    ):
+                                        descriptor_sha256, descriptor_bytes = (
+                                            _regular_digest(descriptor)
+                                        )
+                                        failed_status: dict[str, object] = {
+                                            "status": "rejected",
+                                            "terminal": True,
+                                            "reason": "deployment_quality",
+                                            "dataset": dataset,
+                                            "descriptor": str(descriptor),
+                                            "descriptor_sha256": descriptor_sha256,
+                                            "descriptor_bytes": descriptor_bytes,
+                                            "prepared_descriptor_fingerprint": (
+                                                prepared_fingerprint
+                                            ),
+                                            "error": (
+                                                "persisted terminal deployment quality "
+                                                "evidence failed verification; explicit "
+                                                "fresh training requires --restart-stage "
+                                                "train"
+                                            ),
+                                        }
+                                        dataset_statuses[dataset] = failed_status
+                                        publish_rejection_marker(dataset, failed_status)
+                                        raise DeploymentQualityError(
+                                            "persisted terminal deployment quality "
+                                            "evidence failed verification; explicit fresh "
+                                            "training requires --restart-stage train",
+                                            run_dir=options.runs_root,
+                                            assessment_path=(
+                                                options.runs_root
+                                                / "deployment_quality.json"
+                                            ),
+                                            failed_checks=(),
+                                        )
+                            if options.restart_stage != "train" and _compute_uses_cpu(
+                                compute
+                            ):
+                                prior_resume = _persisted_training_resume(
+                                    persisted_statuses.get(dataset),
+                                    runs_root=options.runs_root,
+                                )
+                                if (
+                                    prior_resume is not None
+                                    and prior_resume.device_type == "cuda"
+                                ):
+                                    raise RuntimeError(
+                                        "streaming checkpoint device type mismatch: "
+                                        "the persisted optimizer checkpoint was created "
+                                        "on CUDA; explicitly restart fresh training with "
+                                        "--compute cpu --restart-stage train"
+                                    )
+                            completed = _verified_completed_training_status(
+                                dataset,
+                                descriptor,
+                                persisted_statuses.get(dataset),
+                                expected_deployment_policy=expected_deployment_policy,
+                            )
+                            if completed is not None:
+                                persisted_run = completed["run"]
+                                trained_runs[dataset] = str(persisted_run)
+                                dataset_statuses[dataset] = completed
+                                write_training_report("running")
+                                continue
+                            if options.restart_stage == "train":
+                                clear_rejection_marker(dataset)
+                            if deps.trainer is None:
+                                assert prepared_fingerprint is not None
                                 resume = _verified_training_resume(
                                     dataset,
                                     descriptor,
@@ -3491,6 +4370,8 @@ def run_bootstrap(
                                     training_config["training"]["resume_from"] = str(
                                         resume.path
                                     )
+                                else:
+                                    training_config["training"]["resume_from"] = None
 
                                 def record_progress(
                                     event: dict[str, object],
@@ -3571,9 +4452,103 @@ def run_bootstrap(
                                     "training run summary is not an object"
                                 )
                             dataset_statuses[dataset] = _completed_training_status(
-                                dataset, descriptor, run_dir, summary
+                                dataset,
+                                descriptor,
+                                run_dir,
+                                summary,
+                                expected_deployment_policy=expected_deployment_policy,
                             )
+                            clear_rejection_marker(dataset)
                             write_training_report("running")
+                        except _TerminalRejectionIndexError as error:
+                            current = dataset_statuses.get(dataset)
+                            if (
+                                isinstance(current, Mapping)
+                                and current.get("status") == "rejected"
+                            ):
+                                write_training_report("rejected")
+                            else:
+                                dataset_statuses[dataset] = {
+                                    "status": "failed",
+                                    "terminal": True,
+                                    "reason": "terminal_rejection_index",
+                                    "dataset": dataset,
+                                    "descriptor": str(descriptor),
+                                    "error": _safe_error(error),
+                                }
+                                write_training_report("failed")
+                            raise
+                        except DeploymentQualityError as error:
+                            current = dataset_statuses.get(dataset)
+                            if not (
+                                isinstance(current, Mapping)
+                                and current.get("status") == "rejected"
+                            ):
+                                if prepared_fingerprint is None:
+                                    descriptor_sha256, descriptor_bytes = (
+                                        _regular_digest(descriptor)
+                                    )
+                                    rejected_status: dict[str, object] = {
+                                        "status": "rejected",
+                                        "terminal": True,
+                                        "reason": "deployment_quality",
+                                        "dataset": dataset,
+                                        "descriptor": str(descriptor),
+                                        "descriptor_sha256": descriptor_sha256,
+                                        "descriptor_bytes": descriptor_bytes,
+                                        "error": _safe_error(error),
+                                    }
+                                else:
+                                    try:
+                                        rejected_status = _rejected_training_status(
+                                            dataset,
+                                            descriptor,
+                                            prepared_fingerprint,
+                                            error.run_dir,
+                                            error.assessment_path,
+                                            error.failed_checks,
+                                            runs_root=options.runs_root,
+                                            expected_deployment_policy=(
+                                                expected_deployment_policy
+                                            ),
+                                        )
+                                    except (
+                                        OSError,
+                                        RuntimeError,
+                                        ValueError,
+                                        json.JSONDecodeError,
+                                    ) as verification_error:
+                                        descriptor_sha256, descriptor_bytes = (
+                                            _regular_digest(descriptor)
+                                        )
+                                        rejected_status = {
+                                            "status": "rejected",
+                                            "terminal": True,
+                                            "reason": "deployment_quality",
+                                            "dataset": dataset,
+                                            "descriptor": str(descriptor),
+                                            "descriptor_sha256": descriptor_sha256,
+                                            "descriptor_bytes": descriptor_bytes,
+                                            "prepared_descriptor_fingerprint": (
+                                                prepared_fingerprint
+                                            ),
+                                            "error": _safe_error(error),
+                                            "verification_error": _safe_error(
+                                                verification_error
+                                            ),
+                                        }
+                                dataset_statuses[dataset] = rejected_status
+                            current_rejection = dataset_statuses.get(dataset)
+                            if isinstance(current_rejection, Mapping):
+                                try:
+                                    publish_rejection_marker(
+                                        dataset, current_rejection
+                                    )
+                                except _TerminalRejectionIndexError:
+                                    write_training_report("rejected")
+                                    raise
+                            write_training_report("rejected")
+                            raise
                         except BaseException as error:
                             current = dataset_statuses.get(dataset)
                             if (
@@ -3597,7 +4572,10 @@ def run_bootstrap(
                     # Run summaries live under runs_root, which may be outside the
                     # portable bootstrap state root. The durable in-root training
                     # report owns those external locators.
-                    return (training_report_path,)
+                    return (
+                        training_report_path,
+                        terminal_rejection_index_path,
+                    )
 
                 def summarize_signature() -> str:
                     return _json_signature(

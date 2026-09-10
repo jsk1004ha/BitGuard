@@ -1136,6 +1136,28 @@ class BootstrapAcquisitionIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(schema["accepted_rows"], 2)
 
+    def test_inspection_contract_change_invalidates_cached_inspect_stage(self) -> None:
+        initial = run_bootstrap(self.options, dependencies=self.dependencies())
+        self.assertEqual(initial["status"], "sources_verified")
+
+        inspector = Mock(wraps=inspect_csv_dataset)
+        with patch(
+            "bitguard_bnn.bootstrap.inspect.SCHEMA_INSPECTION_CONTRACT_VERSION",
+            3,
+        ):
+            rerun = run_bootstrap(
+                self.options,
+                dependencies=self.dependencies(inspector=inspector),
+            )
+
+        self.assertEqual(rerun["status"], "sources_verified")
+        self.assertEqual(
+            rerun["reused_stages"],
+            ["preflight", "environment", "acquire", "extract"],
+        )
+        self.assertEqual(rerun["executed_stages"], ["inspect"])
+        self.assertEqual(inspector.call_count, len(self.options.datasets))
+
     def test_acquisition_journal_reuses_first_dataset_after_later_failure(self) -> None:
         download_calls: list[Path] = []
 

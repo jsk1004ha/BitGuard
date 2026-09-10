@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Final
 
 KNOWN_LABELS: Final[list[str]] = [
@@ -28,6 +29,9 @@ _DATASET_CSV_SIDECARS: Final[dict[str, frozenset[str]]] = {
     "nbaiot": frozenset({"demonstrate_structure.csv"}),
     "botiot": frozenset({"data_names.csv"}),
 }
+BOTIOT_TARGET_ALIASES: Final[frozenset[str]] = frozenset(
+    {"category", "label", "subcategory", "attack"}
+)
 
 COMMON_STREAM_FEATURES: Final[list[str]] = [
     "packet_rate",
@@ -77,6 +81,13 @@ def is_dataset_csv_sidecar(dataset: object, filename: object) -> bool:
 
     sidecars = _DATASET_CSV_SIDECARS.get(str(dataset).strip().casefold(), frozenset())
     return str(filename).casefold() in sidecars
+
+
+def is_botiot_target_alias(column: object) -> bool:
+    """Return whether *column* is an exact normalized BoT-IoT target alias."""
+
+    key = unicodedata.normalize("NFKC", str(column).strip()).casefold()
+    return key in BOTIOT_TARGET_ALIASES
 
 
 def nbaiot_behavior(raw_attack: object) -> str:

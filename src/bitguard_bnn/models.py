@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -46,6 +48,7 @@ class FeatureGate(nn.Module):
         input_groups: np.ndarray,
         group_costs: np.ndarray,
         temperature: float = 1.0,
+        minimum_active_fraction: float = 0.0,
     ) -> None:
         super().__init__()
         groups = np.asarray(input_groups, dtype=np.int64)
@@ -58,21 +61,40 @@ class FeatureGate(nn.Module):
         )
         self.logits = nn.Parameter(torch.full((len(costs),), 2.0))
         self.temperature = float(temperature)
+        self.minimum_active_fraction = float(minimum_active_fraction)
+        if not 0.0 <= self.minimum_active_fraction <= 1.0:
+            raise ValueError("minimum_active_fraction must be between 0 and 1")
 
     def probabilities(self) -> Tensor:
         return torch.sigmoid(self.logits / max(self.temperature, 1e-4))
 
-    def forward(self, values: Tensor) -> Tensor:
+    def projected_mask(self) -> Tensor:
         probabilities = self.probabilities()
-        hard = (probabilities >= 0.5).to(probabilities.dtype)
-        straight_through = hard.detach() - probabilities.detach() + probabilities
-        return values * straight_through[self.input_groups]
+        hard = self.hard_mask(probabilities)
+        return hard.detach() - probabilities.detach() + probabilities
+
+    def forward(self, values: Tensor) -> Tensor:
+        return values * self.projected_mask()[self.input_groups]
+
+    def hard_mask(self, probabilities: Tensor | None = None) -> Tensor:
+        """Project gate probabilities to the shared deterministic deployment mask."""
+
+        values = self.probabilities() if probabilities is None else probabilities
+        hard = (values >= 0.5).to(values.dtype)
+        minimum = math.ceil(self.minimum_active_fraction * values.numel())
+        if minimum <= 0:
+            return hard
+        # Stable sorting makes equal-probability selection deterministic by group index.
+        selected = torch.argsort(values, descending=True, stable=True)[:minimum]
+        floor = torch.zeros_like(values)
+        floor[selected] = 1.0
+        return torch.maximum(hard, floor)
 
     def normalized_cost(self) -> Tensor:
-        return torch.sum(self.probabilities() * self.group_costs)
+        return torch.sum(self.projected_mask() * self.group_costs)
 
     def selected_groups(self) -> Tensor:
-        return torch.flatnonzero(self.probabilities() >= 0.5)
+        return torch.nonzero(self.hard_mask(), as_tuple=True)[0]
 
 
 class FP32MLP(nn.Module):
@@ -177,6 +199,7 @@ def build_model(
                 input_groups,
                 feature_costs,
                 float(cfg.get("gate_temperature", 1.0)),
+                float(cfg.get("minimum_active_fraction", 0.0)),
             )
         return BNNClassifier(
             input_dim,
@@ -207,14 +230,14 @@ def classifier_active_inputs(model: nn.Module) -> tuple[np.ndarray, np.ndarray]:
             input_dim = int(model.network[0].in_features)
         else:
             raise ValueError("cannot determine model input dimension")
-        indices: np.ndarray = np.arange(input_dim, dtype=np.int64)
+        indices: NDArray[np.int64] = np.arange(input_dim, dtype=np.int64)
         return indices.copy(), indices
-    probabilities = gate.probabilities().detach().cpu().numpy()
+    hard_mask = gate.hard_mask().detach().cpu().numpy().astype(bool, copy=False)
     groups = gate.input_groups.detach().cpu().numpy().astype(np.int64, copy=False)
-    active_groups: np.ndarray = np.flatnonzero(probabilities >= 0.5).astype(np.int64)
-    active_inputs: np.ndarray = np.flatnonzero(np.isin(groups, active_groups)).astype(
-        np.int64
-    )
+    active_groups: NDArray[np.int64] = np.flatnonzero(hard_mask).astype(np.int64)
+    active_inputs: NDArray[np.int64] = np.flatnonzero(
+        np.isin(groups, active_groups)
+    ).astype(np.int64)
     return active_groups, active_inputs
 
 
@@ -227,6 +250,10 @@ def feature_gate_summary(model: nn.Module) -> dict[str, Any]:
     return {
         "feature_gate_enabled": True,
         "feature_groups": int(len(probabilities)),
+        "minimum_active_fraction": gate.minimum_active_fraction,
+        "minimum_active_groups": math.ceil(
+            gate.minimum_active_fraction * len(probabilities)
+        ),
         "active_groups": int(len(active_groups)),
         "active_encoded_inputs": int(len(active_inputs)),
         "active_group_indices": active_groups.tolist(),

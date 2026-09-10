@@ -81,7 +81,7 @@ training:
   patience: 8
   num_workers: 4
   device: auto
-  amp: false
+  amp: true
   selection_weights: {macro_f1: 0.5, macro_auprc: 0.3, attack_recall: 0.2}
 
 cascade:

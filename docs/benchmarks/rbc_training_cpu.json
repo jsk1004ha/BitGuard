@@ -1,0 +1,34 @@
+{
+  "scope": "frozen type-head training, generated CPU data, includes cache construction",
+  "rows": 16384,
+  "epochs": 5,
+  "batch_size": 2048,
+  "threads": 1,
+  "torch": "2.13.0+cpu",
+  "python": "3.11.14",
+  "processor": "Intel64 Family 6 Model 170 Stepping 4, GenuineIntel",
+  "repeats": 5,
+  "seconds": {
+    "original": [
+      0.08709720001206733,
+      0.08727819999330677,
+      0.0864953999989666,
+      0.08365270000649616,
+      0.08743779998621903
+    ],
+    "cached": [
+      0.041324299992993474,
+      0.04168369999388233,
+      0.03943889998481609,
+      0.04211459998623468,
+      0.039763899985700846
+    ]
+  },
+  "median_seconds": {
+    "original": 0.08709720001206733,
+    "cached": 0.041324299992993474
+  },
+  "speedup": 2.1076509469448883,
+  "cache_bytes": 524288,
+  "parameter_updates_bitwise_equal": true
+}

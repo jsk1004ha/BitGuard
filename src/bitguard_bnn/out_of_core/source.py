@@ -37,6 +37,7 @@ from bitguard_bnn.constants import (
     botiot_behavior,
     canonicalize_behavior,
     is_dataset_csv_sidecar,
+    is_botiot_target_alias,
     nbaiot_behavior,
     normalize_token,
 )
@@ -1771,6 +1772,12 @@ def _raw_feature_columns(
         csv_column_name_key(column)
         for column in META_COLUMNS | drop_columns | metadata_sources
     }
+    if kind == "botiot":
+        excluded.update(
+            csv_column_name_key(column)
+            for column in raw_columns
+            if is_botiot_target_alias(column)
+        )
     return tuple(
         column
         for column in raw_columns
@@ -2503,7 +2510,11 @@ def _normalization_signature(
             "row_uid": ROW_UID_ALGORITHM,
             "file_sampling": SOURCE_SAMPLING_ALGORITHM,
             "class_sampling": "bitguard.class-reservoir.numpy-default-rng.v1",
-            "schema": "bitguard.source-schema.v1",
+            "schema": (
+                "bitguard.source-schema.v2-botiot-target-aliases"
+                if plan.source.kind == "botiot"
+                else "bitguard.source-schema.v1"
+            ),
             "timestamp": "bitguard.timestamp-plan.v1",
             "behavior_mapping": "bitguard.behavior-mapping.v1",
             "numeric_coercion": "bitguard.numeric-feature-coercion.float32.v1",
@@ -2909,7 +2920,14 @@ def load_normalized_dataset(
             frac=1, random_state=int(config["experiment"]["seed"])
         ).reset_index(drop=True)
         cfg = config["dataset"]
-        features = numeric_features(combined, cfg.get("drop_columns", []))
+        drop_columns = list(cfg.get("drop_columns", []))
+        if plan.source.kind == "botiot":
+            drop_columns.extend(
+                str(column)
+                for column in combined.columns
+                if is_botiot_target_alias(column)
+            )
+        features = numeric_features(combined, drop_columns)
         source = plan.source
         digests = {
             file_plan.relative_path: file_plan.fingerprint.sha256

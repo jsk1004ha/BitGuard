@@ -26,11 +26,15 @@ from bitguard_bnn.column_names import (
 from bitguard_bnn.constants import (
     botiot_behavior,
     is_dataset_csv_sidecar,
+    is_botiot_target_alias,
     nbaiot_behavior,
     normalize_token,
 )
 
 SCHEMA_INSPECTION_CONTRACT = "bitguard.schema-inspection.v2"
+# Bump whenever schema discovery or normalization semantics change. Bootstrap
+# stage signatures include this token so cached reports cannot cross contracts.
+SCHEMA_INSPECTION_CONTRACT_VERSION = 2
 
 _PANDAS_IMPORT_ERROR: Exception | None = None
 try:
@@ -525,6 +529,12 @@ def _schema_for(
     metadata = {
         item for item in (label, raw_label, device, timestamp) if item is not None
     }
+    if dataset == "botiot":
+        metadata.update(
+            column
+            for column in normalized_header
+            if is_botiot_target_alias(column)
+        )
     drop_keys = {_column_key(column) for column in drop_columns}
     dropped = {
         column for column in normalized_header if _column_key(column) in drop_keys

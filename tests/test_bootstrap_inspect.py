@@ -314,6 +314,37 @@ class SchemaInspectionTest(unittest.TestCase):
             self.assertEqual(report.unique_devices, 2)
             self.assertEqual(report.device_samples, (("10.0.0.1", 1), ("10.0.0.2", 1)))
 
+    def test_botiot_excludes_unused_attack_alias_from_features(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "flows.csv").write_text(
+                "category,subcategory,attack,saddr,stime,attack_rate\n"
+                "Normal,Normal,0,10.0.0.1,1.5,0.1\n"
+                "DDoS,TCP,1,10.0.0.2,2.5,7.5\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset("botiot", root, chunk_size=1)
+
+            self.assertEqual(report.feature_columns, ("attack_rate",))
+            self.assertIn("attack", report.excluded_columns)
+
+    def test_botiot_excludes_nfkc_target_alias_without_prefix_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fullwidth_attack = "ａｔｔａｃｋ"
+            (root / "flows.csv").write_text(
+                f"category,subcategory,{fullwidth_attack},saddr,stime,attack_rate\n"
+                "Normal,Normal,0,10.0.0.1,1.5,0.1\n"
+                "DDoS,TCP,1,10.0.0.2,2.5,7.5\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_csv_dataset("botiot", root, chunk_size=1)
+
+            self.assertEqual(report.feature_columns, ("attack_rate",))
+            self.assertIn(fullwidth_attack, report.excluded_columns)
+
     def test_botiot_classifies_realistic_columns_without_rejecting_strings(
         self,
     ) -> None:

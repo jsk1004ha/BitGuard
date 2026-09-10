@@ -9,6 +9,7 @@ dataset:
   chunk_size: 200000
   max_rows_per_file: 300000
   max_rows_per_class: 500000
+  max_loaded_rows: 5000000
   label_map:
     benign: benign
     gafgyt_scan: scan_like
@@ -20,7 +21,6 @@ split:
   validation_fraction: 0.15
   test_fraction: 0.15
   held_out_devices: [Danmini_Doorbell]
-  held_out_attacks: [mirai_scan]
   seed: 2309
 
 preprocess:
@@ -58,7 +58,7 @@ training:
   patience: 6
   num_workers: 4
   device: auto
-  amp: false
+  amp: true
 
 cascade:
   enabled: true

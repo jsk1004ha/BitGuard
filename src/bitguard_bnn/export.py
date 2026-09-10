@@ -131,7 +131,9 @@ def export_run(run_dir: Path, output_dir: Path) -> dict[str, Any]:
         active_groups, active_encoded = classifier_active_inputs(model)
         probabilities = model.feature_gate.probabilities().detach().cpu().numpy()
         arrays["feature_gate_probability"] = probabilities.astype(np.float32)
-        arrays["feature_gate_hard_mask"] = (probabilities >= 0.5).astype(np.uint8)
+        arrays["feature_gate_hard_mask"] = (
+            model.feature_gate.hard_mask().detach().cpu().numpy().astype(np.uint8)
+        )
         manifest["feature_gate_scope_note"] = (
             "Inactive classifier columns are physically pruned. The open-set benign-distance "
             "detector still uses all selected raw features, so acquisition-cost claims must "
