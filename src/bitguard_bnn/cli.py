@@ -24,6 +24,12 @@ def _build_parser() -> argparse.ArgumentParser:
     stream.add_argument("--chunk-size", type=int, default=100000)
     train = subparsers.add_parser("train", help="run preprocessing, training, and evaluation")
     train.add_argument("--config", type=Path, required=True)
+    rbc = subparsers.add_parser("train-rbc", help="run detection-first RBC research training")
+    rbc.add_argument("--config", type=Path, required=True)
+    rbc_predict = subparsers.add_parser("predict-rbc", help="score raw feature CSV using an RBC artifact")
+    rbc_predict.add_argument("--run", type=Path, required=True)
+    rbc_predict.add_argument("--input", type=Path, required=True)
+    rbc_predict.add_argument("--output", type=Path, required=True)
     export = subparsers.add_parser("export", help="export a trained BNN for packed edge inference")
     export.add_argument("--run", type=Path, required=True)
     export.add_argument("--output", type=Path, required=True)
@@ -46,6 +52,16 @@ def main(
 ) -> int | None:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "predict-rbc":
+        from .rbc_predict import predict_csv
+
+        print(json.dumps(predict_csv(args.run, args.input, args.output)))
+        return 0
+    if args.command == "train-rbc":
+        from .rbc import run_rbc
+
+        print(str(run_rbc(args.config).resolve()))
+        return 0
     if args.command == "bootstrap":
         from .bootstrap.cli import run_from_namespace
 

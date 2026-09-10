@@ -14,7 +14,7 @@ dataset:
   raw_attack_column: subcategory
   device_column: saddr
   time_column: stime
-  drop_columns: [pkSeqID, seq, saddr, daddr, sport, dport, smac, dmac]
+  drop_columns: [category, label, subcategory, attack, pkSeqID, seq, saddr, daddr, sport, dport, smac, dmac]
 
 split:
   strategy: attack

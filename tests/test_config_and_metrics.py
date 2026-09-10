@@ -8,6 +8,7 @@ import numpy as np
 
 from bitguard_bnn.config import DEFAULTS, load_config, validate_config
 from bitguard_bnn.metrics import calibrate_fixed_fpr_thresholds, classification_metrics
+from bitguard_bnn.trainer import neural_validation_metrics
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +57,148 @@ class SplitConfigurationTest(unittest.TestCase):
             botiot_attack["split"]["held_out_attacks"],
             ["keylogging", "data_exfiltration"],
         )
+
+    def test_gate_schedule_and_minimum_fraction_are_validated(self) -> None:
+        cases = (
+            ("model", "minimum_active_fraction", -0.01),
+            ("model", "minimum_active_fraction", 1.01),
+            ("loss", "feature_penalty_warmup_fraction", -0.01),
+            ("loss", "feature_penalty_warmup_fraction", 1.01),
+            ("loss", "feature_penalty_ramp_fraction", -0.01),
+            ("loss", "feature_penalty_ramp_fraction", 1.01),
+        )
+        for section, name, value in cases:
+            with self.subTest(section=section, name=name, value=value):
+                config = copy.deepcopy(DEFAULTS)
+                config[section][name] = value
+                with self.assertRaisesRegex(ValueError, name):
+                    validate_config(config)
+
+    def test_repository_full_profiles_enable_deployment_candidate_policy(self) -> None:
+        for filename in ("botiot.yaml", "nbaiot.yaml"):
+            with self.subTest(filename=filename):
+                config = load_config(ROOT / "configs" / "full" / filename)
+                self.assertGreater(config["model"]["minimum_active_fraction"], 0.0)
+                self.assertGreater(
+                    config["loss"]["feature_penalty_warmup_fraction"], 0.0
+                )
+                self.assertGreater(
+                    config["loss"]["feature_penalty_ramp_fraction"], 0.0
+                )
+                gate = config["evaluation"]["deployment_candidate"]
+                self.assertTrue(gate["enabled"])
+                self.assertGreaterEqual(gate["min_balanced_accuracy"], 0.90)
+                self.assertGreaterEqual(gate["min_macro_f1"], 0.88)
+                self.assertGreaterEqual(gate["min_required_class_recall"], 0.85)
+                self.assertGreaterEqual(gate["min_high_risk_recall"], 0.95)
+                self.assertLessEqual(gate["max_observed_benign_fpr"], 0.001)
+                self.assertGreaterEqual(
+                    gate["min_attack_recall_at_fixed_fpr"], 0.90
+                )
+                self.assertLessEqual(gate["max_ece"], 0.03)
+
+    def test_enabled_deployment_policy_requires_explicit_risk_classes(self) -> None:
+        config = copy.deepcopy(DEFAULTS)
+        policy = config["evaluation"]["deployment_candidate"]
+        policy["enabled"] = True
+
+        with self.assertRaisesRegex(ValueError, "required_classes"):
+            validate_config(config)
+
+        policy["required_classes"] = ["benign", "scan_like"]
+        with self.assertRaisesRegex(ValueError, "high_risk_classes"):
+            validate_config(config)
+
+        policy["high_risk_classes"] = ["benign"]
+        with self.assertRaisesRegex(ValueError, "high_risk_classes"):
+            validate_config(config)
+
+    def test_enabled_deployment_policy_requires_out_of_core_parquet_storage(
+        self,
+    ) -> None:
+        config = copy.deepcopy(DEFAULTS)
+        policy = config["evaluation"]["deployment_candidate"]
+        policy.update(
+            {
+                "enabled": True,
+                "required_classes": ["benign", "scan_like"],
+                "high_risk_classes": ["scan_like"],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "dataset.storage=parquet"):
+            validate_config(config)
+
+    def test_deployment_policy_rejects_unknown_fields(self) -> None:
+        config = copy.deepcopy(DEFAULTS)
+        config["evaluation"]["deployment_candidate"]["minimum_precision"] = 0.9
+
+        with self.assertRaisesRegex(ValueError, "unknown.*minimum_precision"):
+            validate_config(config)
+
+    def test_deployment_policy_rejects_missing_fields(self) -> None:
+        config = copy.deepcopy(DEFAULTS)
+        del config["evaluation"]["deployment_candidate"]["max_ece"]
+
+        with self.assertRaisesRegex(ValueError, "missing.*max_ece"):
+            validate_config(config)
+
+
+class NeuralValidationMetricsTest(unittest.TestCase):
+    training_config = {
+        "selection_weights": {
+            "macro_f1": 0.5,
+            "macro_auprc": 0.3,
+            "attack_recall": 0.2,
+        }
+    }
+
+    def test_attack_recall_is_worst_supported_attack_subtype_recall(self) -> None:
+        y_validation = np.asarray([0, 1, 2], dtype=np.int64)
+        validation_probability = np.asarray(
+            [
+                [0.90, 0.05, 0.05],
+                [0.05, 0.05, 0.90],
+                [0.05, 0.05, 0.90],
+            ],
+            dtype=np.float64,
+        )
+
+        metrics = neural_validation_metrics(
+            y_validation,
+            validation_probability,
+            self.training_config,
+        )
+
+        self.assertEqual(metrics["validation_attack_recall"], 0.0)
+
+    def test_attack_recall_ignores_attack_subtypes_without_support(self) -> None:
+        y_validation = np.asarray([0, 1], dtype=np.int64)
+        validation_probability = np.asarray(
+            [[0.90, 0.05, 0.05], [0.05, 0.90, 0.05]], dtype=np.float64
+        )
+
+        metrics = neural_validation_metrics(
+            y_validation,
+            validation_probability,
+            self.training_config,
+        )
+
+        self.assertEqual(metrics["validation_attack_recall"], 1.0)
+
+    def test_attack_recall_is_zero_without_supported_attack_subtypes(self) -> None:
+        y_validation = np.asarray([0, 0], dtype=np.int64)
+        validation_probability = np.asarray(
+            [[0.90, 0.05, 0.05], [0.80, 0.10, 0.10]], dtype=np.float64
+        )
+
+        metrics = neural_validation_metrics(
+            y_validation,
+            validation_probability,
+            self.training_config,
+        )
+
+        self.assertEqual(metrics["validation_attack_recall"], 0.0)
 
 
 class FixedFPRCalibrationTest(unittest.TestCase):

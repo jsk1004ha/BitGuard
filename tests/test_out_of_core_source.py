@@ -1012,6 +1012,30 @@ class NormalizedSourceIteratorTest(unittest.TestCase):
 
             self._assert_parity(config)
 
+    def test_botiot_target_alias_exclusion_matches_streaming_and_materialized_features(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fullwidth_attack = "ａｔｔａｃｋ"
+            pd.DataFrame(
+                {
+                    "category": ["Normal", "DDoS"],
+                    "subcategory": ["Normal", "TCP"],
+                    "attack": [0, 1],
+                    " Attack ": [0, 1],
+                    fullwidth_attack: [0, 1],
+                    "saddr": ["a", "b"],
+                    "stime": [1, 2],
+                    "attack_rate": [0.1, 7.5],
+                }
+            ).to_csv(root / "botiot.csv", index=False)
+            config = _base_config(root, "botiot", "botiot.csv")
+
+            with open_normalized_source(config) as source:
+                self.assertEqual(source.proof.feature_names, ("attack_rate",))
+            self.assertEqual(load_botiot(config).feature_columns, ["attack_rate"])
+
     def test_iterator_does_not_concat_source_chunks_and_reports_exact_offsets(
         self,
     ) -> None:

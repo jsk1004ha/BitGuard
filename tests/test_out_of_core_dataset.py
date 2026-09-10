@@ -177,6 +177,11 @@ class OutOfCoreDatasetTests(unittest.TestCase):
         self.assertEqual(dataset.worker_ids_observed, (0, 1))
         self.assertGreater(dataset.max_pending_chunks_observed, 0)
         self.assertLessEqual(dataset.max_pending_chunks_observed, 4)
+        self.assertGreater(dataset.max_mixing_rows_observed, 0)
+        self.assertLessEqual(
+            dataset.max_mixing_rows_observed,
+            dataset.shuffle_buffer_rows,
+        )
 
     def test_shuffle_buffer_rejects_a_larger_row_group_payload(self) -> None:
         from bitguard_bnn.out_of_core.dataset import ParquetTrainingDataset
@@ -194,14 +199,28 @@ class OutOfCoreDatasetTests(unittest.TestCase):
         first_dataset = self._dataset(epoch=3)
         repeat_dataset = self._dataset(epoch=3)
         other_dataset = self._dataset(epoch=4)
-        first = [uid for batch in self._collect(first_dataset, 0) for uid in batch["row_uid"]]
+        first_batches = self._collect(first_dataset, 0)
+        first = [uid for batch in first_batches for uid in batch["row_uid"]]
         repeat = [uid for batch in self._collect(repeat_dataset, 0) for uid in batch["row_uid"]]
         other = [uid for batch in self._collect(other_dataset, 0) for uid in batch["row_uid"]]
         self.assertEqual(first, repeat)
         self.assertNotEqual(first, other)
-        labels = [entry.label for entry in first_dataset.permuted_shards()]
+        labels = [
+            str(label)
+            for batch in first_batches
+            for label in batch["metadata"]["behavior_label"]
+        ]
         if len(set(labels)) > 1:
-            self.assertNotEqual(labels[0], labels[1])
+            longest_run = 1
+            current_run = 1
+            for previous, current in zip(labels, labels[1:]):
+                current_run = current_run + 1 if current == previous else 1
+                longest_run = max(longest_run, current_run)
+            self.assertLessEqual(longest_run, first_dataset.shuffle_buffer_rows)
+        self.assertLessEqual(
+            first_dataset.max_mixing_rows_observed,
+            first_dataset.shuffle_buffer_rows,
+        )
 
     def test_selected_transform_labels_metadata_and_raw_boolean_match_frozen_artifact(self) -> None:
         from bitguard_bnn.preprocess import FeaturePreprocessor

@@ -8,6 +8,31 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
+def feature_penalty_coefficient(
+    loss_config: dict[str, Any],
+    optimizer_step: int,
+    total_optimizer_steps: int,
+) -> float:
+    """Return the scheduled feature-cost weight for a zero-based optimizer step."""
+
+    target = float(loss_config.get("lambda_feature", 0.0))
+    if target == 0.0:
+        return 0.0
+    if total_optimizer_steps <= 0:
+        raise ValueError("total_optimizer_steps must be positive")
+    if optimizer_step < 0:
+        raise ValueError("optimizer_step must be non-negative")
+    warmup = float(loss_config.get("feature_penalty_warmup_fraction", 0.0))
+    ramp = float(loss_config.get("feature_penalty_ramp_fraction", 0.0))
+    warmup_steps = warmup * total_optimizer_steps
+    if warmup_steps > 0.0 and optimizer_step <= warmup_steps:
+        return 0.0
+    if ramp <= 0.0:
+        return target
+    progress = (optimizer_step - warmup_steps) / (ramp * total_optimizer_steps)
+    return target * min(max(progress, 0.0), 1.0)
+
+
 class FocalLoss(nn.Module):
     def __init__(self, weight: Tensor | None = None, gamma: float = 2.0) -> None:
         super().__init__()
@@ -21,7 +46,8 @@ class FocalLoss(nn.Module):
         selected_probability = probabilities.gather(1, target[:, None]).squeeze(1)
         loss = -((1.0 - selected_probability) ** self.gamma) * selected_log
         if self.weight is not None:
-            loss = loss * self.weight[target]
+            weights = self.weight[target]
+            return (loss * weights).sum() / weights.sum().clamp_min(1e-12)
         return loss.mean()
 
 
@@ -63,6 +89,7 @@ class BitGuardObjective(nn.Module):
         logits: Tensor,
         target: Tensor,
         teacher_logits: Tensor | None = None,
+        feature_coefficient: float | None = None,
     ) -> LossOutput:
         detection = self.detection_loss(logits, target)
         probabilities = torch.softmax(logits, dim=1)
@@ -86,7 +113,12 @@ class BitGuardObjective(nn.Module):
         total = (
             (1.0 - self.distillation_alpha) * detection
             + self.distillation_alpha * distillation
-            + self.lambda_feature * feature_cost
+            + (
+                self.lambda_feature
+                if feature_coefficient is None
+                else float(feature_coefficient)
+            )
+            * feature_cost
             + self.beta_fn * false_negative
             + self.gamma_fp * false_positive
         )

@@ -1,0 +1,31 @@
+experiment:
+  name: botiot_rbc
+  seed: 2309
+dataset:
+  type: botiot
+  path: data/BoT_IoT
+  storage: csv
+  max_loaded_rows: 1000000
+model:
+  type: vanilla_bnn
+  hidden_dims: [64, 32]
+training:
+  epochs: 30
+  batch_size: 2048
+  learning_rate: 0.001
+  patience: 6
+rbc:
+  output_dir: runs/botiot_rbc
+  split_strategy: temporal
+  held_out_attacks: [unknown_like]
+  split_fractions: [0.60, 0.15, 0.10, 0.15]
+  bit_budget: 32
+  raw_feature_cost_cap: 16
+  encoder_fit_rows: 10000
+  max_swaps: 8
+  target_fpr: 0.001
+  calibration_method: empirical
+  worst_group_blend: 0.2
+  distillation_alpha: 0.2
+  threads: 1
+  type_cache_max_bytes: 268435456

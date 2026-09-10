@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import yaml
+
 from bitguard_bnn.config import load_config
 from bitguard_bnn.bootstrap.orchestrator import BootstrapDependencies, run_bootstrap
 from bitguard_bnn.bootstrap.types import BootstrapOptions
@@ -117,6 +119,8 @@ def _write_fake_completed_run(
 
 def _bootstrap_resume_fixture(
     root: Path,
+    *,
+    deployment_candidate_enabled: bool = False,
 ) -> tuple[BootstrapOptions, BootstrapDependencies]:
     archive = root / "nbaiot.zip"
     with zipfile.ZipFile(archive, "w") as output:
@@ -124,7 +128,15 @@ def _bootstrap_resume_fixture(
         output.writestr("device_b/gafgyt_attacks/scan.csv", "mean,std\n8,9\n9,10\n")
 
     repository = Path(__file__).resolve().parents[1]
-    resolved_config = repository / "configs" / "full" / "nbaiot.yaml"
+    template_config = repository / "configs" / "full" / "nbaiot.yaml"
+    resolved_config = root / "nbaiot-resolved.yaml"
+    resolved_payload = yaml.safe_load(template_config.read_text(encoding="utf-8"))
+    resolved_payload["evaluation"]["deployment_candidate"]["enabled"] = (
+        deployment_candidate_enabled
+    )
+    resolved_config.write_text(
+        yaml.safe_dump(resolved_payload, sort_keys=False), encoding="utf-8"
+    )
 
     def prepare(_config: Path, **kwargs: object) -> object:
         descriptor = Path(str(kwargs["descriptor_path"]))
@@ -238,6 +250,7 @@ def write_fast_nbaiot_profile(path: Path) -> None:
             "benchmark_repeats": 1,
         }
     )
+    payload["evaluation"]["deployment_candidate"]["enabled"] = False
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
 
@@ -308,6 +321,7 @@ def write_fast_botiot_profile(path: Path) -> None:
             "benchmark_repeats": 1,
         }
     )
+    payload["evaluation"]["deployment_candidate"]["enabled"] = False
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
 
@@ -633,6 +647,352 @@ def run_cache_journal_exit_child(root_value: str, stage: str) -> None:
 
 
 class FullBootstrapRecoveryTests(unittest.TestCase):
+    def test_terminal_rejection_index_updates_preserve_unrelated_datasets(
+        self,
+    ) -> None:
+        from bitguard_bnn.bootstrap.orchestrator import (
+            _updated_terminal_rejection_entries,
+        )
+
+        nbaiot = {
+            "status": "rejected",
+            "terminal": True,
+            "reason": "deployment_quality",
+            "run": "nbaiot-1",
+        }
+        botiot = {
+            "status": "rejected",
+            "terminal": True,
+            "reason": "deployment_quality",
+            "run": "botiot-1",
+        }
+        replaced = _updated_terminal_rejection_entries(
+            {"nbaiot": nbaiot, "botiot": botiot},
+            "nbaiot",
+            {**nbaiot, "run": "nbaiot-2"},
+        )
+        cleared = _updated_terminal_rejection_entries(
+            replaced, "nbaiot", None
+        )
+
+        self.assertEqual(replaced["nbaiot"]["run"], "nbaiot-2")
+        self.assertEqual(replaced["botiot"], botiot)
+        self.assertEqual(cleared, {"botiot": botiot})
+
+    def test_deployment_quality_error_exposes_terminal_artifact_context(self) -> None:
+        from bitguard_bnn.out_of_core.run import DeploymentQualityError
+
+        run_dir = Path("run")
+        assessment = run_dir / "deployment_quality.json"
+        error = DeploymentQualityError(
+            "deployment candidate rejected",
+            run_dir=run_dir,
+            assessment_path=assessment,
+            failed_checks=("macro_f1", "ece"),
+        )
+
+        self.assertEqual(error.run_dir, run_dir)
+        self.assertEqual(error.assessment_path, assessment)
+        self.assertEqual(error.failed_checks, ("macro_f1", "ece"))
+
+    def test_terminal_deployment_rejection_blocks_retry_until_fresh_restart(
+        self,
+    ) -> None:
+        from bitguard_bnn.deployment_quality import assess_deployment_candidate
+        from bitguard_bnn.out_of_core.run import DeploymentQualityError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            options, dependencies = _bootstrap_resume_fixture(
+                root, deployment_candidate_enabled=True
+            )
+            calls: list[Path | None] = []
+            attempts: list[Path] = []
+            mode = {"complete": False}
+
+            def reject_training(
+                _config_path: str | Path,
+                *,
+                config: dict[str, object],
+                prepared_descriptor_path: str | Path,
+                progress_callback=None,
+                **_runtime_options: object,
+            ) -> Path:
+                training = config["training"]
+                evaluation = config["evaluation"]
+                assert isinstance(training, dict)
+                assert isinstance(evaluation, dict)
+                resume_value = training.get("resume_from")
+                calls.append(
+                    None if resume_value is None else Path(str(resume_value))
+                )
+                run_dir = options.runs_root / f"quality-rejected-{len(calls)}"
+                run_dir.mkdir(parents=True)
+                attempts.append(run_dir)
+                active_checkpoint = run_dir / "last_training_state.pt"
+                assert progress_callback is not None
+                progress_callback(
+                    {
+                        "status": "run_created",
+                        "dataset": "nbaiot",
+                        "prepared_descriptor": str(prepared_descriptor_path),
+                        "prepared_descriptor_fingerprint": (
+                            "fixture-prepared-fingerprint"
+                        ),
+                        "run_dir": str(run_dir.resolve()),
+                        "active_checkpoint": str(active_checkpoint.resolve()),
+                        "resume_checkpoint": (
+                            None
+                            if resume_value is None
+                            else str(Path(str(resume_value)).resolve())
+                        ),
+                    }
+                )
+                active_checkpoint.write_bytes(b"terminal checkpoint")
+                policy = evaluation["deployment_candidate"]
+                assert isinstance(policy, dict)
+                if mode["complete"]:
+                    target = f"{float(policy['fixed_fpr_target']):g}"
+                    metrics = {
+                        "macro_f1": 1.0,
+                        "balanced_accuracy": 1.0,
+                        "expected_calibration_error_10_bin": 0.0,
+                        "per_class": {
+                            label: {"support": 100_000, "recall": 1.0}
+                            for label in policy["required_classes"]
+                        },
+                        "fixed_fpr": {
+                            f"attack_recall_at_benign_fpr_{target}": 1.0,
+                            f"observed_benign_fpr_at_target_{target}": 0.0,
+                        },
+                    }
+                    model_summary = {
+                        "active_groups": int(policy["min_active_groups"]) + 1
+                    }
+                else:
+                    metrics = {
+                        "macro_f1": 0.0,
+                        "balanced_accuracy": 0.0,
+                        "expected_calibration_error_10_bin": 1.0,
+                        "per_class": {
+                            label: {"support": 0, "recall": 0.0}
+                            for label in (
+                                "benign",
+                                "scan_like",
+                                "flood_like",
+                            )
+                        },
+                        "fixed_fpr": {
+                            "attack_recall_at_benign_fpr_0.001": 0.0,
+                            "observed_benign_fpr_at_target_0.001": 1.0,
+                        },
+                    }
+                    model_summary = {"active_groups": 0}
+                quality = assess_deployment_candidate(metrics, model_summary, policy)
+                (run_dir / "best_model.pt").write_bytes(b"model")
+                (run_dir / "metrics.json").write_text(
+                    json.dumps(metrics) + "\n", encoding="utf-8"
+                )
+                (run_dir / "model_summary.json").write_text(
+                    json.dumps(model_summary) + "\n", encoding="utf-8"
+                )
+                (run_dir / "predictions.parquet").write_bytes(b"predictions")
+                (run_dir / "inference_contract.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+                assessment = run_dir / "deployment_quality.json"
+                assessment.write_text(
+                    json.dumps(quality) + "\n", encoding="utf-8"
+                )
+                (run_dir / "phase_resources.json").write_text(
+                    "[]\n", encoding="utf-8"
+                )
+                if mode["complete"]:
+                    self.assertTrue(quality["eligible"])
+                    _write_fake_completed_run(
+                        run_dir,
+                        dataset="nbaiot",
+                        descriptor_path=Path(prepared_descriptor_path),
+                    )
+                    (run_dir / "metrics.json").write_text(
+                        json.dumps(metrics) + "\n", encoding="utf-8"
+                    )
+                    (run_dir / "model_summary.json").write_text(
+                        json.dumps(model_summary) + "\n", encoding="utf-8"
+                    )
+                    assessment.write_text(
+                        json.dumps(quality) + "\n", encoding="utf-8"
+                    )
+                    summary_path = run_dir / "run_summary.json"
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    summary.update(
+                        {
+                            "deployment_quality": str(assessment),
+                            "deployment_candidate": True,
+                        }
+                    )
+                    summary_path.write_text(
+                        json.dumps(summary) + "\n", encoding="utf-8"
+                    )
+                    return run_dir
+                self.assertFalse(quality["eligible"])
+                raise DeploymentQualityError(
+                    "deployment candidate quality gate rejected edge export",
+                    run_dir=run_dir,
+                    assessment_path=assessment,
+                    failed_checks=tuple(quality["failed_checks"]),
+                )
+
+            with patch(
+                "bitguard_bnn.out_of_core.run.run_out_of_core_training",
+                side_effect=reject_training,
+            ):
+                first = run_bootstrap(options, dependencies=dependencies)
+                first_status = first["dataset_statuses"]["nbaiot"]
+                self.assertEqual(first["status"], "failed")
+                self.assertEqual(first_status["status"], "rejected")
+                self.assertIs(first_status["terminal"], True)
+                self.assertNotIn("active_checkpoint", first_status)
+                self.assertNotIn("resume_checkpoint", first_status)
+                self.assertEqual(first_status["run"], str(attempts[0]))
+                self.assertEqual(
+                    first_status["deployment_quality"],
+                    str(attempts[0] / "deployment_quality.json"),
+                )
+                self.assertIn("--restart-stage train", first["recovery_command"])
+                self.assertNotIn(
+                    "automatic optimizer/cache resume", first["recovery_command"]
+                )
+
+                rejection_index = (
+                    options.data_root / ".bitguard" / "terminal-rejections.json"
+                )
+                self.assertTrue(rejection_index.is_file())
+                rejection_payload = json.loads(
+                    rejection_index.read_text(encoding="utf-8")
+                )
+                self.assertEqual(rejection_payload["format_version"], 1)
+                self.assertEqual(
+                    rejection_payload["datasets"]["nbaiot"]["status"], "rejected"
+                )
+                training_report_path = (
+                    options.data_root / ".bitguard" / "training.json"
+                )
+                training_report_path.unlink()
+                second = run_bootstrap(options, dependencies=dependencies)
+                self.assertEqual(second["status"], "failed")
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(attempts), 1)
+                second_status = second["dataset_statuses"]["nbaiot"]
+                self.assertEqual(second_status["status"], "rejected")
+                self.assertEqual(second_status["run"], first_status["run"])
+                self.assertEqual(
+                    second_status["deployment_quality"],
+                    first_status["deployment_quality"],
+                )
+
+                training_report_path.write_text("not-json\n", encoding="utf-8")
+                corrupt_report = run_bootstrap(options, dependencies=dependencies)
+                self.assertEqual(corrupt_report["status"], "failed")
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    corrupt_report["dataset_statuses"]["nbaiot"]["status"],
+                    "rejected",
+                )
+
+                Path(first_status["deployment_quality"]).write_text(
+                    "{}\n", encoding="utf-8"
+                )
+                tampered = run_bootstrap(options, dependencies=dependencies)
+                self.assertEqual(tampered["status"], "failed")
+                self.assertEqual(len(calls), 1)
+                tampered_status = tampered["dataset_statuses"]["nbaiot"]
+                self.assertEqual(tampered_status["status"], "rejected")
+                self.assertIs(tampered_status["terminal"], True)
+                self.assertNotIn("active_checkpoint", tampered_status)
+                self.assertNotIn("resume_checkpoint", tampered_status)
+                self.assertIn("failed verification", tampered_status["error"])
+
+                rejection_index.write_text("{}\n", encoding="utf-8")
+                malformed_marker = run_bootstrap(options, dependencies=dependencies)
+                self.assertEqual(malformed_marker["status"], "failed")
+                self.assertEqual(len(calls), 1)
+                self.assertIn(
+                    "terminal rejection index", malformed_marker["error"].lower()
+                )
+                self.assertIn(
+                    "--restart-stage train", malformed_marker["recovery_command"]
+                )
+                self.assertNotIn(
+                    "automatic optimizer/cache resume",
+                    malformed_marker["recovery_command"],
+                )
+
+                restarted = run_bootstrap(
+                    replace(options, restart_stage="train"),
+                    dependencies=dependencies,
+                )
+                rejected_training_report = json.loads(
+                    training_report_path.read_text(encoding="utf-8")
+                )
+                repaired_index = json.loads(
+                    rejection_index.read_text(encoding="utf-8")
+                )
+                custom_calls: list[str] = []
+
+                def transient_custom_trainer(**_kwargs: object) -> Path:
+                    custom_calls.append("called")
+                    raise RuntimeError("transient custom trainer failure")
+
+                transient = run_bootstrap(
+                    replace(options, restart_stage="train"),
+                    dependencies=replace(
+                        dependencies, trainer=transient_custom_trainer
+                    ),
+                )
+                cleared_after_transient = json.loads(
+                    rejection_index.read_text(encoding="utf-8")
+                )
+                mode["complete"] = True
+                completed = run_bootstrap(
+                    replace(options, restart_stage="train"),
+                    dependencies=dependencies,
+                )
+                cleared_after_success = json.loads(
+                    rejection_index.read_text(encoding="utf-8")
+                )
+                rejection_index.write_text("{}\n", encoding="utf-8")
+                tampered_after_success = run_bootstrap(
+                    options, dependencies=dependencies
+                )
+
+            self.assertEqual(restarted["status"], "failed")
+            self.assertEqual(transient["status"], "failed")
+            self.assertEqual(custom_calls, ["called"])
+            self.assertEqual(cleared_after_transient["datasets"], {})
+            self.assertEqual(completed["status"], "completed", completed.get("error"))
+            self.assertEqual(tampered_after_success["status"], "failed")
+            self.assertIn(
+                "terminal rejection index", tampered_after_success["error"].lower()
+            )
+            self.assertEqual(calls, [None, None, None])
+            self.assertEqual(len(attempts), 3)
+            training_report = json.loads(
+                (options.data_root / ".bitguard" / "training.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(rejected_training_report["status"], "rejected")
+            self.assertEqual(
+                rejected_training_report["datasets"]["nbaiot"]["status"],
+                "rejected",
+            )
+            self.assertEqual(
+                repaired_index["datasets"]["nbaiot"]["run"], str(attempts[1])
+            )
+            self.assertEqual(training_report["status"], "completed")
+            self.assertEqual(cleared_after_success["datasets"], {})
+
     def test_resume_header_is_rejected_before_run_directory_creation(self) -> None:
         import torch
 
@@ -1918,6 +2278,7 @@ class FullBootstrapRecoveryTests(unittest.TestCase):
 
     def test_train_recovery_preserves_resume_unless_reset_is_required(self) -> None:
         from bitguard_bnn.bootstrap.orchestrator import _recovery
+        from bitguard_bnn.out_of_core.run import DeploymentQualityError
 
         normal = _recovery(
             "train",
@@ -1927,6 +2288,21 @@ class FullBootstrapRecoveryTests(unittest.TestCase):
         self.assertIn("rerun the original command", normal)
         self.assertIn("automatic optimizer/cache resume", normal)
         self.assertNotIn("--restart-stage", normal)
+        rejection = DeploymentQualityError(
+            "deployment candidate quality gate rejected edge export",
+            run_dir=Path("run"),
+            assessment_path=Path("run") / "deployment_quality.json",
+            failed_checks=("macro_f1",),
+        )
+        rejected = _recovery(
+            "train",
+            rejection,
+            {"compute": {"selected_profile": "cpu", "device": "cpu"}},
+        )
+        self.assertIn("--restart-stage train", rejected)
+        self.assertIn("deployment_quality.json", rejected)
+        self.assertNotIn("automatic optimizer/cache resume", rejected)
+        self.assertNotIn("rerun the original command unchanged", rejected)
         reset_errors = (
             "streaming checkpoint fields are invalid",
             "unsupported streaming checkpoint format",

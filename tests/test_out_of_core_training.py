@@ -403,6 +403,140 @@ class OutOfCoreTrainingTests(unittest.TestCase):
             )
         self.assertEqual(len(resumed_validation_calls), 2)
 
+    def test_feature_penalty_ramp_resume_matches_uninterrupted_training_exactly(
+        self,
+    ) -> None:
+        import torch
+
+        from bitguard_bnn.losses import feature_penalty_coefficient
+        from bitguard_bnn.out_of_core.trainer import (
+            StreamingTrainingInterrupted,
+            fit_neural_streaming,
+        )
+
+        config = self._config(epochs=2, dropout=0.0)
+        config["model"]["type"] = "cost_aware_bnn"
+        config["loss"].update(
+            {
+                "lambda_feature": 0.4,
+                "feature_penalty_warmup_fraction": 0.25,
+                "feature_penalty_ramp_fraction": 0.5,
+            }
+        )
+        self.assertEqual(feature_penalty_coefficient(config["loss"], 1, 6), 0.0)
+        self.assertGreater(feature_penalty_coefficient(config["loss"], 2, 6), 0.0)
+
+        with patch(
+            "bitguard_bnn.out_of_core.trainer.verify_prepared_dataset",
+            return_value=_prepared(),
+        ):
+            seed_everything(17)
+            uninterrupted = fit_neural_streaming(
+                self._model(config),
+                self._actual_loader_dataset(),
+                {"benign": 3, "flood_like": 3},
+                ("benign", "flood_like"),
+                config,
+                self._validation,
+                _VALIDATION_CONTRACT,
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "feature-penalty-ramp.pt"
+                seed_everything(17)
+                with self.assertRaises(StreamingTrainingInterrupted):
+                    fit_neural_streaming(
+                        self._model(config),
+                        self._actual_loader_dataset(),
+                        {"benign": 3, "flood_like": 3},
+                        ("benign", "flood_like"),
+                        config,
+                        self._validation,
+                        _VALIDATION_CONTRACT,
+                        checkpoint_path=checkpoint,
+                        stop_after_optimizer_step=2,
+                    )
+                state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                self.assertEqual(state["global_optimizer_step"], 2)
+
+                seed_everything(999)
+                resumed = fit_neural_streaming(
+                    self._model(config),
+                    self._actual_loader_dataset(),
+                    {"benign": 3, "flood_like": 3},
+                    ("benign", "flood_like"),
+                    config,
+                    self._validation,
+                    _VALIDATION_CONTRACT,
+                    checkpoint_path=checkpoint,
+                    resume_from=checkpoint,
+                )
+
+        self.assertEqual(
+            uninterrupted.history.to_dict(orient="records"),
+            resumed.history.to_dict(orient="records"),
+        )
+        for name, expected in uninterrupted.model.state_dict().items():
+            self.assertTrue(
+                torch.equal(expected.cpu(), resumed.model.state_dict()[name].cpu()), name
+            )
+
+    def test_feature_penalty_schedule_change_invalidates_streaming_checkpoint(
+        self,
+    ) -> None:
+        from bitguard_bnn.out_of_core.trainer import (
+            StreamingTrainingInterrupted,
+            fit_neural_streaming,
+        )
+
+        config = self._config()
+        config["model"]["type"] = "cost_aware_bnn"
+        config["loss"].update(
+            {
+                "lambda_feature": 0.4,
+                "feature_penalty_warmup_fraction": 0.25,
+                "feature_penalty_ramp_fraction": 0.5,
+            }
+        )
+
+        with patch(
+            "bitguard_bnn.out_of_core.trainer.verify_prepared_dataset",
+            return_value=_prepared(),
+        ), tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "feature-penalty-signature.pt"
+            seed_everything(17)
+            with self.assertRaises(StreamingTrainingInterrupted):
+                fit_neural_streaming(
+                    self._model(config),
+                    self._actual_loader_dataset(),
+                    {"benign": 3, "flood_like": 3},
+                    ("benign", "flood_like"),
+                    config,
+                    self._validation,
+                    _VALIDATION_CONTRACT,
+                    checkpoint_path=checkpoint,
+                    stop_after_optimizer_step=2,
+                )
+
+            for name, value in (
+                ("feature_penalty_warmup_fraction", 0.125),
+                ("feature_penalty_ramp_fraction", 0.25),
+            ):
+                incompatible = copy.deepcopy(config)
+                incompatible["loss"][name] = value
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, "scientific signature"
+                ):
+                    fit_neural_streaming(
+                        self._model(incompatible),
+                        self._actual_loader_dataset(),
+                        {"benign": 3, "flood_like": 3},
+                        ("benign", "flood_like"),
+                        incompatible,
+                        self._validation,
+                        _VALIDATION_CONTRACT,
+                        resume_from=checkpoint,
+                    )
+
     def test_one_epoch_streaming_matches_array_fit_with_fixed_batch_order(self) -> None:
         import torch
 
@@ -1142,6 +1276,44 @@ class OutOfCoreTrainingTests(unittest.TestCase):
                     )
                 for name, expected in before.items():
                     self.assertTrue(torch.equal(expected, candidate.state_dict()[name]))
+
+    def test_array_resume_rejects_v2_validation_semantics_checkpoint(self) -> None:
+        import torch
+
+        from bitguard_bnn.trainer import _fit_neural
+
+        rng = np.random.default_rng(29)
+        features = rng.normal(size=(12, 4)).astype(np.float32)
+        labels = np.asarray([0, 1] * 6, dtype=np.int64)
+        arrays = (features[:8], labels[:8], features[8:], labels[8:])
+        weights = np.ones(2, dtype=np.float32)
+        config = self._config(epochs=2, dropout=0.0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "array-v2-state.pt"
+            seed_everything(29)
+            _fit_neural(
+                self._model(config),
+                *arrays,
+                weights,
+                config,
+                checkpoint_path=checkpoint,
+                stop_after_epoch=1,
+            )
+            legacy = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            legacy["training_signature"]["array_training_algorithm"] = (
+                "bitguard.array-neural.v2"
+            )
+            torch.save(legacy, checkpoint)
+
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                _fit_neural(
+                    self._model(config),
+                    *arrays,
+                    weights,
+                    config,
+                    resume_from=checkpoint,
+                )
 
     def test_array_worker_rng_isolated_for_exact_resume(self) -> None:
         import torch

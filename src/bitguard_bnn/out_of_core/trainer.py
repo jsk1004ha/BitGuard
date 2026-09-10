@@ -807,6 +807,7 @@ def fit_neural_streaming(
     checkpoint_interval = int(training["checkpoint_every_steps"])
     patience = int(training["patience"])
     num_workers = int(training.get("num_workers", 0))
+    total_optimizer_steps = epochs * math.ceil(dataset.row_count / dataset.batch_size)
     should_stop = bool(records) and stale >= patience
     if epoch_phase == "epoch_boundary":
         epoch_phase = "training"
@@ -850,6 +851,8 @@ def fit_neural_streaming(
                     scaler=scaler,
                     config=config,
                     teacher_model=teacher_model,
+                    optimizer_step=cursor.optimizer_step,
+                    total_optimizer_steps=total_optimizer_steps,
                 )
                 rows = len(feature_tensor)
                 if rows <= 0:
@@ -939,7 +942,6 @@ def fit_neural_streaming(
                             r"`optimizer\.step\(\)`\."
                         ),
                         category=UserWarning,
-                        module=r"torch\.optim\.lr_scheduler",
                     )
                     scheduler.step()
                 terminal_training_resume = False

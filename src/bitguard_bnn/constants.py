@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Final
 
 KNOWN_LABELS: Final[list[str]] = [
@@ -23,6 +24,10 @@ META_COLUMNS: Final[set[str]] = {
     "behavior_label",
     "timestamp",
 }
+
+BOTIOT_TARGET_ALIASES: Final[frozenset[str]] = frozenset(
+    {"category", "label", "subcategory", "attack"}
+)
 
 COMMON_STREAM_FEATURES: Final[list[str]] = [
     "packet_rate",
@@ -65,6 +70,13 @@ def normalize_token(value: object) -> str:
     token = str(value).strip().lower()
     token = re.sub(r"[^a-z0-9]+", "_", token).strip("_")
     return token or "unknown"
+
+
+def is_botiot_target_alias(column: object) -> bool:
+    """Return whether *column* is an exact normalized BoT-IoT target alias."""
+
+    key = unicodedata.normalize("NFKC", str(column).strip()).casefold()
+    return key in BOTIOT_TARGET_ALIASES
 
 
 def nbaiot_behavior(raw_attack: object) -> str:

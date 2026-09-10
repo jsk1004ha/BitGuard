@@ -20,6 +20,7 @@ import yaml
 from bitguard_bnn.config import DEFAULTS
 from bitguard_bnn.bootstrap.orchestrator import BootstrapDependencies, run_bootstrap
 from bitguard_bnn.bootstrap.types import BootstrapOptions
+from bitguard_bnn.deployment_quality import assess_deployment_candidate
 from tests.test_out_of_core_prepare import (
     _source_contract,
     _write_botiot,
@@ -590,6 +591,68 @@ class OutOfCoreRunBoundaryTests(unittest.TestCase):
             [uid for batch in batches for uid in batch["row_uid"]], expected_uids
         )
 
+    def test_validation_attack_recall_uses_worst_supported_attack_subtype(self) -> None:
+        import torch
+
+        from bitguard_bnn.out_of_core import run as run_module
+
+        labels = ["benign", "scan_like", "flood_like"]
+
+        class Dataset:
+            row_count = 6
+            batch_size = 6
+
+            def set_epoch(self, _epoch: int) -> None:
+                return None
+
+            def __iter__(self):
+                yield {
+                    "features": np.asarray(
+                        [
+                            [8.0, 0.0, 0.0],
+                            [8.0, 0.0, 0.0],
+                            [0.0, 0.0, 8.0],
+                            [0.0, 0.0, 8.0],
+                            [0.0, 0.0, 8.0],
+                            [0.0, 0.0, 8.0],
+                        ],
+                        dtype=np.float32,
+                    ),
+                    "unencoded": np.zeros((6, 1), dtype=np.float32),
+                    "labels": np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int64),
+                    "row_uid": np.asarray([f"uid-{index}" for index in range(6)]),
+                    "metadata": {
+                        "source_file": np.asarray(["source"] * 6),
+                        "device_id": np.asarray(["device"] * 6),
+                        "timestamp": np.arange(6, dtype=np.float64),
+                        "sequence_index": np.arange(6, dtype=np.int64),
+                        "raw_attack": np.asarray([""] * 6),
+                        "behavior_label": np.asarray(
+                            [
+                                "benign",
+                                "benign",
+                                "scan_like",
+                                "scan_like",
+                                "flood_like",
+                                "flood_like",
+                            ]
+                        ),
+                    },
+                    "boolean_raw": {},
+                }
+
+        class Model(torch.nn.Module):
+            def forward(self, values):
+                return values
+
+        with tempfile.TemporaryDirectory() as temporary:
+            callback = run_module._validation_callback(
+                Dataset(), labels, Path(temporary) / "validation"
+            )
+            result = callback(Model(), torch.device("cpu"))
+
+        self.assertEqual(result["validation_attack_recall"], 0.0)
+
     def test_temporal_prediction_routing_is_chronological_and_restores_storage_order(
         self,
     ) -> None:
@@ -1018,7 +1081,14 @@ class OutOfCoreRunBoundaryTests(unittest.TestCase):
 
 
 class OutOfCoreRunEndToEndTests(unittest.TestCase):
-    def _prepare(self, dataset: str, root: Path, *, cascade_enabled: bool = True):
+    def _prepare(
+        self,
+        dataset: str,
+        root: Path,
+        *,
+        cascade_enabled: bool = True,
+        deployment_candidate: str = "disabled",
+    ):
         from bitguard_bnn.out_of_core.prepare import prepare_full_dataset
 
         repository = Path(__file__).resolve().parents[1]
@@ -1091,6 +1161,34 @@ class OutOfCoreRunEndToEndTests(unittest.TestCase):
                 "benchmark_repeats": 1,
             }
         )
+        if deployment_candidate == "disabled":
+            payload["evaluation"]["deployment_candidate"]["enabled"] = False
+        else:
+            payload["model"]["type"] = "cost_aware_bnn"
+            policy = payload["evaluation"]["deployment_candidate"]
+            policy.update(
+                {
+                    "enabled": True,
+                    "required_classes": ["benign", "flood_like"],
+                    "min_required_class_support": 1,
+                    "high_risk_classes": ["flood_like"],
+                    "min_required_class_recall": 0.0,
+                    "min_high_risk_recall": 0.0,
+                    "min_balanced_accuracy": 0.0,
+                    "min_macro_f1": 0.0,
+                    "fixed_fpr_target": 0.5,
+                    "min_attack_recall_at_fixed_fpr": 0.0,
+                    "max_observed_benign_fpr": 1.0,
+                    "max_ece": 1.0,
+                    "min_active_groups": 0,
+                }
+            )
+            if deployment_candidate == "reject":
+                policy.update(
+                    {
+                        "min_required_class_support": 1_000_000,
+                    }
+                )
         config_path = root / f"{dataset}.yaml"
         config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
         return prepare_full_dataset(
@@ -1190,6 +1288,13 @@ class OutOfCoreRunEndToEndTests(unittest.TestCase):
                     ],
                     prepared.to_dict()["fingerprint"],
                 )
+                self.assertEqual(
+                    checkpoint["scientific_signature"]["validation_contract"]["algorithm"],
+                    "bitguard.full-validation-selection.v2",
+                )
+                self.assertNotIn("deployment_quality", summary)
+                self.assertNotIn("deployment_candidate", summary)
+                self.assertFalse((run_dir / "deployment_quality.json").exists())
                 self.assertEqual(prediction_rows, prepared.test_count)
                 self.assertFalse((run_dir / "validation_cache").exists())
                 self.assertEqual(
@@ -1323,7 +1428,12 @@ class OutOfCoreRunEndToEndTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            prepared = self._prepare("botiot", root, cascade_enabled=False)
+            prepared = self._prepare(
+                "botiot",
+                root,
+                cascade_enabled=False,
+                deployment_candidate="pass",
+            )
             config = load_config(prepared.resolved_config_path)
             config["experiment"]["output_dir"] = str(root / "runs")
 
@@ -1337,6 +1447,12 @@ class OutOfCoreRunEndToEndTests(unittest.TestCase):
             operating_points = json.loads(
                 (run_dir / "fixed_fpr_thresholds.json").read_text(encoding="utf-8")
             )
+            quality = json.loads(
+                (run_dir / "deployment_quality.json").read_text(encoding="utf-8")
+            )
+            summary = json.loads(
+                (run_dir / "run_summary.json").read_text(encoding="utf-8")
+            )
             self.assertFalse((run_dir / "tiny_model.pt").exists())
             self.assertFalse((run_dir / "cascade_calibration.json").exists())
             self.assertEqual(metrics["fixed_fpr"]["threshold_source"], "validation")
@@ -1348,10 +1464,85 @@ class OutOfCoreRunEndToEndTests(unittest.TestCase):
                 pq.ParquetFile(run_dir / "predictions.parquet").metadata.num_rows,
                 prepared.test_count,
             )
+            self.assertTrue(quality["eligible"])
+            self.assertEqual(quality["status"], "deployment_candidate")
+            self.assertEqual(
+                summary["deployment_quality"], str(run_dir / "deployment_quality.json")
+            )
+            self.assertTrue(summary["deployment_candidate"])
+
+    def test_rejected_deployment_candidate_retains_evidence_and_blocks_export(
+        self,
+    ) -> None:
+        from bitguard_bnn.config import load_config
+        from bitguard_bnn.out_of_core.run import (
+            DeploymentQualityError,
+            run_out_of_core_training,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepared = self._prepare(
+                "botiot",
+                root,
+                cascade_enabled=False,
+                deployment_candidate="reject",
+            )
+            config = load_config(prepared.resolved_config_path)
+            config["experiment"]["output_dir"] = str(root / "runs")
+
+            with self.assertRaisesRegex(
+                DeploymentQualityError,
+                "quality gate rejected edge export",
+            ):
+                run_out_of_core_training(
+                    prepared.resolved_config_path,
+                    config=config,
+                    prepared_descriptor_path=prepared.descriptor_path,
+                )
+
+            quality_paths = list((root / "runs").glob("*/*/deployment_quality.json"))
+            self.assertEqual(len(quality_paths), 1)
+            run_dir = quality_paths[0].parent
+            quality = json.loads(quality_paths[0].read_text(encoding="utf-8"))
+            self.assertFalse(quality["eligible"])
+            self.assertIn("required_class_support", quality["failed_checks"])
+            self.assertTrue((run_dir / "best_model.pt").is_file())
+            self.assertTrue((run_dir / "model_summary.json").is_file())
+            self.assertTrue((run_dir / "metrics.json").is_file())
+            self.assertTrue((run_dir / "phase_resources.json").is_file())
+            self.assertFalse((run_dir / "edge").exists())
+            self.assertFalse((run_dir / "run_summary.json").exists())
 
 
 class BootstrapRunStageTests(unittest.TestCase):
-    def _fixture(self, root: Path, *, prepare_only: bool, fail_botiot: bool = False):
+    def _fixture(
+        self,
+        root: Path,
+        *,
+        prepare_only: bool,
+        fail_botiot: bool = False,
+        with_deployment_quality: bool = False,
+        deployment_quality_variant: str = "valid",
+        deployment_policy_enabled: bool | None = None,
+    ):
+        if deployment_policy_enabled is None:
+            deployment_policy_enabled = with_deployment_quality
+        deployment_policy = {
+            "enabled": True,
+            "required_classes": ["benign", "scan_like", "flood_like"],
+            "min_required_class_support": 10,
+            "min_required_class_recall": 0.85,
+            "high_risk_classes": ["scan_like", "flood_like"],
+            "min_high_risk_recall": 0.95,
+            "min_balanced_accuracy": 0.90,
+            "min_macro_f1": 0.88,
+            "fixed_fpr_target": 0.001,
+            "min_attack_recall_at_fixed_fpr": 0.90,
+            "max_observed_benign_fpr": 0.001,
+            "max_ece": 0.03,
+            "min_active_groups": 2,
+        }
         archive = root / "nbaiot.zip"
         with zipfile.ZipFile(archive, "w") as output:
             output.writestr("device_a/benign_traffic.csv", "mean,std\n1,2\n2,3\n")
@@ -1372,8 +1563,36 @@ class BootstrapRunStageTests(unittest.TestCase):
             descriptor = Path(str(kwargs["descriptor_path"]))
             dataset = descriptor.parent.name
             descriptor.parent.mkdir(parents=True, exist_ok=True)
+            resolved_config = descriptor.parent / "resolved.yaml"
+            resolved_config.write_text(
+                yaml.safe_dump(
+                    {
+                        "dataset": {
+                            "storage": "parquet",
+                            "shard_manifest": "prepared/shard_manifest.json",
+                        },
+                        "evaluation": {
+                            "fixed_fpr_targets": [0.01, 0.001],
+                            "deployment_candidate": (
+                                deployment_policy
+                                if deployment_policy_enabled
+                                else {"enabled": False}
+                            ),
+                        }
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
             descriptor.write_text(
-                json.dumps({"dataset": dataset, "valid": True}) + "\n",
+                json.dumps(
+                    {
+                        "dataset": dataset,
+                        "valid": True,
+                        "resolved_config_path": str(resolved_config),
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
             return SimpleNamespace(descriptor_path=str(descriptor))
@@ -1383,6 +1602,7 @@ class BootstrapRunStageTests(unittest.TestCase):
             if payload.get("valid") is not True:
                 raise RuntimeError("invalid prepared descriptor")
             return SimpleNamespace(
+                resolved_config_path=payload["resolved_config_path"],
                 to_dict=lambda: {
                     "dataset": payload["dataset"],
                     "descriptor_path": str(descriptor),
@@ -1439,6 +1659,67 @@ class BootstrapRunStageTests(unittest.TestCase):
                     "manifest": str(artifacts["manifest"]),
                 },
             }
+            if with_deployment_quality:
+                quality_path = run_dir / "deployment_quality.json"
+                quality_metrics = {
+                    "macro_f1": 0.95,
+                    "balanced_accuracy": 0.95,
+                    "per_class": {
+                        "benign": {"recall": 0.90, "support": 100},
+                        "scan_like": {"recall": 0.97, "support": 100},
+                        "flood_like": {"recall": 0.97, "support": 100},
+                    },
+                    "fixed_fpr": {
+                        "attack_recall_at_benign_fpr_0.001": 0.95,
+                        "observed_benign_fpr_at_target_0.001": 0.0009,
+                    },
+                    "expected_calibration_error_10_bin": 0.02,
+                }
+                model_summary = {"active_groups": 4}
+                quality = assess_deployment_candidate(
+                    quality_metrics,
+                    model_summary,
+                    deployment_policy,
+                )
+                artifacts["metrics"].write_text(
+                    json.dumps(quality_metrics) + "\n", encoding="utf-8"
+                )
+                (run_dir / "model_summary.json").write_text(
+                    json.dumps(model_summary) + "\n", encoding="utf-8"
+                )
+                if deployment_quality_variant == "missing_check":
+                    del quality["checks"]["active_groups"]
+                elif deployment_quality_variant == "extra_check":
+                    quality["checks"]["unreviewed_metric"] = {"passed": True}
+                elif deployment_quality_variant == "malformed_record":
+                    quality["checks"]["macro_f1"] = {"passed": True}
+                elif deployment_quality_variant == "missing_policy":
+                    del quality["policy"]
+                elif deployment_quality_variant == "policy_disabled":
+                    quality["policy"]["enabled"] = False
+                elif deployment_quality_variant == "policy_mismatch":
+                    quality["policy"]["min_macro_f1"] = 0.87
+                elif deployment_quality_variant == "metrics_conflict":
+                    quality_metrics["macro_f1"] = 0.10
+                    artifacts["metrics"].write_text(
+                        json.dumps(quality_metrics) + "\n", encoding="utf-8"
+                    )
+                elif deployment_quality_variant == "metrics_non_json":
+                    artifacts["metrics"].write_text("not-json\n", encoding="utf-8")
+                elif deployment_quality_variant == "model_summary_conflict":
+                    (run_dir / "model_summary.json").write_text(
+                        json.dumps({"active_groups": 1}) + "\n", encoding="utf-8"
+                    )
+                quality_path.write_text(
+                    json.dumps(quality) + "\n",
+                    encoding="utf-8",
+                )
+                summary.update(
+                    {
+                        "deployment_quality": str(quality_path),
+                        "deployment_candidate": True,
+                    }
+                )
             (run_dir / "run_summary.json").write_text(
                 json.dumps(summary) + "\n", encoding="utf-8"
             )
@@ -1532,6 +1813,195 @@ class BootstrapRunStageTests(unittest.TestCase):
                 completed["dataset_statuses"]["nbaiot"]["run"],
                 failed["dataset_statuses"]["nbaiot"]["run"],
             )
+            self.assertNotIn(
+                "deployment_quality", completed["dataset_statuses"]["nbaiot"]
+            )
+            self.assertNotIn(
+                "deployment_candidate", completed["dataset_statuses"]["nbaiot"]
+            )
+
+    def test_retry_reuses_eligible_deployment_quality_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            options, dependencies, calls = self._fixture(
+                Path(temporary),
+                prepare_only=False,
+                fail_botiot=True,
+                with_deployment_quality=True,
+            )
+            failed = run_bootstrap(options, dependencies=dependencies)
+            completed = run_bootstrap(options, dependencies=dependencies)
+
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(completed["status"], "completed", completed.get("error"))
+            self.assertEqual(calls, ["nbaiot", "botiot", "botiot"])
+            nbaiot = completed["dataset_statuses"]["nbaiot"]
+            self.assertTrue(nbaiot["deployment_candidate"])
+            self.assertEqual(
+                nbaiot["deployment_quality"],
+                nbaiot["artifacts"]["deployment_quality"]["path"],
+            )
+
+    def test_deployment_quality_report_requires_exact_check_set(self) -> None:
+        for variant in ("missing_check", "extra_check"):
+            with (
+                self.subTest(variant=variant),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                options, dependencies, calls = self._fixture(
+                    Path(temporary),
+                    prepare_only=False,
+                    with_deployment_quality=True,
+                    deployment_quality_variant=variant,
+                )
+
+                report = run_bootstrap(options, dependencies=dependencies)
+
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(calls, ["nbaiot"])
+
+    def test_deployment_quality_report_requires_complete_check_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            options, dependencies, calls = self._fixture(
+                Path(temporary),
+                prepare_only=False,
+                with_deployment_quality=True,
+                deployment_quality_variant="malformed_record",
+            )
+
+            report = run_bootstrap(options, dependencies=dependencies)
+
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(calls, ["nbaiot"])
+
+    def test_deployment_quality_report_requires_enabled_complete_policy(self) -> None:
+        for variant in ("missing_policy", "policy_disabled"):
+            with (
+                self.subTest(variant=variant),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                options, dependencies, calls = self._fixture(
+                    Path(temporary),
+                    prepare_only=False,
+                    with_deployment_quality=True,
+                    deployment_quality_variant=variant,
+                )
+
+                report = run_bootstrap(options, dependencies=dependencies)
+
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(calls, ["nbaiot"])
+
+    def test_deployment_quality_policy_must_match_resolved_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            options, dependencies, calls = self._fixture(
+                Path(temporary),
+                prepare_only=False,
+                with_deployment_quality=True,
+                deployment_quality_variant="policy_mismatch",
+            )
+
+            report = run_bootstrap(options, dependencies=dependencies)
+
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(calls, ["nbaiot"])
+
+    def test_enabled_deployment_policy_requires_quality_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            options, dependencies, calls = self._fixture(
+                Path(temporary),
+                prepare_only=False,
+                with_deployment_quality=False,
+                deployment_policy_enabled=True,
+            )
+
+            report = run_bootstrap(options, dependencies=dependencies)
+
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(calls, ["nbaiot"])
+
+    def test_disabled_deployment_policy_rejects_quality_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            options, dependencies, calls = self._fixture(
+                Path(temporary),
+                prepare_only=False,
+                with_deployment_quality=True,
+                deployment_policy_enabled=False,
+            )
+
+            report = run_bootstrap(options, dependencies=dependencies)
+
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(calls, ["nbaiot"])
+
+    def test_deployment_quality_report_must_match_pinned_evidence(self) -> None:
+        for variant in (
+            "metrics_conflict",
+            "metrics_non_json",
+            "model_summary_conflict",
+        ):
+            with (
+                self.subTest(variant=variant),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                options, dependencies, calls = self._fixture(
+                    Path(temporary),
+                    prepare_only=False,
+                    with_deployment_quality=True,
+                    deployment_quality_variant=variant,
+                )
+
+                report = run_bootstrap(options, dependencies=dependencies)
+
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(calls, ["nbaiot"])
+
+    def test_invalid_deployment_quality_artifact_forces_owner_to_retrain(
+        self,
+    ) -> None:
+        scenarios = ("tampered", "missing", "failed", "candidate_false")
+        for operation in scenarios:
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                options, dependencies, calls = self._fixture(
+                    Path(temporary),
+                    prepare_only=False,
+                    with_deployment_quality=True,
+                )
+                first = run_bootstrap(options, dependencies=dependencies)
+                status = first["dataset_statuses"]["nbaiot"]
+                quality_path = Path(status["deployment_quality"])
+                if operation == "tampered":
+                    quality_path.write_bytes(b"tampered")
+                elif operation == "missing":
+                    quality_path.unlink()
+                elif operation == "failed":
+                    quality_path.write_text(
+                        json.dumps(
+                            {
+                                "format_version": 1,
+                                "eligible": False,
+                                "status": "rejected",
+                                "failed_checks": ["macro_f1"],
+                                "checks": {"macro_f1": {"passed": False}},
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    summary_path = Path(status["run"]) / "run_summary.json"
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    summary["deployment_candidate"] = False
+                    summary_path.write_text(
+                        json.dumps(summary) + "\n", encoding="utf-8"
+                    )
+
+                second = run_bootstrap(options, dependencies=dependencies)
+
+                self.assertEqual(second["status"], "completed", second.get("error"))
+                self.assertEqual(calls, ["nbaiot", "botiot", "nbaiot"])
 
     def test_malformed_training_report_root_is_not_treated_as_resumable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1807,6 +2277,16 @@ class BootstrapRunStageTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "escapes its run directory"):
                 orchestrator._training_artifact_paths(foreign_summary, run_dir)
+
+            foreign_quality_summary = copy.deepcopy(summary)
+            foreign_quality_summary.update(
+                {
+                    "deployment_quality": str(outside),
+                    "deployment_candidate": True,
+                }
+            )
+            with self.assertRaisesRegex(RuntimeError, "escapes its run directory"):
+                orchestrator._training_artifact_paths(foreign_quality_summary, run_dir)
 
             manifest.write_text(
                 json.dumps({"files": ["../outside.bin", "manifest.json"]}),

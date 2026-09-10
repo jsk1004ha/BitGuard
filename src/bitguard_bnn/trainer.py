@@ -430,7 +430,7 @@ def _training_signature(
 
     ignored_training_keys = {"checkpoint_every_epochs", "epochs", "resume_from"}
     signature = {
-        "array_training_algorithm": "bitguard.array-neural.v2",
+        "array_training_algorithm": "bitguard.array-neural.v3",
         "experiment_seed": int(config["experiment"]["seed"]),
         "dataset": config.get("dataset", {}),
         "split": config.get("split", {}),
@@ -464,12 +464,25 @@ def neural_train_step(
     scaler: Any,
     config: dict[str, Any],
     teacher_model: Any | None,
+    optimizer_step: int | None = None,
+    total_optimizer_steps: int | None = None,
 ) -> dict[str, float]:
     """Apply one neural optimizer update through the shared scientific boundary."""
 
     import torch
 
+    from .losses import feature_penalty_coefficient
     from .models import clamp_binary_master_weights
+
+    if (optimizer_step is None) != (total_optimizer_steps is None):
+        raise ValueError(
+            "optimizer_step and total_optimizer_steps must be provided together"
+        )
+    effective_feature_coefficient = None
+    if optimizer_step is not None and total_optimizer_steps is not None:
+        effective_feature_coefficient = feature_penalty_coefficient(
+            config["loss"], optimizer_step, total_optimizer_steps
+        )
 
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(
@@ -479,7 +492,16 @@ def neural_train_step(
         logits = model(features)
         with torch.no_grad():
             teacher_logits = None if teacher_model is None else teacher_model(features)
-        output = objective(model, logits, target, teacher_logits)
+        if effective_feature_coefficient is None:
+            output = objective(model, logits, target, teacher_logits)
+        else:
+            output = objective(
+                model,
+                logits,
+                target,
+                teacher_logits,
+                feature_coefficient=effective_feature_coefficient,
+            )
     scaler.scale(output.total).backward()
     scaler.unscale_(optimizer)
     clip = float(config["training"].get("gradient_clip", 0.0))
@@ -529,10 +551,17 @@ def neural_validation_metrics(
                 )
             )
     macro_auprc = float(np.mean(per_class_auprc))
-    attack_mask = y_validation != 0
+    supported_attack_classes = np.unique(y_validation[y_validation != 0])
     attack_recall = (
-        float(np.mean(validation_prediction[attack_mask] != 0))
-        if attack_mask.any()
+        min(
+            float(
+                np.mean(
+                    validation_prediction[y_validation == class_index] == class_index
+                )
+            )
+            for class_index in supported_attack_classes
+        )
+        if supported_attack_classes.size
         else 0.0
     )
     selection_weights = _validated_selection_weights(
@@ -766,6 +795,12 @@ def _fit_neural(
         generator=worker_generator,
         persistent_workers=num_workers > 0,
     )
+    optimizer_steps_per_epoch = (
+        len(dataset) // batch_size
+        if drop_last
+        else math.ceil(len(dataset) / batch_size)
+    )
+    total_optimizer_steps = epochs * optimizer_steps_per_epoch
     amp_enabled = bool(training_cfg.get("amp", False)) and device.type == "cuda"
     scaler = _make_grad_scaler(torch, device.type, amp_enabled)
     patience = int(training_cfg["patience"])
@@ -880,7 +915,7 @@ def _fit_neural(
                 name: 0.0 for name in ("loss", "detection", "feature_cost", "fn", "fp")
             }
             seen = 0
-            for features, target in loader:
+            for batch_index, (features, target) in enumerate(loader):
                 features = features.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 step_metrics = neural_train_step(
@@ -892,6 +927,9 @@ def _fit_neural(
                     scaler=scaler,
                     config=config,
                     teacher_model=teacher_model,
+                    optimizer_step=(epoch - 1) * optimizer_steps_per_epoch
+                    + batch_index,
+                    total_optimizer_steps=total_optimizer_steps,
                 )
                 batch_rows = len(features)
                 seen += batch_rows

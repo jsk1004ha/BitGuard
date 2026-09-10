@@ -64,12 +64,15 @@ DEFAULTS: dict[str, Any] = {
         "dropout": 0.0,
         "binary_first_layer": True,
         "gate_temperature": 1.0,
+        "minimum_active_fraction": 0.0,
     },
     "loss": {
         "type": "weighted_ce",
         "focal_gamma": 2.0,
         "class_weighted": True,
         "lambda_feature": 0.0,
+        "feature_penalty_warmup_fraction": 0.0,
+        "feature_penalty_ramp_fraction": 0.0,
         "beta_fn": 0.0,
         "gamma_fp": 0.0,
         "distillation_alpha": 0.0,
@@ -134,6 +137,21 @@ DEFAULTS: dict[str, Any] = {
         "benchmark_warmup": 20,
         "benchmark_repeats": 100,
         "fixed_fpr_targets": [1e-2, 1e-3],
+        "deployment_candidate": {
+            "enabled": False,
+            "required_classes": [],
+            "min_required_class_support": 1,
+            "min_required_class_recall": 0.85,
+            "high_risk_classes": [],
+            "min_high_risk_recall": 0.95,
+            "min_balanced_accuracy": 0.90,
+            "min_macro_f1": 0.88,
+            "fixed_fpr_target": 1e-3,
+            "min_attack_recall_at_fixed_fpr": 0.90,
+            "max_observed_benign_fpr": 1e-3,
+            "max_ece": 0.03,
+            "min_active_groups": 1,
+        },
     },
 }
 
@@ -187,6 +205,93 @@ def _validated_selection_weights(value: Any) -> dict[str, float]:
     ):
         raise ValueError("training.selection_weights must sum to 1.0")
     return normalized
+
+
+def _finite_unit_interval(value: object, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(float(value))
+        or not 0.0 <= float(value) <= 1.0
+    ):
+        raise ValueError(f"{name} must be finite in [0, 1]")
+    return float(value)
+
+
+_DEPLOYMENT_CANDIDATE_POLICY_KEYS = frozenset(
+    {
+        "enabled",
+        "required_classes",
+        "min_required_class_support",
+        "min_required_class_recall",
+        "high_risk_classes",
+        "min_high_risk_recall",
+        "min_balanced_accuracy",
+        "min_macro_f1",
+        "fixed_fpr_target",
+        "min_attack_recall_at_fixed_fpr",
+        "max_observed_benign_fpr",
+        "max_ece",
+        "min_active_groups",
+    }
+)
+
+
+def _validate_deployment_candidate_policy(value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("evaluation.deployment_candidate must be a mapping")
+    fields = set(value)
+    missing = _DEPLOYMENT_CANDIDATE_POLICY_KEYS - fields
+    unknown = fields - _DEPLOYMENT_CANDIDATE_POLICY_KEYS
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append(f"missing fields: {', '.join(sorted(missing))}")
+        if unknown:
+            details.append(
+                f"unknown fields: {', '.join(sorted(str(name) for name in unknown))}"
+            )
+        raise ValueError(
+            "evaluation.deployment_candidate has " + "; ".join(details)
+        )
+    if not isinstance(value.get("enabled"), bool):
+        raise ValueError("evaluation.deployment_candidate.enabled must be boolean")
+    for name in (
+        "min_required_class_recall",
+        "min_high_risk_recall",
+        "min_balanced_accuracy",
+        "min_macro_f1",
+        "fixed_fpr_target",
+        "min_attack_recall_at_fixed_fpr",
+        "max_observed_benign_fpr",
+        "max_ece",
+    ):
+        _finite_unit_interval(
+            value.get(name), f"evaluation.deployment_candidate.{name}"
+        )
+    if float(value["fixed_fpr_target"]) <= 0.0:
+        raise ValueError(
+            "evaluation.deployment_candidate.fixed_fpr_target must be positive"
+        )
+    for name in ("required_classes", "high_risk_classes"):
+        labels = value.get(name)
+        if (
+            not isinstance(labels, list)
+            or any(not isinstance(label, str) or not label for label in labels)
+            or len(set(labels)) != len(labels)
+        ):
+            raise ValueError(
+                f"evaluation.deployment_candidate.{name} must contain unique labels"
+            )
+    for name, minimum in (
+        ("min_required_class_support", 1),
+        ("min_active_groups", 0),
+    ):
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
+            raise ValueError(
+                f"evaluation.deployment_candidate.{name} must be an integer >= {minimum}"
+            )
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -260,6 +365,22 @@ def validate_config(config: dict[str, Any]) -> None:
         hidden_dims = list(config["model"].get("hidden_dims", []))
         if not hidden_dims or any(int(dimension) <= 0 for dimension in hidden_dims):
             raise ValueError("model.hidden_dims must contain at least one positive dimension")
+    _finite_unit_interval(
+        config["model"].get("minimum_active_fraction", 0.0),
+        "model.minimum_active_fraction",
+    )
+    warmup_fraction = _finite_unit_interval(
+        config["loss"].get("feature_penalty_warmup_fraction", 0.0),
+        "loss.feature_penalty_warmup_fraction",
+    )
+    ramp_fraction = _finite_unit_interval(
+        config["loss"].get("feature_penalty_ramp_fraction", 0.0),
+        "loss.feature_penalty_ramp_fraction",
+    )
+    if warmup_fraction + ramp_fraction > 1.0:
+        raise ValueError(
+            "loss feature penalty warmup and ramp fractions must sum to at most 1"
+        )
     thresholds = config["temporal"]["action_thresholds"]
     if len(thresholds) != 5 or list(thresholds) != sorted(thresholds):
         raise ValueError("temporal.action_thresholds must contain five increasing values")
@@ -283,6 +404,37 @@ def validate_config(config: dict[str, Any]) -> None:
     for target in config["evaluation"].get("fixed_fpr_targets", []):
         if not 0.0 < float(target) < 1.0:
             raise ValueError("evaluation.fixed_fpr_targets must be between 0 and 1")
+    deployment_policy = config["evaluation"].get("deployment_candidate")
+    _validate_deployment_candidate_policy(deployment_policy)
+    if bool(deployment_policy["enabled"]):
+        required_classes = set(deployment_policy["required_classes"])
+        high_risk_classes = set(deployment_policy["high_risk_classes"])
+        if not required_classes:
+            raise ValueError(
+                "evaluation.deployment_candidate.required_classes must not be empty"
+            )
+        if (
+            not high_risk_classes
+            or "benign" in high_risk_classes
+            or not high_risk_classes.issubset(required_classes)
+        ):
+            raise ValueError(
+                "evaluation.deployment_candidate.high_risk_classes must be a "
+                "non-empty subset of required_classes without benign"
+            )
+        target = float(deployment_policy["fixed_fpr_target"])
+        configured_targets = {
+            float(value) for value in config["evaluation"].get("fixed_fpr_targets", [])
+        }
+        if target not in configured_targets:
+            raise ValueError(
+                "deployment fixed_fpr_target must appear in evaluation.fixed_fpr_targets"
+            )
+        if storage != "parquet":
+            raise ValueError(
+                "evaluation.deployment_candidate.enabled requires "
+                "dataset.storage=parquet"
+            )
 
 
 def resolve_path(config: dict[str, Any], value: str | Path | None) -> Path | None:

@@ -133,6 +133,41 @@ preprocessing values remain deterministic bounded-sample approximations, with
 their capacity and statistical error contract recorded in
 `feature_manifest.json`.
 
+### Deployment-candidate training policy
+
+The two `configs/full/*.yaml` profiles enable a fail-closed deployment-candidate
+policy. BoT-IoT target aliases such as `category`, `subcategory`, `label`, and
+the binary `attack` flag are reserved metadata and can never become model
+features. Cost-aware gates train without a feature penalty during the initial
+warmup, ramp the penalty by global optimizer step, and always retain a minimum
+fraction of feature groups. The schedule is bound to the resumable scientific
+signature, so an interrupted run continues at the same coefficient.
+
+Validation checkpoint selection uses the worst supported attack-subtype recall
+rather than only aggregate attack-versus-benign recall. This prevents a model
+that maps every rare scan to a more common attack class from appearing healthy.
+The full profiles also give this worst-class signal more weight and use a longer
+early-stopping patience.
+
+After full-test evaluation, BitGuard writes `deployment_quality.json` and
+requires all configured thresholds to pass before producing the automatic edge
+export:
+balanced accuracy, Macro-F1, required/high-risk class recall and support,
+attack recall at the fixed benign-FPR operating point, observed benign FPR,
+calibration error, and active feature groups. A rejected model keeps its
+checkpoint, exact metrics, and predictions for diagnosis but the command exits
+non-zero and does not label or export it as deployable. These thresholds are an
+acceptance gate, not a promise that a single training run will achieve them. A
+quality rejection is stored as a terminal, non-resumable result: an unchanged
+rerun reports the same rejection without retraining, and a new attempt requires
+an intentional `--restart-stage train` after changing the data, model, or policy.
+
+Knowledge distillation remains disabled in the full profiles because the
+current interrupted-run contract cannot independently authenticate and restore
+the teacher. Training continues to consume every prepared training row exactly
+once per epoch with class-weighted focal loss and deterministic class-interleaved
+shards; synthetic minority oversampling is not claimed.
+
 ### Resume, restart, and prepare-only
 
 A normal rerun reads `bootstrap-state.json`, fingerprints committed outputs,
@@ -207,7 +242,8 @@ Each successful run under `<runs-root>/nbaiot_full/<timestamp>` or
 calibrated configs, environment and prepared-dataset manifests, train state and
 best checkpoints, calibration files, `inference_contract.json`, exact
 `metrics.json`, compressed `predictions.parquet`, deterministic plot sample and
-manifest, phase resource measurements, and `edge/bitguard_edge_*` export files.
+manifest, phase resource measurements, `deployment_quality.json`, and—only for
+an eligible deployment candidate—`edge/bitguard_edge_*` export files.
 
 The filesystem safety boundary covers untrusted network/archive content and
 cooperative BitGuard writers inside a trusted workspace. Malicious same-account
@@ -350,20 +386,23 @@ open-set behavior rather than a mislabeled closed-set classifier.
 The planned `preprocess.feature_budget` values are 115, 64, 32, 16, 8, and
 `null`; any positive budget is accepted for development runs. Ranking is fit
 on train only. `cost_aware` ranking maximizes a univariate detection score
-per configured feature cost. The gated BNN additionally minimizes the expected
-cost of its learned feature gates:
+per configured feature cost. The gated BNN additionally minimizes the projected
+normalized cost of its learned feature gates:
 
 ```text
 L = L_detection
-  + lambda_feature * expected_feature_cost
+  + lambda_feature * projected_feature_cost
   + beta_fn * differentiable_false_negative_cost
   + gamma_fp * differentiable_false_positive_cost
   + distillation_loss (optional)
 ```
 
 Neural early stopping uses a configurable validation composite of Macro-F1,
-Macro-AUPRC, and attack recall (`training.selection_weights`), never accuracy
-alone.
+Macro-AUPRC, and the worst supported attack-subtype recall
+(`training.selection_weights`), never accuracy alone. Full profiles warm up and
+ramp the gate cost by global optimizer step and project the learned gate to its
+configured minimum active fraction, so a constant classifier with every input
+disabled cannot be selected or exported.
 
 A fixed model-size term has no gradient, so it is reported as parameter/packed
 bytes and compared through width/model ablations rather than added as a

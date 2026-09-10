@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, cast
+from typing import Any, Callable, Iterator, Mapping, Sequence, cast
 
 import numpy as np
 import pandas as pd
@@ -31,11 +31,15 @@ from bitguard_bnn.config import (
     seed_everything,
 )
 from bitguard_bnn.constants import CANONICAL_LABELS
+from bitguard_bnn.deployment_quality import assess_deployment_candidate
 from bitguard_bnn.export import export_run
 from bitguard_bnn.out_of_core.dataset import ParquetTrainingDataset
 from bitguard_bnn.out_of_core.evaluate import evaluate_prediction_batches
-from bitguard_bnn.out_of_core.manifest import stable_fingerprint
-from bitguard_bnn.out_of_core.manifest import read_split_manifest
+from bitguard_bnn.out_of_core.manifest import (
+    read_split_manifest,
+    stable_fingerprint,
+    write_json_atomic,
+)
 from bitguard_bnn.out_of_core.metrics import StreamingClassificationMetrics
 from bitguard_bnn.out_of_core.prepare import PreparedDataset, verify_prepared_dataset
 from bitguard_bnn.preprocess import FeaturePreprocessor
@@ -67,6 +71,23 @@ _TEST_PREDICTION_ORDER_ALGORITHM = {
 _PHASE_SAMPLE_INTERVAL_SECONDS = 1.0
 
 _TRAINING_RESOURCE_RESERVE_BYTES = 64 * 1024**2
+
+
+class DeploymentQualityError(RuntimeError):
+    """Raised when test evidence rejects a model for edge deployment."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        run_dir: str | Path,
+        assessment_path: str | Path,
+        failed_checks: Sequence[str],
+    ) -> None:
+        super().__init__(message)
+        self.run_dir = Path(run_dir)
+        self.assessment_path = Path(assessment_path)
+        self.failed_checks = tuple(failed_checks)
 
 
 def _add_exception_note(error: BaseException, note: str) -> None:
@@ -753,7 +774,7 @@ def _preflight_streaming_resume_checkpoint(
         binary_attack_target=False,
     )
     training_contract = {
-        "algorithm": "bitguard.full-validation-selection.v1",
+        "algorithm": "bitguard.full-validation-selection.v2",
         "prepared_descriptor_fingerprint": prepared.to_dict()["fingerprint"],
         "split_fingerprint": prepared.split_fingerprint,
         "validation_rows": prepared.validation_count,
@@ -885,13 +906,18 @@ def _validation_callback(
                     "validation callback did not consume the complete split"
                 )
             result = metrics.finalize()
-            attack_rate = result["high_risk_false_negative_rate"]
+            per_class = cast(Mapping[str, Mapping[str, object]], result["per_class"])
+            attack_recalls = []
+            for label in callback_labels[1:]:
+                class_metrics = per_class.get(label)
+                if class_metrics is not None and cast(
+                    int, class_metrics.get("support", 0)
+                ) > 0:
+                    attack_recalls.append(cast(float, class_metrics["recall"]))
             return {
                 "validation_macro_f1": float(result["macro_f1"]),
                 "validation_macro_auprc": float(result["macro_auprc"] or 0.0),
-                "validation_attack_recall": (
-                    0.0 if attack_rate is None else 1.0 - float(attack_rate)
-                ),
+                "validation_attack_recall": min(attack_recalls, default=0.0),
             }
         finally:
             metrics.cleanup()
@@ -1553,7 +1579,7 @@ def _run_verified_neural_training(
     counts = _class_counts(prepared, labels)
     attack_prior = _attack_prior(counts)
     training_contract = {
-        "algorithm": "bitguard.full-validation-selection.v1",
+        "algorithm": "bitguard.full-validation-selection.v2",
         "prepared_descriptor_fingerprint": prepared.to_dict()["fingerprint"],
         "split_fingerprint": prepared.split_fingerprint,
         "validation_rows": prepared.validation_count,
@@ -1912,6 +1938,28 @@ def _run_verified_neural_training(
                 "test evaluation row count does not match prepared split"
             )
 
+    deployment_quality: dict[str, Any] | None = None
+    deployment_policy = runtime_config["evaluation"].get("deployment_candidate", {})
+    if bool(deployment_policy.get("enabled", False)):
+        deployment_quality = assess_deployment_candidate(
+            cast(Mapping[str, object], evaluation["metrics"]),
+            model_summary,
+            deployment_policy,
+        )
+        deployment_quality_path = run_dir / "deployment_quality.json"
+        write_json_atomic(deployment_quality_path, deployment_quality)
+        if not bool(deployment_quality["eligible"]):
+            save_json(phases, run_dir / "phase_resources.json")
+            failed = ", ".join(cast(list[str], deployment_quality["failed_checks"]))
+            raise DeploymentQualityError(
+                "deployment candidate quality gate rejected edge export "
+                f"(failed checks: {failed}); trained model and test metrics are "
+                f"retained in {run_dir} and assessment is at {deployment_quality_path}",
+                run_dir=run_dir,
+                assessment_path=deployment_quality_path,
+                failed_checks=cast(list[str], deployment_quality["failed_checks"]),
+            )
+
     with _phase(phases, "edge_export", temporary):
         export_result = export_run(run_dir, run_dir / "edge")
 
@@ -1929,6 +1977,14 @@ def _run_verified_neural_training(
             "predictions": str(run_dir / "predictions.parquet"),
             "inference_contract": str(run_dir / "inference_contract.json"),
             "export": export_result,
+            **(
+                {}
+                if deployment_quality is None
+                else {
+                    "deployment_quality": str(run_dir / "deployment_quality.json"),
+                    "deployment_candidate": bool(deployment_quality["eligible"]),
+                }
+            ),
         },
         run_dir / "run_summary.json",
     )
@@ -1936,4 +1992,4 @@ def _run_verified_neural_training(
     return run_dir
 
 
-__all__ = ["run_out_of_core_training"]
+__all__ = ["DeploymentQualityError", "run_out_of_core_training"]

@@ -30,7 +30,7 @@ from bitguard_bnn.out_of_core.shard import SHARD_MANIFEST_SCHEMA
 from bitguard_bnn.preprocess import FeaturePreprocessor
 
 
-DATASET_ALGORITHM = "bitguard.deterministic-parquet-dataset.v2"
+DATASET_ALGORITHM = "bitguard.deterministic-parquet-dataset.v3"
 _PARTITIONS = frozenset({"train", "validation", "test"})
 _MANIFEST_SEMANTIC_FIELDS = (
     "schema_version",
@@ -93,6 +93,14 @@ class _RowGroupChunk:
     position: int
     row_groups: tuple[int, ...]
     rows: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ScheduledChunk:
+    ordinal: int
+    shard_position: int
+    entry: _ShardEntry
+    chunk: _RowGroupChunk
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +339,13 @@ def _buffer_seed(seed: int, epoch: int, fingerprint: str, index: int) -> int:
     return int.from_bytes(hashlib.sha256(material).digest()[:16], "little")
 
 
+def _mix_seed(seed: int, epoch: int, fingerprint: str, index: int) -> int:
+    material = (
+        f"{DATASET_ALGORITHM}\0mix\0{seed}\0{epoch}\0{fingerprint}\0{index}"
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:16], "little")
+
+
 def _selected_unencoded(
     processor: FeaturePreprocessor, frame: pd.DataFrame
 ) -> np.ndarray:
@@ -485,6 +500,14 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
         self.seed = int(seed)
         self.shuffle_buffer_rows = int(buffer_rows)
         self.entries = tuple(entries)
+        label_count = len({entry.label for entry in self.entries})
+        largest_row_group = max(
+            rows for entry in self.entries for rows in entry.row_group_rows
+        )
+        self.mix_chunk_rows = max(
+            largest_row_group,
+            self.shuffle_buffer_rows // label_count,
+        )
         self.selected_features = tuple(str(value) for value in manifest["selected_features"])
         self.materialized_features = tuple(
             str(value) for value in manifest["materialized_features"]
@@ -496,6 +519,7 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
         self.epoch = 0
         self.cursor: DataCursor | None = None
         self._max_pending_chunks_observed = 0
+        self._max_mixing_rows_observed = 0
         self._worker_ids_observed: set[int] = set()
 
     @property
@@ -505,6 +529,10 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
     @property
     def worker_ids_observed(self) -> tuple[int, ...]:
         return tuple(sorted(self._worker_ids_observed))
+
+    @property
+    def max_mixing_rows_observed(self) -> int:
+        return self._max_mixing_rows_observed
 
     def set_epoch(self, epoch: int, cursor: DataCursor | None = None) -> None:
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
@@ -535,19 +563,14 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             position += 1
         return tuple(ordered)
 
-    def _iter_assigned_shard_chunks(
+    def _read_scheduled_chunk(
         self,
         processor: FeaturePreprocessor,
-        entry: _ShardEntry,
-        shard_position: int,
-        base_ordinal: int,
+        scheduled: _ScheduledChunk,
         worker_id: int,
-        worker_count: int,
-    ) -> Iterator[dict[str, Any]]:
-        chunk_count = _row_group_chunk_count(entry, self.shuffle_buffer_rows)
-        first_owned = (worker_id - (base_ordinal % worker_count)) % worker_count
-        if first_owned >= chunk_count:
-            return
+    ) -> dict[str, Any]:
+        entry = scheduled.entry
+        chunk = scheduled.chunk
         path = Path(entry.path)
         metadata_columns = (
             "row_uid",
@@ -565,54 +588,49 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
                     f"prepared shard identity changed during iteration: {path}"
                 )
             parquet = pq.ParquetFile(handle)
-            for chunk in _iter_row_group_chunks(entry, self.shuffle_buffer_rows):
-                ordinal = base_ordinal + chunk.position
-                if ordinal % worker_count != worker_id:
-                    continue
-                table = parquet.read_row_groups(
-                    list(chunk.row_groups),
-                    columns=columns,
-                    use_threads=False,
+            table = parquet.read_row_groups(
+                list(chunk.row_groups),
+                columns=columns,
+                use_threads=False,
+            )
+        if table.num_rows != chunk.rows:
+            raise RuntimeError("prepared row-group chunk coverage mismatch")
+        frame = table.to_pandas()
+        order = np.random.Generator(
+            np.random.PCG64(
+                _buffer_seed(
+                    self.seed,
+                    self.epoch,
+                    entry.fingerprint,
+                    chunk.position,
                 )
-                if table.num_rows != chunk.rows:
-                    raise RuntimeError("prepared row-group chunk coverage mismatch")
-                frame = table.to_pandas()
-                order = np.random.Generator(
-                    np.random.PCG64(
-                        _buffer_seed(
-                            self.seed,
-                            self.epoch,
-                            entry.fingerprint,
-                            chunk.position,
-                        )
-                    )
-                ).permutation(len(frame))
-                frame = frame.iloc[order].reset_index(drop=True)
-                unencoded = _selected_unencoded(processor, frame)
-                encoded = processor.encoder.transform(unencoded).astype(
-                    np.float32, copy=False
-                )
-                labels = processor.encode_labels(frame)
-                metadata = {
-                    name: frame[name].to_numpy(copy=True) for name in metadata_columns[1:]
-                }
-                boolean_raw = {
-                    name: frame[name].to_numpy(dtype=np.float32, copy=True)
-                    for name in self.boolean_features
-                }
-                yield {
-                    "_chunk_ordinal": ordinal,
-                    "_worker_id": worker_id,
-                    "_shard_position": shard_position,
-                    "_chunk_position": chunk.position,
-                    "_last_chunk": chunk.position == chunk_count - 1,
-                    "features": encoded,
-                    "unencoded": unencoded,
-                    "labels": labels,
-                    "row_uid": frame["row_uid"].astype(str).to_numpy(copy=True),
-                    "metadata": metadata,
-                    "boolean_raw": boolean_raw,
-                }
+            )
+        ).permutation(len(frame))
+        frame = frame.iloc[order].reset_index(drop=True)
+        unencoded = _selected_unencoded(processor, frame)
+        encoded = processor.encoder.transform(unencoded).astype(
+            np.float32, copy=False
+        )
+        labels = processor.encode_labels(frame)
+        metadata = {
+            name: frame[name].to_numpy(copy=True) for name in metadata_columns[1:]
+        }
+        boolean_raw = {
+            name: frame[name].to_numpy(dtype=np.float32, copy=True)
+            for name in self.boolean_features
+        }
+        return {
+            "_chunk_ordinal": scheduled.ordinal,
+            "_worker_id": worker_id,
+            "_shard_position": scheduled.shard_position,
+            "_chunk_position": chunk.position,
+            "features": encoded,
+            "unencoded": unencoded,
+            "labels": labels,
+            "row_uid": frame["row_uid"].astype(str).to_numpy(copy=True),
+            "metadata": metadata,
+            "boolean_raw": boolean_raw,
+        }
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         worker = torch.utils.data.get_worker_info()
@@ -637,39 +655,60 @@ class ParquetTrainingDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
             raise TypeError("artifact is not a FeaturePreprocessor")
         if tuple(processor.selected_features) != self.selected_features:
             raise RuntimeError("frozen preprocessor no longer matches shard features")
-        resume = _resume_layout(self)
-        start_position = resume.start_shard_position
-        ordinal = 0
-        for position, entry in enumerate(self.permuted_shards()):
-            if position < start_position:
+        for scheduled in _scheduled_chunks(self):
+            if scheduled.ordinal % worker_count == worker_id:
+                yield self._read_scheduled_chunk(
+                    processor,
+                    scheduled,
+                    worker_id,
+                )
+
+
+def _scheduled_chunks(
+    dataset: ParquetTrainingDataset,
+) -> Iterator[_ScheduledChunk]:
+    entries = dataset.permuted_shards()
+    chunk_rows = getattr(dataset, "mix_chunk_rows", dataset.shuffle_buffer_rows)
+    sources = [
+        iter(_iter_row_group_chunks(entry, chunk_rows))
+        for entry in entries
+    ]
+    active = list(range(len(entries)))
+    ordinal = 0
+    while active:
+        following: list[int] = []
+        for shard_position in active:
+            chunk = next(sources[shard_position], None)
+            if chunk is None:
                 continue
-            chunk_count = _row_group_chunk_count(entry, self.shuffle_buffer_rows)
-            yield from self._iter_assigned_shard_chunks(
-                processor,
-                entry,
-                position,
-                ordinal,
-                worker_id,
-                worker_count,
+            yield _ScheduledChunk(
+                ordinal=ordinal,
+                shard_position=shard_position,
+                entry=entries[shard_position],
+                chunk=chunk,
             )
-            ordinal += chunk_count
+            ordinal += 1
+            following.append(shard_position)
+        active = following
 
 
-def _total_chunk_count(
-    dataset: ParquetTrainingDataset, start_position: int
-) -> int:
-    return sum(
-        _row_group_chunk_count(entry, dataset.shuffle_buffer_rows)
-        for entry in dataset.permuted_shards()[start_position:]
-    )
+def _total_chunk_count(dataset: ParquetTrainingDataset) -> int:
+    # Epoch permutation changes order, not count. Retain the immutable metadata
+    # key so a changed manifest/chunk budget cannot reuse stale expectations.
+    entries = tuple(dataset.entries)
+    chunk_rows = getattr(dataset, "mix_chunk_rows", dataset.shuffle_buffer_rows)
+    key = (entries, chunk_rows)
+    cached = getattr(dataset, "_chunk_count_cache", None)
+    if cached is None or cached[0] != key:
+        count = sum(_row_group_chunk_count(entry, chunk_rows) for entry in entries)
+        dataset._chunk_count_cache = (key, count)
+        return count
+    return cached[1]
 
 
 def _ordered_chunks(
     dataset: ParquetTrainingDataset, num_workers: int
 ) -> Iterator[dict[str, Any]]:
-    start_position = _resume_layout(dataset).start_shard_position
-    if start_position == len(dataset.entries):
-        return
     prefetch_factor = 2
     loader_seed = int.from_bytes(
         hashlib.sha256(
@@ -693,7 +732,7 @@ def _ordered_chunks(
     loader = torch.utils.data.DataLoader(dataset, **loader_options)
     pending: list[tuple[int, int, dict[str, Any]]] = []
     expected = 0
-    expected_total = _total_chunk_count(dataset, start_position)
+    expected_total = _total_chunk_count(dataset)
     pending_limit = 1 if num_workers == 0 else num_workers * prefetch_factor
     serial = 0
     for chunk in loader:
@@ -721,6 +760,97 @@ def _ordered_chunks(
         raise RuntimeError("worker stream omitted or duplicated an ordered shard chunk")
 
 
+def _fair_mixing_order(labels: np.ndarray, seed: int) -> np.ndarray:
+    """Spread each class through a window while preserving every row exactly once."""
+
+    values = np.asarray(labels).astype(str)
+    groups: dict[str, np.ndarray] = {}
+    generator = np.random.Generator(np.random.PCG64(seed))
+    for label in sorted(set(values)):
+        positions = np.flatnonzero(values == label)
+        groups[label] = positions[generator.permutation(len(positions))]
+    label_order = list(groups)
+    label_order = [label_order[index] for index in generator.permutation(len(label_order))]
+    counts = {label: len(groups[label]) for label in label_order}
+    offsets = {label: 0 for label in label_order}
+    credits = {label: 0 for label in label_order}
+    total = len(values)
+    result = np.empty(total, dtype=np.int64)
+    for output_position in range(total):
+        available = [label for label in label_order if offsets[label] < counts[label]]
+        for label in available:
+            credits[label] += counts[label]
+        selected = max(available, key=lambda label: credits[label])
+        source_position = offsets[selected]
+        result[output_position] = groups[selected][source_position]
+        offsets[selected] = source_position + 1
+        credits[selected] -= total
+    return result
+
+
+def _reorder_payload(payload: dict[str, Any], order: np.ndarray) -> dict[str, Any]:
+    for name in ("features", "unencoded", "labels", "row_uid"):
+        payload[name] = payload[name][order]
+    for group in ("metadata", "boolean_raw"):
+        for name, values in payload[group].items():
+            payload[group][name] = values[order]
+    payload["_shard_position"] = 0
+    return payload
+
+
+def _mixed_chunks(
+    dataset: ParquetTrainingDataset, num_workers: int
+) -> Iterator[dict[str, Any]]:
+    """Mix class-sharded chunks within one shared, bounded row budget."""
+
+    parts: list[dict[str, Any]] = []
+    buffered_rows = 0
+    window = 0
+
+    def flush() -> dict[str, Any]:
+        nonlocal parts, buffered_rows, window
+        payload = _concatenate_parts(parts)
+        parts = []
+        buffered_rows = 0
+        payload.update(
+            {
+                "_chunk_ordinal": window,
+                "_worker_id": 0,
+                "_shard_position": 0,
+                "_chunk_position": window,
+            }
+        )
+        mixing_labels = payload["metadata"].get("behavior_label", payload["labels"])
+        order = _fair_mixing_order(
+            mixing_labels,
+            _mix_seed(
+                dataset.seed,
+                dataset.epoch,
+                dataset.manifest_fingerprint,
+                window,
+            ),
+        )
+        mixed = _reorder_payload(payload, order)
+        window += 1
+        return mixed
+
+    for chunk in _ordered_chunks(dataset, num_workers):
+        rows = len(chunk["row_uid"])
+        if rows > dataset.shuffle_buffer_rows:
+            raise RuntimeError("ordered chunk exceeds the shared shuffle buffer")
+        if parts and buffered_rows + rows > dataset.shuffle_buffer_rows:
+            yield flush()
+        parts.append(chunk)
+        buffered_rows += rows
+        if hasattr(dataset, "_max_mixing_rows_observed"):
+            dataset._max_mixing_rows_observed = max(
+                dataset._max_mixing_rows_observed,
+                buffered_rows,
+            )
+    if parts:
+        yield flush()
+
+
 def _logical_batch_sizes(
     row_count: int, batch_size: int, *, allow_singleton: bool
 ) -> Iterator[int]:
@@ -743,7 +873,6 @@ def _resume_layout(
     dataset: ParquetTrainingDataset,
 ) -> _ResumeLayout:
     layout = _batch_layout(dataset)
-    entries = dataset.permuted_shards()
     if dataset.cursor is None:
         return _ResumeLayout(layout, 0, 0, 0, 0)
     target = (dataset.cursor.shard_position, dataset.cursor.batch_position)
@@ -751,28 +880,21 @@ def _resume_layout(
         return _ResumeLayout(
             layout,
             layout.batch_count,
-            len(entries),
+            len(dataset.entries),
             0,
             0,
         )
-    shard_position = dataset.cursor.shard_position
-    if shard_position < 0 or shard_position >= len(entries):
+    if dataset.cursor.shard_position != 0:
         raise ValueError("resume cursor does not identify a logical batch boundary")
-    preceding = sum(entry.rows for entry in entries[:shard_position])
-    shard_end = preceding + entries[shard_position].rows
-    first_index = layout.first_index_starting_at_or_after(preceding)
-    start_index = first_index + dataset.cursor.batch_position
+    start_index = dataset.cursor.batch_position
     if start_index >= layout.batch_count:
-        raise ValueError("resume cursor does not identify a logical batch boundary")
-    global_start = layout.start_at(start_index)
-    if global_start < preceding or global_start >= shard_end:
         raise ValueError("resume cursor does not identify a logical batch boundary")
     return _ResumeLayout(
         layout,
         start_index,
-        shard_position,
-        global_start - preceding,
-        dataset.cursor.batch_position,
+        0,
+        layout.start_at(start_index),
+        start_index,
     )
 
 
@@ -780,31 +902,13 @@ def _iter_batch_specs(
     dataset: ParquetTrainingDataset,
     resume: _ResumeLayout,
 ) -> Iterator[_BatchSpec]:
-    entries = dataset.permuted_shards()
-    shard_position = resume.start_shard_position
-    preceding = sum(entry.rows for entry in entries[:shard_position])
-    shard_end = (
-        dataset.row_count
-        if shard_position == len(entries)
-        else preceding + entries[shard_position].rows
-    )
-    batch_position = resume.start_batch_position
     for index in range(resume.start_index, resume.layout.batch_count):
-        global_start = resume.layout.start_at(index)
-        while global_start >= shard_end:
-            preceding = shard_end
-            shard_position += 1
-            if shard_position >= len(entries):
-                raise RuntimeError("logical batch start exceeds prepared shard coverage")
-            shard_end = preceding + entries[shard_position].rows
-            batch_position = 0
         yield _BatchSpec(
-            shard_position=shard_position,
-            batch_position=batch_position,
-            global_start=global_start,
+            shard_position=0,
+            batch_position=index,
+            global_start=resume.layout.start_at(index),
             rows=resume.layout.size_at(index),
         )
-        batch_position += 1
 
 
 def _take_rows(
@@ -878,7 +982,7 @@ def _logical_batches(
     resume = _resume_layout(dataset)
     if resume.start_index == resume.layout.batch_count:
         return
-    chunks = iter(_ordered_chunks(dataset, num_workers))
+    chunks = iter(_mixed_chunks(dataset, num_workers))
     state: list[Any] = [None, 0]
     if resume.skip_rows:
         _take_rows(chunks, state, resume.skip_rows)
