@@ -6,23 +6,21 @@ replace the scientific pipeline; it only supplies a GPU container and durable st
 
 ## What is persisted
 
-The named Modal Volume `bitguard-bnn` is mounted at `/bitguard` and contains:
+The named Modal Volume `bitguard-bnn` is mounted at `/bitguard`, but BitGuard does **not** run directly on that filesystem. The bootstrap uses POSIX hard links and no-clobber rename operations that Modal Volume mounts do not provide. Instead, the runner restores a durable snapshot to a normal Linux working disk, runs BitGuard there, and mirrors it back periodically:
 
 ```text
-/bitguard/
+/work/bitguard/                 # normal Linux working filesystem
 ├── BitGuardData/
-│   ├── .bitguard/        # bootstrap state/report, manifests, recovery metadata
-│   ├── prepared/         # verified Parquet shards and preprocessing artifacts
-│   └── ...               # acquired/extracted official dataset files
 └── BitGuardRuns/
-    ├── nbaiot_full/      # checkpoints, metrics, predictions, exports
-    └── botiot_full/
+        │
+        │ rsync every 3 minutes + final sync
+        ▼
+/bitguard/snapshot-v2/          # persistent Modal Volume
+├── BitGuardData/
+└── BitGuardRuns/
 ```
 
-The repository and locked CUDA environment are baked into the Modal Image. They do
-not consume Volume space. A background thread commits the Volume every 60 seconds,
-and the runner performs a final commit after the bootstrap process exits. BitGuard's
-normal atomic checkpoints and bootstrap state remain authoritative.
+The Function requests a 128 GiB ephemeral working disk. The repository and locked CUDA environment are baked into the Modal Image. BitGuard's normal atomic checkpoints and bootstrap state remain authoritative; the Volume is only the durable snapshot/restore layer.
 
 ## One-time setup
 
@@ -42,7 +40,7 @@ terms; it is not a license grant.
 The cheapest default is T4:
 
 ```bash
-modal run modal_train.py \
+modal run -n bitguard-bnn modal_train.py \
   --gpu T4 \
   --dataset all \
   --accept-botiot-license
@@ -56,7 +54,7 @@ to reduce total cost.
 For a long run that should continue if the local terminal disconnects:
 
 ```bash
-modal run -d modal_train.py \
+modal run -d -n bitguard-bnn modal_train.py \
   --gpu T4 \
   --dataset all \
   --accept-botiot-license
@@ -72,13 +70,13 @@ checkpoints.
 N-BaIoT:
 
 ```bash
-modal run modal_train.py --gpu T4 --dataset nbaiot
+modal run -n bitguard-bnn modal_train.py --gpu T4 --dataset nbaiot
 ```
 
 BoT-IoT:
 
 ```bash
-modal run modal_train.py \
+modal run -n bitguard-bnn modal_train.py \
   --gpu T4 \
   --dataset botiot \
   --accept-botiot-license
@@ -87,15 +85,15 @@ modal run modal_train.py \
 ## Inspect progress without allocating a GPU
 
 ```bash
-modal run modal_train.py::read_status
+modal run -n bitguard-status modal_train.py::read_status
 ```
 
 You can also inspect the persistent filesystem directly:
 
 ```bash
 modal volume ls bitguard-bnn /
-modal volume ls bitguard-bnn BitGuardData/.bitguard
-modal volume ls bitguard-bnn BitGuardRuns
+modal volume ls bitguard-bnn snapshot-v2/BitGuardData/.bitguard
+modal volume ls bitguard-bnn snapshot-v2/BitGuardRuns
 ```
 
 ## Download results
@@ -103,7 +101,7 @@ modal volume ls bitguard-bnn BitGuardRuns
 Download all run artifacts:
 
 ```bash
-modal volume get bitguard-bnn BitGuardRuns ./BitGuardRuns
+modal volume get bitguard-bnn snapshot-v2/BitGuardRuns ./BitGuardRuns
 ```
 
 Or download a particular run directory after locating it with `modal volume ls`.
@@ -119,7 +117,7 @@ modal volume put bitguard-bnn ./bot-iot.zip uploads/bot-iot.zip
 Then run:
 
 ```bash
-modal run modal_train.py \
+modal run -n bitguard-bnn modal_train.py \
   --gpu T4 \
   --dataset botiot \
   --accept-botiot-license \
@@ -137,7 +135,7 @@ requires it or when you intentionally want to invalidate that stage and everythi
 after it:
 
 ```bash
-modal run modal_train.py \
+modal run -n bitguard-bnn modal_train.py \
   --gpu T4 \
   --dataset all \
   --accept-botiot-license \
@@ -152,7 +150,7 @@ Valid stage names are the same as the normal BitGuard bootstrap pipeline, such a
 A prepare-only invocation is available:
 
 ```bash
-modal run modal_train.py \
+modal run -n bitguard-bnn modal_train.py \
   --gpu T4 \
   --dataset all \
   --accept-botiot-license \
@@ -177,3 +175,20 @@ from GPU price alone:
 modal billing summary --for "this month"
 modal billing report --for "this month" --show-resources
 ```
+
+
+## Logs for detached runs
+
+Name the ephemeral run with `-n bitguard-bnn` so it can be addressed by name while it is running:
+
+```bash
+modal app logs bitguard-bnn -f
+```
+
+If a run has already stopped, use the `ap-...` App ID printed by `modal run` and omit `-f`:
+
+```bash
+modal app logs ap-XXXXXXXX --tail 1000
+```
+
+`modal run` creates an ephemeral App. A stopped ephemeral App is not a currently deployed App, so following logs by its source-code `App(...)` name is not reliable unless the run was explicitly named with `-n`.
