@@ -54,6 +54,7 @@ GpuName = Literal["T4", "L4", "A10", "A100", "L40S", "H100"]
 DatasetName = Literal["all", "nbaiot", "botiot"]
 
 _LOCAL_REPOSITORY = Path(__file__).resolve().parent
+_SYNC_LOCK = threading.Lock()
 
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
@@ -165,11 +166,12 @@ def _restore_snapshot() -> None:
 def _sync_snapshot() -> None:
     """Mirror current local state to the persistent Volume and commit it."""
 
-    Path(PERSISTENT_DATA_ROOT).mkdir(parents=True, exist_ok=True)
-    Path(PERSISTENT_RUNS_ROOT).mkdir(parents=True, exist_ok=True)
-    _rsync_directory(DATA_ROOT, PERSISTENT_DATA_ROOT, delete=True)
-    _rsync_directory(RUNS_ROOT, PERSISTENT_RUNS_ROOT, delete=True)
-    volume.commit()
+    with _SYNC_LOCK:
+        Path(PERSISTENT_DATA_ROOT).mkdir(parents=True, exist_ok=True)
+        Path(PERSISTENT_RUNS_ROOT).mkdir(parents=True, exist_ok=True)
+        _rsync_directory(DATA_ROOT, PERSISTENT_DATA_ROOT, delete=True)
+        _rsync_directory(RUNS_ROOT, PERSISTENT_RUNS_ROOT, delete=True)
+        volume.commit()
 
 
 def _sync_periodically(stop: threading.Event) -> None:
