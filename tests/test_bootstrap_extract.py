@@ -762,6 +762,27 @@ Mode = drwxr-xr-x
             self.assertEqual(calls[1][:3], ["/usr/bin/7z", "l", "-slt"])
             self.assertIn("-sccUTF-8", calls[1])
 
+    def test_7z_failure_includes_bounded_diagnostics(self) -> None:
+        def run(args, **kwargs):
+            del kwargs
+            return subprocess.CompletedProcess(
+                args,
+                2,
+                "listing stdout detail",
+                "ERROR: unsupported RAR codec",
+            )
+
+        with self.assertRaisesRegex(
+            ArchiveExtractionError,
+            r"exit code 2.*unsupported RAR codec",
+        ):
+            extract_module._run_7z(
+                run,
+                ["/tools/7z", "l", "source.rar"],
+                operation="listing",
+                timeout=1,
+            )
+
     def test_uses_argument_arrays_lists_first_then_validates_result_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
