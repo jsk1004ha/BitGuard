@@ -84,8 +84,10 @@ modal run -n bitguard-bnn modal_train.py \
 
 ## Inspect progress without allocating a GPU
 
+Use the lightweight status reader below. It does not construct the training CUDA image, so status checks do not rebuild PyTorch:
+
 ```bash
-modal run -n bitguard-status modal_train.py::read_status
+modal run -n bitguard-status modal_status.py::status
 ```
 
 You can also inspect the persistent filesystem directly:
