@@ -640,16 +640,17 @@ The unit tests do not download either research dataset.
 ## 14. Modal cloud training
 
 The full N-BaIoT + BoT-IoT pipeline can run on Modal with the repository code
-and locked CUDA environment baked into a Modal Image while datasets, prepared
-Parquet shards, bootstrap state, checkpoints, and run outputs stay on a durable
-Modal Volume.
+and locked CUDA environment baked into a Modal Image. BitGuard executes on a
+normal Linux working disk so its hard-link safety contract remains intact, while
+datasets, prepared Parquet shards, bootstrap state, checkpoints, and run outputs
+are periodically mirrored to a durable Modal Volume.
 
 From the repository root:
 
 ```bash
 python -m pip install "modal>=1.5,<1.6"
 modal setup
-modal run modal_train.py --gpu T4 --dataset all --accept-botiot-license
+modal run -d -n bitguard-bnn modal_train.py --gpu T4 --dataset all --accept-botiot-license
 ```
 
 Re-running the same command reuses BitGuard's verified bootstrap state and
