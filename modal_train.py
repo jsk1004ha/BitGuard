@@ -48,7 +48,7 @@ BOOTSTRAP = "/opt/BitGuard/bootstrap.sh"
 
 SYNC_INTERVAL_SECONDS = 180
 MAX_MODAL_RUNTIME_SECONDS = 24 * 60 * 60
-EPHEMERAL_DISK_MIB = 128 * 1024
+EPHEMERAL_DISK_MIB = 512 * 1024  # Modal Function disk minimum: 512 GiB
 
 GpuName = Literal["T4", "L4", "A10", "A100", "L40S", "H100"]
 DatasetName = Literal["all", "nbaiot", "botiot"]
