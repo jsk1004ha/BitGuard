@@ -842,8 +842,19 @@ def _run_7z(
             f"7-Zip {operation} failed before completion: {type(error).__name__}"
         ) from error
     if getattr(result, "returncode", 1) != 0:
+        details: list[str] = []
+        for stream_name in ("stderr", "stdout"):
+            value = getattr(result, stream_name, "")
+            if isinstance(value, str):
+                cleaned = " ".join(value.strip().split())
+                if cleaned:
+                    if len(cleaned) > 4096:
+                        cleaned = cleaned[:4093] + "..."
+                    details.append(f"{stream_name}={cleaned!r}")
+        suffix = "" if not details else "; " + "; ".join(details)
         raise ArchiveExtractionError(
-            f"7-Zip {operation} failed with exit code {getattr(result, 'returncode', None)}"
+            f"7-Zip {operation} failed with exit code "
+            f"{getattr(result, 'returncode', None)}{suffix}"
         )
     return result
 
