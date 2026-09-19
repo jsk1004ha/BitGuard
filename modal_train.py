@@ -26,11 +26,11 @@ import modal
 
 APP_NAME = "bitguard-bnn"
 VOLUME_NAME = "bitguard-bnn"
-VOLUME_MOUNT = Path("/bitguard")
-DATA_ROOT = VOLUME_MOUNT / "BitGuardData"
-RUNS_ROOT = VOLUME_MOUNT / "BitGuardRuns"
-REPOSITORY_ROOT = Path("/opt/BitGuard")
-BOOTSTRAP = REPOSITORY_ROOT / "bootstrap.sh"
+VOLUME_MOUNT = "/bitguard"
+DATA_ROOT = "/bitguard/BitGuardData"
+RUNS_ROOT = "/bitguard/BitGuardRuns"
+REPOSITORY_ROOT = "/opt/BitGuard"
+BOOTSTRAP = "/opt/BitGuard/bootstrap.sh"
 COMMIT_INTERVAL_SECONDS = 60
 MAX_MODAL_RUNTIME_SECONDS = 24 * 60 * 60
 
@@ -46,7 +46,7 @@ image = (
     .apt_install("git", "p7zip-full")
     .add_local_dir(
         str(_LOCAL_REPOSITORY),
-        str(REPOSITORY_ROOT),
+        REPOSITORY_ROOT,
         copy=True,
         ignore=[
             ".git/**",
@@ -81,7 +81,7 @@ app = modal.App(APP_NAME)
 
 
 def _load_report() -> dict[str, object] | None:
-    report_path = DATA_ROOT / ".bitguard" / "bootstrap-report.json"
+    report_path = Path(DATA_ROOT) / ".bitguard" / "bootstrap-report.json"
     if not report_path.is_file():
         return None
     try:
@@ -106,18 +106,18 @@ def _report_summary(returncode: int) -> dict[str, object]:
     return {
         "returncode": int(returncode),
         "volume": VOLUME_NAME,
-        "data_root": str(DATA_ROOT),
-        "runs_root": str(RUNS_ROOT),
-        "bootstrap_report": str(DATA_ROOT / ".bitguard" / "bootstrap-report.json"),
+        "data_root": DATA_ROOT,
+        "runs_root": RUNS_ROOT,
+        "bootstrap_report": f"{DATA_ROOT}/.bitguard/bootstrap-report.json",
         **{key: report[key] for key in keys if key in report},
     }
 
 
 def _resolve_volume_source(value: str) -> Path:
     supplied = Path(value)
-    candidate = supplied if supplied.is_absolute() else VOLUME_MOUNT / supplied
+    mount = Path(VOLUME_MOUNT).resolve()
+    candidate = supplied if supplied.is_absolute() else mount / supplied
     resolved = candidate.resolve()
-    mount = VOLUME_MOUNT.resolve()
     try:
         resolved.relative_to(mount)
     except ValueError as exc:
@@ -138,7 +138,7 @@ def _commit_volume_periodically(stop: threading.Event) -> None:
 
 @app.function(
     image=image,
-    volumes={str(VOLUME_MOUNT): volume},
+    volumes={VOLUME_MOUNT: volume},
     cpu=8.0,
     memory=32768,
     timeout=MAX_MODAL_RUNTIME_SECONDS,
@@ -163,20 +163,20 @@ def run_bitguard(
 
     # Pull in the newest committed Volume state before opening any files.
     volume.reload()
-    DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    Path(DATA_ROOT).mkdir(parents=True, exist_ok=True)
+    Path(RUNS_ROOT).mkdir(parents=True, exist_ok=True)
 
     command = [
-        str(BOOTSTRAP),
+        BOOTSTRAP,
         "--full",
         "--dataset",
         dataset,
         "--compute",
         "cu128",
         "--data-root",
-        str(DATA_ROOT),
+        DATA_ROOT,
         "--runs-root",
-        str(RUNS_ROOT),
+        RUNS_ROOT,
         "--no-install-system-tools",
     ]
     if dataset in {"all", "botiot"}:
@@ -227,7 +227,7 @@ def run_bitguard(
 
 @app.function(
     image=modal.Image.debian_slim(python_version="3.11"),
-    volumes={str(VOLUME_MOUNT): volume.with_mount_options(read_only=True)},
+    volumes={VOLUME_MOUNT: volume.with_mount_options(read_only=True)},
     timeout=120,
 )
 def read_status() -> dict[str, object]:
