@@ -344,10 +344,12 @@ def run_bitguard(
     timeout=120,
 )
 def read_status() -> dict[str, object]:
-    """Read the latest durable bootstrap status without allocating a GPU."""
+    """Read and print the latest durable bootstrap status."""
 
     volume.reload()
-    return _report_summary(0, persistent=True)
+    summary = _report_summary(0, persistent=True)
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
 
 
 @app.local_entrypoint()
