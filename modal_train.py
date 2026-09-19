@@ -115,6 +115,9 @@ def _report_summary(returncode: int, *, persistent: bool) -> dict[str, object]:
         "status",
         "last_completed_stage",
         "failed_stage",
+        "error",
+        "report_error",
+        "lock_release_error",
         "next_stage",
         "dataset_statuses",
         "trained_runs",
@@ -313,10 +316,24 @@ def run_bitguard(
     summary = _report_summary(completed.returncode, persistent=False)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     if completed.returncode != 0 or summary.get("status") == "failed":
+        failure = {
+            key: summary.get(key)
+            for key in (
+                "returncode",
+                "status",
+                "last_completed_stage",
+                "failed_stage",
+                "error",
+                "report_error",
+                "lock_release_error",
+                "recovery_command",
+                "bootstrap_report",
+            )
+            if summary.get(key) is not None
+        }
         raise RuntimeError(
-            "BitGuard bootstrap did not complete successfully. Its durable snapshot "
-            "was committed. Inspect recovery_command, then rerun with the indicated "
-            "--restart-stage only when the report requires it."
+            "BitGuard bootstrap failed after committing its durable snapshot:\n"
+            + json.dumps(failure, ensure_ascii=False, indent=2)
         )
     return summary
 
