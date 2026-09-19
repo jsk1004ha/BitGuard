@@ -81,5 +81,4 @@ def status() -> dict[str, object]:
 
 @app.local_entrypoint()
 def main() -> None:
-    result = status.remote()
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    status.remote()
