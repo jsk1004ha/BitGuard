@@ -20,7 +20,7 @@ The named Modal Volume `bitguard-bnn` is mounted at `/bitguard`, but BitGuard do
 └── BitGuardRuns/
 ```
 
-The Function requests a 128 GiB ephemeral working disk. The repository and locked CUDA environment are baked into the Modal Image. BitGuard's normal atomic checkpoints and bootstrap state remain authoritative; the Volume is only the durable snapshot/restore layer.
+The Function requests a 512 GiB ephemeral working disk, which is Modal's current minimum accepted explicit Function disk request. The repository and locked CUDA environment are baked into the Modal Image. BitGuard's normal atomic checkpoints and bootstrap state remain authoritative; the Volume is only the durable snapshot/restore layer.
 
 ## One-time setup
 
