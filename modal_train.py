@@ -61,6 +61,16 @@ volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "p7zip-full", "rsync")
+    .run_commands(
+        (
+            "sh -ceu '. /etc/os-release; "
+            "echo \"deb http://deb.debian.org/debian $VERSION_CODENAME non-free\" "
+            "> /etc/apt/sources.list.d/bitguard-nonfree.list; "
+            "apt-get update; "
+            "apt-get install -y --no-install-recommends p7zip-rar; "
+            "rm -rf /var/lib/apt/lists/*'"
+        )
+    )
     .add_local_dir(
         str(_LOCAL_REPOSITORY),
         REPOSITORY_ROOT,
